@@ -1,0 +1,173 @@
+"""PDF fetcher — resolves invoice-attachment links into bytes on disk.
+
+Stage 2 of the invoice pipeline. After the classifier says an email is an
+invoice but no PDF is attached, this module chases the billing link. It is
+intentionally conservative:
+
+- Every fetch goes through :mod:`execution.shared.http` so SSRF validation,
+  streaming size limits, and bounded redirects apply uniformly.
+- Every response is PDF-magic-byte checked. HTML bodies — the signature of
+  a login-gated portal like Zoom, Notion, AWS, or GitHub — are rejected
+  as :data:`FetchStatus.NEEDS_MANUAL_DOWNLOAD` rather than stored. The
+  caller surfaces those as an Exceptions-tab row.
+- Known providers with short-lived URLs (Stripe 30-day, Paddle 1-hour)
+  are still fetched via the generic path; the plan's provider-specific
+  modules arrive in Phase 6 behind a feature flag. All we do now is
+  annotate ``provider`` so the filer and the Exceptions-tab row know
+  where the PDF came from.
+
+The module never writes to disk. The caller (``invoice/filer.py``) takes
+the bytes, writes the sandboxed ``.tmp/invoices/`` file, uploads to
+Drive, then commits the SQLite row.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from enum import StrEnum
+from typing import Final
+from urllib.parse import urlparse
+
+from execution.shared.errors import RateLimitedError, SSRFValidationError
+from execution.shared.http import FetchResult, SafeHttpClient
+
+
+class FetchStatus(StrEnum):
+    """Outcome of a single :func:`fetch_invoice_pdf` call."""
+
+    OK = "ok"
+    NEEDS_MANUAL_DOWNLOAD = "needs_manual_download"
+    SSRF_REJECTED = "ssrf_rejected"
+    RATE_LIMITED = "rate_limited"
+    UPSTREAM_ERROR = "upstream_error"
+
+
+# Known billing-portal hosts whose "hosted invoice" URL returns HTML.
+# Listed with a reason so the Exceptions-tab entry carries context.
+LOGIN_GATED_HOSTS: Final[dict[str, str]] = {
+    "zoom.us": "Zoom requires portal login to download the PDF",
+    "us02web.zoom.us": "Zoom requires portal login to download the PDF",
+    "notion.so": "Notion billing PDFs live behind workspace login",
+    "www.notion.so": "Notion billing PDFs live behind workspace login",
+    "console.aws.amazon.com": "AWS console login required",
+    "github.com": "GitHub billing PDFs require account login",
+    "portal.azure.com": "Azure portal login required",
+}
+
+# Providers whose URLs expire quickly — fetch on email receipt, not deferred.
+# We recognise them to tag the provider on the FetchOutcome; resolving the
+# hosted_invoice_url → invoice_pdf redirect is handled by the SafeHttpClient
+# redirect loop.
+_STRIPE_HOSTS: Final[frozenset[str]] = frozenset(
+    {"pay.stripe.com", "invoice.stripe.com", "files.stripe.com"}
+)
+_PADDLE_HOSTS: Final[frozenset[str]] = frozenset(
+    {"paddle.com", "paddle.net", "vendors.paddle.com", "checkout.paddle.com"}
+)
+
+
+@dataclass(frozen=True, slots=True)
+class FetchOutcome:
+    """Result of a fetch attempt — either PDF bytes or a clear failure reason."""
+
+    status: FetchStatus
+    url: str
+    provider: str
+    body: bytes | None = None
+    content_type: str | None = None
+    reason: str | None = None
+
+
+def classify_provider(url: str) -> str:
+    """Return a stable provider tag for downstream attribution."""
+    try:
+        host = (urlparse(url).hostname or "").lower().rstrip(".")
+    except ValueError:
+        return "unknown"
+    if not host:
+        return "unknown"
+    if host in _STRIPE_HOSTS:
+        return "stripe"
+    if host in _PADDLE_HOSTS:
+        return "paddle"
+    if host in LOGIN_GATED_HOSTS:
+        return "login_gated"
+    return "generic"
+
+
+def fetch_invoice_pdf(
+    url: str,
+    *,
+    client: SafeHttpClient,
+    max_bytes: int = 25 * 1024 * 1024,
+) -> FetchOutcome:
+    """Fetch ``url`` and return a :class:`FetchOutcome`.
+
+    Never raises for expected failure modes (SSRF, login-gated, rate-limit,
+    HTTP error) — all surface as a status so the pipeline can continue
+    processing other invoices. Unexpected errors (e.g. timeout) still
+    propagate so they can be observed in the run log.
+    """
+    provider = classify_provider(url)
+    host = (urlparse(url).hostname or "").lower().rstrip(".")
+
+    # Short-circuit on known login-gated portals — saves a round-trip and
+    # produces a better Exceptions-row reason than a generic HTML rejection.
+    if host in LOGIN_GATED_HOSTS:
+        return FetchOutcome(
+            status=FetchStatus.NEEDS_MANUAL_DOWNLOAD,
+            url=url,
+            provider=provider,
+            reason=LOGIN_GATED_HOSTS[host],
+        )
+
+    try:
+        result: FetchResult = client.fetch_bytes(
+            url,
+            max_bytes=max_bytes,
+            require_pdf_magic=True,
+        )
+    except SSRFValidationError as err:
+        # SSRF validator catches three things: blocked IP / host, size-cap
+        # breach, PDF magic-byte mismatch. Distinguish HTML-masquerading
+        # (magic fail) from actual SSRF rejection for a cleaner reason.
+        if "magic" in str(err).lower():
+            return FetchOutcome(
+                status=FetchStatus.NEEDS_MANUAL_DOWNLOAD,
+                url=url,
+                provider=provider,
+                reason=(
+                    "response was not a PDF — likely login page or HTML "
+                    "invoice viewer"
+                ),
+            )
+        return FetchOutcome(
+            status=FetchStatus.SSRF_REJECTED,
+            url=url,
+            provider=provider,
+            reason=str(err),
+        )
+    except RateLimitedError as err:
+        return FetchOutcome(
+            status=FetchStatus.RATE_LIMITED,
+            url=url,
+            provider=provider,
+            reason=str(err),
+        )
+
+    return FetchOutcome(
+        status=FetchStatus.OK,
+        url=result.url,
+        provider=provider,
+        body=result.body,
+        content_type=result.content_type,
+    )
+
+
+__all__ = [
+    "LOGIN_GATED_HOSTS",
+    "FetchOutcome",
+    "FetchStatus",
+    "classify_provider",
+    "fetch_invoice_pdf",
+]
