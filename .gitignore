@@ -1,0 +1,21 @@
+# Ephemeral
+.tmp/
+
+# Credentials
+.env
+credentials.json
+token.json
+
+# Virtual environment
+venv/
+
+# OS
+.DS_Store
+
+# Ephemeral review findings (per-PR)
+todos/
+
+# AI tool state
+.claude/
+.gemini/
+.agents/

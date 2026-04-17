@@ -1,0 +1,7 @@
+# Base dependencies (included with template)
+python-dotenv
+requests
+
+# Add project-specific dependencies below
+# Example: google-api-python-client (for Google Sheets integration)
+# Example: beautifulsoup4 (for web scraping)
