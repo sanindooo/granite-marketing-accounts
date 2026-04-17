@@ -21,7 +21,7 @@ from typing import Annotated
 import typer
 
 from execution.shared import db as db_mod
-from execution.shared.errors import PipelineError, emit_error, emit_success
+from execution.shared.errors import ConfigError, PipelineError, emit_error, emit_success
 from execution.shared.fiscal import london_today_fy
 from execution.shared.secrets import ensure_backend, is_mock
 
@@ -236,12 +236,211 @@ def output_create_fy(
 
 
 # ---------------------------------------------------------------------------
-# Placeholders for later phases
+# ingest email subcommands (Phase 2)
 # ---------------------------------------------------------------------------
 
-@ingest_app.callback()
-def ingest_callback() -> None:
-    """Stub. Email + bank adapters land in Phases 2 and 3."""
+
+ingest_email_app = typer.Typer(
+    name="email", help="Email-adapter ingestion.", no_args_is_help=True
+)
+ingest_app.add_typer(ingest_email_app)
+
+
+@ingest_email_app.command("ms365")
+def ingest_email_ms365(
+    db_path: Annotated[Path | None, typer.Option("--db")] = None,
+    initial: Annotated[
+        bool,
+        typer.Option(
+            "--initial",
+            help="Ignore the saved watermark and start a fresh delta sync.",
+        ),
+    ] = False,
+) -> None:
+    """Fetch new MS Graph inbox messages into the ``emails`` table.
+
+    Classification + extraction + filing run in a later stage; this command
+    only handles the ingest → email-row side so each concern stays
+    separately runnable and observable.
+    """
+    try:
+        from execution.adapters.ms365 import SOURCE_ID, Ms365Adapter, Ms365Auth
+
+        conn = db_mod.connect(db_path)
+        db_mod.apply_migrations(conn)
+
+        watermark = None if initial else _load_watermark(conn, SOURCE_ID)
+        auth = Ms365Auth.from_keychain()
+        adapter = Ms365Adapter(auth=auth)
+        try:
+            batches = 0
+            emails = 0
+            for batch in adapter.fetch_since(watermark):
+                batches += 1
+                emails += len(batch)
+                with conn:
+                    for email in batch:
+                        _upsert_email(conn, email.as_email_row())
+            _save_watermark(
+                conn, SOURCE_ID, watermark=adapter.next_watermark, emit_count=emails
+            )
+            _clear_reauth(conn, SOURCE_ID)
+        finally:
+            adapter.close()
+
+        emit_success(
+            {
+                "source": SOURCE_ID,
+                "batches": batches,
+                "emails": emails,
+                "next_watermark_saved": adapter.next_watermark is not None,
+                "initial": initial,
+            }
+        )
+    except PipelineError as err:
+        if err.error_code == "needs_reauth":
+            conn = db_mod.connect(db_path)
+            db_mod.apply_migrations(conn)
+            _record_reauth(conn, err.source, message=str(err))
+        emit_error(err)
+    except Exception as err:
+        emit_error(err)
+
+
+# ---------------------------------------------------------------------------
+# ops reauth subcommands (Phase 2)
+# ---------------------------------------------------------------------------
+
+
+@ops_app.command("reauth")
+def ops_reauth(
+    source: Annotated[str, typer.Argument(help="Adapter to re-authorise, e.g. 'ms365'.")],
+    db_path: Annotated[Path | None, typer.Option("--db")] = None,
+) -> None:
+    """Run the interactive device-code re-auth for ``source``."""
+    try:
+        if source == "ms365":
+            from execution.adapters.ms365 import SOURCE_ID as MS365_SOURCE
+            from execution.adapters.ms365 import Ms365Auth
+
+            auth = Ms365Auth.from_keychain()
+            flow = auth.initiate_device_flow()
+            message = flow.get("message") or (
+                f"Visit {flow.get('verification_uri')} and enter code "
+                f"{flow.get('user_code')}"
+            )
+            # Stderr so stdout stays single-JSON-doc per the agent contract.
+            sys.stderr.write(message + "\n")
+            sys.stderr.flush()
+            auth.complete_device_flow()
+
+            conn = db_mod.connect(db_path)
+            db_mod.apply_migrations(conn)
+            _clear_reauth(conn, MS365_SOURCE)
+            emit_success(
+                {"source": MS365_SOURCE, "reauth": "ok", "user_code": flow.get("user_code")}
+            )
+            return
+        raise ConfigError(
+            f"unknown reauth source {source!r}; supported: 'ms365'",
+            source="cli",
+        )
+    except PipelineError as err:
+        emit_error(err)
+    except Exception as err:
+        emit_error(err)
+
+
+# ---------------------------------------------------------------------------
+# Small helpers reused by the ingest commands above
+# ---------------------------------------------------------------------------
+
+
+def _load_watermark(conn: sqlite3.Connection, source: str) -> str | None:
+    row = conn.execute(
+        "SELECT last_watermark FROM watermarks WHERE source = ?", (source,)
+    ).fetchone()
+    if row is None:
+        return None
+    return str(row["last_watermark"]) if row["last_watermark"] else None
+
+
+def _save_watermark(
+    conn: sqlite3.Connection,
+    source: str,
+    *,
+    watermark: str | None,
+    emit_count: int,
+) -> None:
+    from execution.shared.clock import now_utc
+
+    with conn:
+        conn.execute(
+            """
+            INSERT INTO watermarks
+                (source, last_watermark, last_success_at, last_emit_count,
+                 expected_cadence_hours)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(source) DO UPDATE SET
+                last_watermark = COALESCE(excluded.last_watermark, watermarks.last_watermark),
+                last_success_at = excluded.last_success_at,
+                last_emit_count = excluded.last_emit_count
+            """,
+            (source, watermark, now_utc().isoformat(), emit_count, 24),
+        )
+
+
+def _clear_reauth(conn: sqlite3.Connection, source: str) -> None:
+    from execution.shared.clock import now_utc
+
+    with conn:
+        conn.execute(
+            "UPDATE reauth_required SET resolved_at = ? WHERE source = ? AND resolved_at IS NULL",
+            (now_utc().isoformat(), source),
+        )
+
+
+def _record_reauth(conn: sqlite3.Connection, source: str, *, message: str) -> None:
+    from execution.shared.clock import now_utc
+
+    with conn:
+        conn.execute(
+            """
+            INSERT INTO reauth_required
+                (source, detected_at, last_retry_at, retry_count, last_error)
+            VALUES (?, ?, ?, 1, ?)
+            ON CONFLICT(source) DO UPDATE SET
+                last_retry_at = excluded.last_retry_at,
+                retry_count = reauth_required.retry_count + 1,
+                last_error = excluded.last_error
+            """,
+            (source, now_utc().isoformat(), now_utc().isoformat(), message),
+        )
+
+
+def _upsert_email(conn: sqlite3.Connection, row: dict[str, object]) -> None:
+    conn.execute(
+        """
+        INSERT INTO emails
+            (msg_id, source_adapter, message_id_header, received_at,
+             from_addr, subject, outcome)
+        VALUES (?, ?, ?, ?, ?, ?, 'pending')
+        ON CONFLICT(msg_id) DO NOTHING
+        """,
+        (
+            row["msg_id"],
+            row["source_adapter"],
+            row.get("message_id_header"),
+            row["received_at"],
+            row["from_addr"],
+            row["subject"],
+        ),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Placeholders for later phases
+# ---------------------------------------------------------------------------
 
 
 @reconcile_app.callback()
