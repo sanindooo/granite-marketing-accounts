@@ -104,7 +104,16 @@ module = "execution.shared.*"
 strict = true
 
 [[tool.mypy.overrides]]
-module = ["keyring.*", "httpx", "tenacity.*", "structlog.*"]
+module = [
+    "keyring.*",
+    "httpx",
+    "tenacity.*",
+    "structlog.*",
+    "google.*",
+    "googleapiclient.*",
+    "google_auth_oauthlib.*",
+    "gspread.*",
+]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]
