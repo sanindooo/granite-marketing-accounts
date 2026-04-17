@@ -64,6 +64,100 @@ def test_ingest_bank_subcommand_registered() -> None:
     assert "wise" in result.stdout
 
 
+def test_ingest_bank_monzo_registered() -> None:
+    result = runner.invoke(app, ["ingest", "bank", "monzo", "--help"])
+    assert result.exit_code == 0
+
+
+def test_ingest_bank_monzo_surfaces_reauth_required(tmp_path, monkeypatch) -> None:
+    db = tmp_path / "pipeline.db"
+    runner.invoke(app, ["db", "migrate", "--db", str(db)])
+
+    from execution.adapters import monzo as monzo_mod
+    from execution.shared.errors import AuthExpiredError
+
+    class _BrokenAuth:
+        def access_token(self) -> str:
+            raise AuthExpiredError("simulated monzo expiry", source="monzo")
+
+    class _BrokenAdapter:
+        def __init__(self, *, auth, http=None):
+            del auth, http
+
+        def fetch_since(self, _watermark, *, now=None):
+            raise AuthExpiredError("simulated monzo expiry", source="monzo")
+
+        def close(self) -> None:
+            return None
+
+        @property
+        def next_watermark(self) -> str | None:
+            return None
+
+    monkeypatch.setattr(
+        monzo_mod.MonzoAuth, "from_keychain", staticmethod(lambda: _BrokenAuth())
+    )
+    monkeypatch.setattr(monzo_mod, "MonzoAdapter", _BrokenAdapter)
+
+    result = runner.invoke(app, ["ingest", "bank", "monzo", "--db", str(db)])
+    assert result.exit_code != 0
+    doc = json.loads(result.stdout.strip().splitlines()[-1])
+    assert doc["status"] == "error"
+    assert doc["error_code"] == "needs_reauth"
+
+
+def test_ops_reauth_monzo_walks_oauth_callback(tmp_path, monkeypatch) -> None:
+    db = tmp_path / "pipeline.db"
+    runner.invoke(app, ["db", "migrate", "--db", str(db)])
+
+    from datetime import UTC, datetime, timedelta
+
+    from execution.adapters import monzo as monzo_mod
+    from execution.adapters.monzo import CallbackResult, TokenCache
+
+    captured_state: dict[str, str] = {}
+
+    class _FakeAuth:
+        def build_authorize_url(self, *, state: str) -> str:
+            captured_state["state"] = state
+            return f"https://auth.monzo.com/?state={state}"
+
+        def exchange_code(self, *, code: str) -> TokenCache:
+            assert code == "fake-code"
+            now = datetime(2026, 4, 11, tzinfo=UTC)
+            return TokenCache(
+                access_token="a",
+                refresh_token="r",
+                access_expires_at=now + timedelta(hours=1),
+                first_auth_at=now,
+                last_refresh_at=now,
+                user_id="user-fake",
+            )
+
+    monkeypatch.setattr(
+        monzo_mod.MonzoAuth, "from_keychain", staticmethod(lambda: _FakeAuth())
+    )
+    monkeypatch.setattr(
+        monzo_mod,
+        "run_callback_server",
+        lambda *, expected_state, **_kw: CallbackResult(
+            code="fake-code", state=expected_state
+        ),
+    )
+    # No-op webbrowser.open so the test is CI-safe.
+    import webbrowser
+
+    monkeypatch.setattr(webbrowser, "open", lambda _url: False)
+
+    result = runner.invoke(app, ["ops", "reauth", "monzo", "--db", str(db)])
+    assert result.exit_code == 0
+    doc = json.loads(result.stdout.strip().splitlines()[-1])
+    assert doc["status"] == "success"
+    assert doc["source"] == "monzo"
+    assert doc["user_id"] == "user-fake"
+    assert captured_state["state"]  # used a non-empty CSRF state
+
+
 def test_ingest_bank_wise_surfaces_reauth_required(tmp_path, monkeypatch) -> None:
     db = tmp_path / "pipeline.db"
     runner.invoke(app, ["db", "migrate", "--db", str(db)])

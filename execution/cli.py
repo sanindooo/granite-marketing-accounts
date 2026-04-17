@@ -318,6 +318,69 @@ ingest_bank_app = typer.Typer(
 ingest_app.add_typer(ingest_bank_app)
 
 
+@ingest_bank_app.command("monzo")
+def ingest_bank_monzo(
+    db_path: Annotated[Path | None, typer.Option("--db")] = None,
+    initial: Annotated[
+        bool,
+        typer.Option(
+            "--initial",
+            help="Ignore the saved watermark and pull the full sliding window.",
+        ),
+    ] = False,
+) -> None:
+    """Pull Monzo transactions from every open account into ``transactions``."""
+    try:
+        from typing import cast
+
+        from execution.adapters.monzo import SOURCE_ID, MonzoAdapter, MonzoAuth
+        from execution.reconcile.ledger import RawTransactionLike, write_batch
+
+        conn = db_mod.connect(db_path)
+        db_mod.apply_migrations(conn)
+
+        watermark = None if initial else _load_watermark(conn, SOURCE_ID)
+        auth = MonzoAuth.from_keychain()
+        adapter = MonzoAdapter(auth=auth)
+        try:
+            batches = 0
+            transactions = 0
+            for batch in adapter.fetch_since(watermark):
+                batches += 1
+                transactions += len(batch)
+                stats = write_batch(
+                    conn, cast("list[RawTransactionLike]", batch)
+                )
+                del stats
+            _save_watermark(
+                conn,
+                SOURCE_ID,
+                watermark=adapter.next_watermark,
+                emit_count=transactions,
+            )
+            _clear_reauth(conn, SOURCE_ID)
+        finally:
+            adapter.close()
+
+        emit_success(
+            {
+                "source": SOURCE_ID,
+                "batches": batches,
+                "transactions": transactions,
+                "next_watermark_saved": adapter.next_watermark is not None,
+                "initial": initial,
+            }
+        )
+    except PipelineError as err:
+        if err.error_code == "needs_reauth":
+            conn = db_mod.connect(db_path)
+            db_mod.apply_migrations(conn)
+            _record_reauth(conn, err.source, message=str(err))
+        emit_error(err)
+    except Exception as err:
+        emit_error(err)
+
+
 @ingest_bank_app.command("wise")
 def ingest_bank_wise(
     db_path: Annotated[Path | None, typer.Option("--db")] = None,
@@ -418,8 +481,49 @@ def ops_reauth(
                 {"source": MS365_SOURCE, "reauth": "ok", "user_code": flow.get("user_code")}
             )
             return
+        if source == "monzo":
+            import contextlib
+            import webbrowser
+
+            from execution.adapters.monzo import (
+                SOURCE_ID as MONZO_SOURCE,
+            )
+            from execution.adapters.monzo import (
+                MonzoAuth,
+                new_state_token,
+                run_callback_server,
+            )
+
+            monzo_auth = MonzoAuth.from_keychain()
+            state = new_state_token()
+            url = monzo_auth.build_authorize_url(state=state)
+            sys.stderr.write(
+                "Opening browser for Monzo authorisation. If the browser "
+                "does not open automatically, visit:\n\n"
+                f"  {url}\n\n"
+                "After approving in the browser AND confirming in the "
+                "Monzo mobile app, the callback will complete here.\n"
+            )
+            sys.stderr.flush()
+            with contextlib.suppress(webbrowser.Error):
+                webbrowser.open(url)
+            callback = run_callback_server(expected_state=state)
+            cache = monzo_auth.exchange_code(code=callback.code)
+
+            conn = db_mod.connect(db_path)
+            db_mod.apply_migrations(conn)
+            _clear_reauth(conn, MONZO_SOURCE)
+            emit_success(
+                {
+                    "source": MONZO_SOURCE,
+                    "reauth": "ok",
+                    "user_id": cache.user_id,
+                    "access_expires_at": cache.access_expires_at.isoformat(),
+                }
+            )
+            return
         raise ConfigError(
-            f"unknown reauth source {source!r}; supported: 'ms365'",
+            f"unknown reauth source {source!r}; supported: 'ms365', 'monzo'",
             source="cli",
         )
     except PipelineError as err:
