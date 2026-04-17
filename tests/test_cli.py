@@ -69,6 +69,60 @@ def test_ingest_bank_monzo_registered() -> None:
     assert result.exit_code == 0
 
 
+def test_reconcile_match_registered() -> None:
+    result = runner.invoke(app, ["reconcile", "match", "--help"])
+    assert result.exit_code == 0
+
+
+def test_reconcile_run_registered() -> None:
+    result = runner.invoke(app, ["reconcile", "run", "--help"])
+    assert result.exit_code == 0
+
+
+def test_reconcile_match_empty_db_returns_zero_stats(tmp_path) -> None:
+    db = tmp_path / "pipeline.db"
+    runner.invoke(app, ["db", "migrate", "--db", str(db)])
+    result = runner.invoke(app, ["reconcile", "match", "--db", str(db)])
+    assert result.exit_code == 0
+    doc = json.loads(result.stdout.strip().splitlines()[-1])
+    assert doc["status"] == "success"
+    assert doc["invoices_scanned"] == 0
+    assert doc["rows_written"] == 0
+    assert doc["run_id"].startswith("match-")
+
+
+def test_reconcile_run_isolates_adapter_failures(tmp_path) -> None:
+    db = tmp_path / "pipeline.db"
+    runner.invoke(app, ["db", "migrate", "--db", str(db)])
+    result = runner.invoke(
+        app,
+        [
+            "reconcile",
+            "run",
+            "--db",
+            str(db),
+            "--skip-ingest",
+            "--skip-sheet",
+        ],
+    )
+    assert result.exit_code == 0
+    doc = json.loads(result.stdout.strip().splitlines()[-1])
+    assert doc["status"] == "ok"
+    assert doc["match"]["invoices_scanned"] == 0
+    # Warnings record skip-ingest for audit.
+    assert any("skipped" in w for w in doc["warnings"])
+    # The runs table must record a completed record.
+    import sqlite3
+
+    conn = sqlite3.connect(str(db))
+    conn.row_factory = sqlite3.Row
+    row = conn.execute(
+        "SELECT status, ended_at FROM runs ORDER BY started_at DESC LIMIT 1"
+    ).fetchone()
+    assert row["status"] == "ok"
+    assert row["ended_at"] is not None
+
+
 def test_ingest_bank_monzo_surfaces_reauth_required(tmp_path, monkeypatch) -> None:
     db = tmp_path / "pipeline.db"
     runner.invoke(app, ["db", "migrate", "--db", str(db)])

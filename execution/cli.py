@@ -14,9 +14,17 @@ from __future__ import annotations
 
 import sqlite3
 import sys
+from datetime import date
 from decimal import Decimal
 from pathlib import Path
-from typing import Annotated
+from typing import TYPE_CHECKING, Annotated
+
+if TYPE_CHECKING:  # pragma: no cover
+    from execution.output.sheet import (
+        ReconciliationRow,
+        UnmatchedInvoice,
+        UnmatchedTransaction,
+    )
 
 import typer
 
@@ -626,7 +634,560 @@ def _upsert_email(conn: sqlite3.Connection, row: dict[str, object]) -> None:
 
 @reconcile_app.callback()
 def reconcile_callback() -> None:
-    """Stub. Matching engine lands in Phase 4."""
+    """Reconciliation engine — matcher, ledger post-processing, end-to-end run."""
+
+
+@reconcile_app.command("match")
+def reconcile_match(
+    fiscal_year: Annotated[
+        str | None,
+        typer.Option("--fy", help="Restrict to a single FY (e.g. FY-2026-27)."),
+    ] = None,
+    db_path: Annotated[Path | None, typer.Option("--db")] = None,
+) -> None:
+    """Run the matcher over every invoice and upsert reconciliation_rows."""
+    try:
+        from execution.reconcile.run import run_matcher
+
+        conn = db_mod.connect(db_path)
+        db_mod.apply_migrations(conn)
+        run_id = _begin_run(conn, kind="match")
+        try:
+            stats = run_matcher(conn, run_id=run_id, fiscal_year=fiscal_year)
+            _complete_run(conn, run_id=run_id, status="ok", stats=_stats_dict(stats))
+        except PipelineError:
+            _complete_run(conn, run_id=run_id, status="failed", stats={})
+            raise
+        emit_success(
+            {
+                "run_id": run_id,
+                "fiscal_year": fiscal_year,
+                "invoices_scanned": stats.invoices_scanned,
+                "auto_matched": stats.auto_matched,
+                "suggested": stats.suggested,
+                "unmatched": stats.unmatched,
+                "rows_written": stats.rows_written,
+                "rows_preserved": stats.rows_preserved,
+            }
+        )
+    except PipelineError as err:
+        emit_error(err)
+    except Exception as err:
+        emit_error(err)
+
+
+@reconcile_app.command("run")
+def reconcile_run(
+    fiscal_year: Annotated[
+        str | None,
+        typer.Option("--fy", help="Restrict matcher + sheet writes to a single FY."),
+    ] = None,
+    skip_ingest: Annotated[
+        bool, typer.Option("--skip-ingest", help="Skip adapter pulls.")
+    ] = False,
+    skip_sheet: Annotated[
+        bool, typer.Option("--skip-sheet", help="Skip the Google Sheets write step.")
+    ] = False,
+    adapters: Annotated[
+        str,
+        typer.Option(
+            "--adapters",
+            help=(
+                "Comma-separated list of adapters to run. "
+                "Supported: ms365,amex_csv,wise,monzo. Default: all."
+            ),
+        ),
+    ] = "ms365,amex_csv,wise,monzo",
+    amex_drop: Annotated[
+        Path | None,
+        typer.Option(
+            "--amex-drop",
+            help="Override the Amex CSV drop folder (default: ~/Downloads/Amex).",
+        ),
+    ] = None,
+    db_path: Annotated[Path | None, typer.Option("--db")] = None,
+) -> None:
+    """End-to-end: ingest → ledger post-processing → match → (optional) sheet.
+
+    Adapters run in isolated try/except blocks so one failure doesn't
+    block the others; the JSON summary lists each adapter's outcome
+    plus a ``partial`` status when some adapters didn't complete.
+    """
+    try:
+        conn = db_mod.connect(db_path)
+        db_mod.apply_migrations(conn)
+        run_id = _begin_run(conn, kind="pipeline")
+        outcomes: dict[str, str] = {}
+        warnings: list[str] = []
+        requested = {a.strip() for a in adapters.split(",") if a.strip()}
+
+        if not skip_ingest:
+            if "ms365" in requested:
+                outcomes["ms365"] = _safe_run_adapter(conn, "ms365")
+            if "amex_csv" in requested:
+                outcomes["amex_csv"] = _safe_run_amex_csv(conn, drop=amex_drop)
+            if "wise" in requested:
+                outcomes["wise"] = _safe_run_adapter(conn, "wise")
+            if "monzo" in requested:
+                outcomes["monzo"] = _safe_run_adapter(conn, "monzo")
+        else:
+            warnings.append("ingest skipped via --skip-ingest")
+
+        # Ledger post-processing — refund linking.
+        try:
+            from execution.reconcile.ledger import link_refunds
+
+            refunds_linked = link_refunds(conn)
+        except PipelineError as err:
+            warnings.append(f"link_refunds: {err.user_message}")
+            refunds_linked = 0
+
+        # Matcher.
+        from execution.reconcile.run import run_matcher
+
+        match_stats = run_matcher(conn, run_id=run_id, fiscal_year=fiscal_year)
+
+        # Sheet writer (optional).
+        sheet_outcome = "skipped"
+        if not skip_sheet:
+            sheet_outcome = _safe_write_sheet(
+                conn,
+                fiscal_year=fiscal_year or london_today_fy(),
+                run_id=run_id,
+            )
+
+        status = "ok"
+        if any(v.startswith("error:") for v in outcomes.values()):
+            status = "partial"
+        _complete_run(
+            conn,
+            run_id=run_id,
+            status=status,
+            stats={
+                "adapters": outcomes,
+                "refunds_linked": refunds_linked,
+                "match": _stats_dict(match_stats),
+                "sheet": sheet_outcome,
+            },
+        )
+        emit_success(
+            {
+                "run_id": run_id,
+                "status": status,
+                "fiscal_year": fiscal_year or london_today_fy(),
+                "adapters": outcomes,
+                "refunds_linked": refunds_linked,
+                "match": {
+                    "invoices_scanned": match_stats.invoices_scanned,
+                    "auto_matched": match_stats.auto_matched,
+                    "suggested": match_stats.suggested,
+                    "unmatched": match_stats.unmatched,
+                    "rows_written": match_stats.rows_written,
+                    "rows_preserved": match_stats.rows_preserved,
+                },
+                "sheet": sheet_outcome,
+                "warnings": warnings,
+            }
+        )
+    except PipelineError as err:
+        emit_error(err)
+    except Exception as err:
+        emit_error(err)
+
+
+# ---------------------------------------------------------------------------
+# Orchestrator helpers
+# ---------------------------------------------------------------------------
+
+
+def _stats_dict(stats: object) -> dict[str, object]:
+    """asdict over a frozen+slotted dataclass; slots-dataclasses have no ``__dict__``."""
+    from dataclasses import asdict, is_dataclass
+
+    if is_dataclass(stats) and not isinstance(stats, type):
+        return asdict(stats)
+    return {}
+
+
+def _begin_run(conn: sqlite3.Connection, *, kind: str) -> str:
+    """Insert a ``runs`` record and return the generated ``run_id``."""
+    import secrets as _rnd
+
+    from execution.shared.clock import now_utc
+
+    run_id = f"{kind}-{now_utc().strftime('%Y%m%dT%H%M%S')}-{_rnd.token_hex(4)}"
+    with conn:
+        conn.execute(
+            """
+            INSERT INTO runs (run_id, started_at, status, stats_json, cost_gbp)
+            VALUES (?, ?, 'running', '{}', '0.00')
+            """,
+            (run_id, now_utc().isoformat()),
+        )
+    return run_id
+
+
+def _complete_run(
+    conn: sqlite3.Connection,
+    *,
+    run_id: str,
+    status: str,
+    stats: dict[str, object],
+) -> None:
+    import json as _json
+
+    from execution.shared.clock import now_utc
+
+    with conn:
+        conn.execute(
+            """
+            UPDATE runs
+               SET ended_at = ?, status = ?, stats_json = ?
+             WHERE run_id = ?
+            """,
+            (now_utc().isoformat(), status, _json.dumps(stats, default=str), run_id),
+        )
+
+
+def _safe_run_adapter(conn: sqlite3.Connection, adapter_name: str) -> str:
+    """Invoke an adapter's ingest in-process, capturing PipelineError.
+
+    Returns the outcome string (``"ok"`` | ``"ok:N"`` | ``"error:<code>"``)
+    for the Run Status tab + JSON output.
+    """
+    from typing import cast
+
+    from execution.reconcile.ledger import RawTransactionLike, write_batch
+
+    try:
+        if adapter_name == "ms365":
+            from execution.adapters.ms365 import (
+                SOURCE_ID as MS_SOURCE,
+            )
+            from execution.adapters.ms365 import (
+                Ms365Adapter,
+                Ms365Auth,
+            )
+
+            auth = Ms365Auth.from_keychain()
+            adapter = Ms365Adapter(auth=auth)
+            try:
+                watermark = _load_watermark(conn, MS_SOURCE)
+                total = 0
+                for batch in adapter.fetch_since(watermark):
+                    total += len(batch)
+                    with conn:
+                        for email in batch:
+                            _upsert_email(conn, email.as_email_row())
+                _save_watermark(
+                    conn, MS_SOURCE, watermark=adapter.next_watermark, emit_count=total
+                )
+                _clear_reauth(conn, MS_SOURCE)
+            finally:
+                adapter.close()
+            return f"ok:{total}"
+
+        if adapter_name == "wise":
+            from execution.adapters.wise import (
+                SOURCE_ID as WS_SOURCE,
+            )
+            from execution.adapters.wise import (
+                WiseAdapter,
+                WiseAuth,
+            )
+
+            w_auth = WiseAuth.from_keychain()
+            w_adapter = WiseAdapter(auth=w_auth)
+            try:
+                watermark = _load_watermark(conn, WS_SOURCE)
+                total = 0
+                for w_batch in w_adapter.fetch_since(watermark):
+                    total += len(w_batch)
+                    write_batch(conn, cast("list[RawTransactionLike]", w_batch))
+                _save_watermark(
+                    conn, WS_SOURCE, watermark=w_adapter.next_watermark, emit_count=total
+                )
+                _clear_reauth(conn, WS_SOURCE)
+            finally:
+                w_adapter.close()
+            return f"ok:{total}"
+
+        if adapter_name == "monzo":
+            from execution.adapters.monzo import (
+                SOURCE_ID as MZ_SOURCE,
+            )
+            from execution.adapters.monzo import (
+                MonzoAdapter,
+                MonzoAuth,
+            )
+
+            m_auth = MonzoAuth.from_keychain()
+            m_adapter = MonzoAdapter(auth=m_auth)
+            try:
+                watermark = _load_watermark(conn, MZ_SOURCE)
+                total = 0
+                for m_batch in m_adapter.fetch_since(watermark):
+                    total += len(m_batch)
+                    write_batch(conn, cast("list[RawTransactionLike]", m_batch))
+                _save_watermark(
+                    conn, MZ_SOURCE, watermark=m_adapter.next_watermark, emit_count=total
+                )
+                _clear_reauth(conn, MZ_SOURCE)
+            finally:
+                m_adapter.close()
+            return f"ok:{total}"
+        raise ConfigError(f"unknown adapter {adapter_name!r}", source="cli")
+    except PipelineError as err:
+        if err.error_code == "needs_reauth":
+            _record_reauth(conn, err.source, message=str(err))
+        return f"error:{err.error_code}"
+    except Exception as err:
+        # Adapters run in isolation so one failure doesn't block the others.
+        return f"error:{type(err).__name__}"
+
+
+def _safe_run_amex_csv(conn: sqlite3.Connection, *, drop: Path | None) -> str:
+    """Run the Amex CSV adapter over the drop folder."""
+    from typing import cast
+
+    from execution.adapters.amex_csv import (
+        SOURCE_ID as AMEX_SOURCE,
+    )
+    from execution.adapters.amex_csv import (
+        discover_csv_files,
+        fetch_from_file,
+    )
+    from execution.reconcile.ledger import RawTransactionLike, write_batch
+
+    drop_root = drop or Path.home() / "Downloads" / "Amex"
+    if not drop_root.exists():
+        return "error:missing_drop_folder"
+    try:
+        files = discover_csv_files(drop_root)
+        total = 0
+        for csv_file in files:
+            for batch in fetch_from_file(csv_file, drop_root=drop_root):
+                total += len(batch)
+                write_batch(conn, cast("list[RawTransactionLike]", batch))
+        _save_watermark(conn, AMEX_SOURCE, watermark=None, emit_count=total)
+        return f"ok:{total}"
+    except PipelineError as err:
+        return f"error:{err.error_code}"
+    except Exception as err:
+        return f"error:{type(err).__name__}"
+
+
+def _safe_write_sheet(
+    conn: sqlite3.Connection,
+    *,
+    fiscal_year: str,
+    run_id: str,
+) -> str:
+    """Materialise Reconciliation + Unmatched + Exceptions tabs for a FY."""
+    try:
+        from execution.output.sheet import (
+            ReconciliationRow,
+            UnmatchedInvoice,
+            UnmatchedTransaction,
+            write_reconciliation_tab,
+            write_unmatched_invoices_tab,
+            write_unmatched_txns_tab,
+        )
+        from execution.shared import sheet as sheet_mod
+
+        clients = sheet_mod.GoogleClients.connect()
+        fy_sheet = sheet_mod.create_fy_workbook(clients, conn, fiscal_year)
+        sink = _GspreadSheetSink(clients.gspread)
+
+        recon_rows = _materialise_recon_rows(conn, fiscal_year=fiscal_year)
+        write_reconciliation_tab(
+            sink, spreadsheet_id=fy_sheet.spreadsheet_id, rows=recon_rows
+        )
+
+        unmatched_inv = _materialise_unmatched_invoices(conn, fiscal_year=fiscal_year)
+        write_unmatched_invoices_tab(
+            sink, spreadsheet_id=fy_sheet.spreadsheet_id, rows=unmatched_inv
+        )
+
+        unmatched_tx = _materialise_unmatched_transactions(conn, fiscal_year=fiscal_year)
+        write_unmatched_txns_tab(
+            sink, spreadsheet_id=fy_sheet.spreadsheet_id, rows=unmatched_tx
+        )
+        del run_id, ReconciliationRow, UnmatchedInvoice, UnmatchedTransaction
+        return f"ok:{fy_sheet.spreadsheet_id}"
+    except PipelineError as err:
+        return f"error:{err.error_code}"
+    except Exception as err:
+        return f"error:{type(err).__name__}"
+
+
+def _materialise_recon_rows(
+    conn: sqlite3.Connection, *, fiscal_year: str
+) -> list[ReconciliationRow]:
+    from execution.output.sheet import ReconciliationRow
+
+    rows = conn.execute(
+        """
+        SELECT r.row_id, r.fiscal_year, r.state, r.match_score, r.match_reason,
+               r.user_note,
+               i.invoice_id, i.invoice_number, i.invoice_date,
+               i.vendor_name_raw, i.category, i.currency,
+               i.amount_gross, i.amount_gross_gbp, i.drive_web_view_link,
+               t.txn_id, t.booking_date, t.account, t.description_raw
+        FROM reconciliation_rows r
+        LEFT JOIN invoices i ON i.invoice_id = r.invoice_id
+        LEFT JOIN transactions t ON t.txn_id = r.txn_id
+        WHERE r.fiscal_year = ?
+        ORDER BY r.updated_at DESC
+        """,
+        (fiscal_year,),
+    ).fetchall()
+    out: list[ReconciliationRow] = []
+    for row in rows:
+        out.append(
+            ReconciliationRow(
+                row_id=row["row_id"],
+                fiscal_year=row["fiscal_year"],
+                state=row["state"],
+                score=Decimal(row["match_score"] or "0"),
+                invoice_id=row["invoice_id"],
+                invoice_number=row["invoice_number"],
+                invoice_date=_parse_iso_or_none(row["invoice_date"]),
+                supplier_name=row["vendor_name_raw"],
+                category=row["category"],
+                currency=row["currency"],
+                amount_gross=_decimal_or_none(row["amount_gross"]),
+                amount_gbp=_decimal_or_none(row["amount_gross_gbp"]),
+                txn_id=row["txn_id"],
+                booking_date=_parse_iso_or_none(row["booking_date"]),
+                account=row["account"],
+                description=row["description_raw"],
+                match_reason=row["match_reason"] or "",
+                verified=row["state"] == "user_verified",
+                override_match=None,
+                personal_flag=row["state"] == "user_personal",
+                ignore_flag=row["state"] == "user_ignore",
+                category_override=None,
+                notes=row["user_note"] or "",
+                drive_link=row["drive_web_view_link"],
+            )
+        )
+    return out
+
+
+def _materialise_unmatched_invoices(
+    conn: sqlite3.Connection, *, fiscal_year: str
+) -> list[UnmatchedInvoice]:
+    from execution.output.sheet import UnmatchedInvoice
+    from execution.shared.fiscal import fy_bounds
+
+    start, end = fy_bounds(fiscal_year)
+    rows = conn.execute(
+        """
+        SELECT i.invoice_id, i.vendor_name_raw, i.invoice_number,
+               i.invoice_date, i.currency, i.amount_gross, i.category,
+               i.drive_web_view_link
+        FROM invoices i
+        LEFT JOIN reconciliation_rows r ON r.invoice_id = i.invoice_id
+        WHERE i.deleted_at IS NULL
+          AND i.invoice_date BETWEEN ? AND ?
+          AND (r.state IS NULL OR r.state = 'unmatched')
+        """,
+        (start.isoformat(), end.isoformat()),
+    ).fetchall()
+    return [
+        UnmatchedInvoice(
+            invoice_id=row["invoice_id"],
+            supplier_name=row["vendor_name_raw"],
+            invoice_number=row["invoice_number"],
+            invoice_date=_parse_iso_or_none(row["invoice_date"]),
+            currency=row["currency"],
+            amount_gross=_decimal_or_none(row["amount_gross"]),
+            category=row["category"],
+            drive_link=row["drive_web_view_link"],
+        )
+        for row in rows
+    ]
+
+
+def _materialise_unmatched_transactions(
+    conn: sqlite3.Connection, *, fiscal_year: str
+) -> list[UnmatchedTransaction]:
+    from execution.output.sheet import UnmatchedTransaction
+    from execution.shared.fiscal import fy_bounds
+
+    start, end = fy_bounds(fiscal_year)
+    rows = conn.execute(
+        """
+        SELECT t.txn_id, t.booking_date, t.account, t.description_raw,
+               t.currency, t.amount, t.amount_gbp, t.txn_type, t.category
+        FROM transactions t
+        LEFT JOIN reconciliation_rows r ON r.txn_id = t.txn_id
+        WHERE t.deleted_at IS NULL
+          AND t.booking_date BETWEEN ? AND ?
+          AND t.txn_type != 'transfer'
+          AND r.row_id IS NULL
+        """,
+        (start.isoformat(), end.isoformat()),
+    ).fetchall()
+    from datetime import date as _date
+
+    return [
+        UnmatchedTransaction(
+            txn_id=row["txn_id"],
+            booking_date=_date.fromisoformat(row["booking_date"]),
+            account=row["account"],
+            description=row["description_raw"],
+            currency=row["currency"],
+            amount=Decimal(row["amount"]),
+            amount_gbp=Decimal(row["amount_gbp"]),
+            txn_type=row["txn_type"],
+            category=row["category"],
+        )
+        for row in rows
+    ]
+
+
+class _GspreadSheetSink:
+    """Adapter from :class:`SheetSink` protocol onto a live gspread client."""
+
+    def __init__(self, gspread_client: object) -> None:
+        self._gspread = gspread_client
+
+    def write_rectangle(
+        self,
+        *,
+        spreadsheet_id: str,
+        tab: str,
+        header: tuple[str, ...],
+        rows: list[list[str]],
+    ) -> None:
+        ss = self._gspread.open_by_key(spreadsheet_id)  # type: ignore[attr-defined]
+        try:
+            worksheet = ss.worksheet(tab)
+        except Exception:
+            worksheet = ss.add_worksheet(title=tab, rows=max(100, len(rows) + 1), cols=max(10, len(header)))
+        values = [list(header), *rows]
+        worksheet.clear()
+        if values:
+            worksheet.update(range_name="A1", values=values)
+
+
+def _parse_iso_or_none(value: str | None) -> date | None:
+    if not value:
+        return None
+    from datetime import date as _date
+    from datetime import datetime as _datetime
+
+    if "T" in value:
+        return _datetime.fromisoformat(value).date()
+    return _date.fromisoformat(value)
+
+
+def _decimal_or_none(value: str | None) -> Decimal | None:
+    if value is None or value == "":
+        return None
+    return Decimal(value)
 
 
 @output_app.callback()
