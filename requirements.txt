@@ -1,7 +1,24 @@
-# Base dependencies (included with template)
-python-dotenv
-requests
+# Generated from pyproject.toml for project-template compatibility.
+# For full install use: pip install -e .[all,dev]
 
-# Add project-specific dependencies below
-# Example: google-api-python-client (for Google Sheets integration)
-# Example: beautifulsoup4 (for web scraping)
+# Phase 1A runtime
+python-dotenv>=1.0
+keyring>=25.0
+httpx>=0.27
+tenacity>=9.0
+typer>=0.12
+structlog>=24.4
+python-dateutil>=2.9
+
+# Phase 2+ runtime (uncomment when those phases start)
+# anthropic>=0.40
+# pdfplumber>=0.11
+# pypdf>=5.0
+# cryptography>=43
+# msal>=1.30
+# imap_tools>=1.7
+# gspread>=6.1
+# google-api-python-client>=2.140
+# google-auth-oauthlib>=1.2
+# rapidfuzz>=3.10
+# pydantic>=2.9

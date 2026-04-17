@@ -1,0 +1,121 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "granite-accounts"
+version = "0.1.0"
+description = "Self-hosted accounting pipeline for a UK Ltd: email invoice ingestion + Amex/Wise/Monzo reconciliation"
+readme = "README.md"
+requires-python = ">=3.11"
+authors = [{ name = "Stephen Anindo", email = "stephen@granitemarketing.co.uk" }]
+license = { text = "MIT" }
+
+# Phase 1A runtime deps only. Later phases add their own optional-dependencies
+# groups; see docs/plans/2026-04-17-001-feat-accounting-assistant-pipeline-plan.md.
+dependencies = [
+    "python-dotenv>=1.0",
+    "keyring>=25.0",
+    "httpx>=0.27",
+    "tenacity>=9.0",
+    "typer>=0.12",
+    "structlog>=24.4",
+    "python-dateutil>=2.9",
+]
+
+[project.optional-dependencies]
+invoice = [
+    "anthropic>=0.40",
+    "pdfplumber>=0.11",
+    "pypdf>=5.0",
+]
+banks = [
+    "cryptography>=43",
+]
+email = [
+    "msal>=1.30",
+    "imap_tools>=1.7",
+]
+sheets = [
+    "gspread>=6.1",
+    "google-api-python-client>=2.140",
+    "google-auth-oauthlib>=1.2",
+]
+recon = [
+    "rapidfuzz>=3.10",
+]
+validation = [
+    "pydantic>=2.9",
+]
+all = [
+    "granite-accounts[invoice,banks,email,sheets,recon,validation]",
+]
+dev = [
+    "pytest>=8.3",
+    "pytest-mock>=3.14",
+    "pytest-recording>=0.13",
+    "time-machine>=2.15",
+    "hypothesis>=6.115",
+    "ruff>=0.7",
+    "mypy>=1.13",
+]
+
+[project.scripts]
+granite = "execution.cli:app"
+
+[tool.setuptools.packages.find]
+include = ["execution*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+# E/F = pycodestyle + pyflakes
+# I   = isort
+# UP  = pyupgrade
+# B   = bugbear
+# SIM = flake8-simplify
+# RUF = ruff-specific
+# PTH = flake8-use-pathlib (catches os.path vs pathlib)
+# DTZ = flake8-datetimez (catches naive datetime)
+# S   = flake8-bandit (catches insecure patterns)
+# ANN = flake8-annotations (type-hint enforcement)
+select = ["E", "F", "I", "UP", "B", "SIM", "RUF", "PTH", "DTZ", "S", "ANN"]
+ignore = [
+    "ANN401", # Allow Any when explicit
+    "S101",   # assert is fine in tests
+    "E501",   # line length handled elsewhere
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["ANN", "S", "DTZ"]
+"execution/__main__.py" = ["ANN"]
+
+[tool.mypy]
+python_version = "3.11"
+warn_unused_ignores = true
+warn_redundant_casts = true
+warn_return_any = true
+no_implicit_optional = true
+
+[[tool.mypy.overrides]]
+module = "execution.shared.*"
+strict = true
+
+[[tool.mypy.overrides]]
+module = ["keyring.*", "httpx", "tenacity.*", "structlog.*"]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+filterwarnings = [
+    "error",
+    "ignore::DeprecationWarning:google.*",
+]
+addopts = "-ra --strict-markers --strict-config"
+markers = [
+    "live: tests that hit real external APIs (require credentials, skipped by default)",
+    "integration: full-pipeline fixtures; no real network",
+]

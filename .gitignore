@@ -1,6 +1,9 @@
 # Ephemeral
 .tmp/
 
+# Pipeline state (SQLite DB, watermarks, config) — local durable, not committed
+.state/
+
 # Credentials
 .env
 credentials.json
@@ -8,6 +11,17 @@ token.json
 
 # Virtual environment
 venv/
+.venv/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+build/
+dist/
 
 # OS
 .DS_Store
