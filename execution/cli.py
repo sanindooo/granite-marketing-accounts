@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import sqlite3
 import sys
+from decimal import Decimal
 from pathlib import Path
 from typing import Annotated
 
@@ -155,6 +156,85 @@ def ops_health(
     emit_success(payload)
 
 
+@ops_app.command("smoke-claude")
+def ops_smoke_claude(
+    budget_gbp: Annotated[
+        str,
+        typer.Option("--budget", help="Per-run budget ceiling in GBP."),
+    ] = "0.05",
+) -> None:
+    """Send one cheap Haiku 4.5 ping to prove the Claude wiring works."""
+    try:
+        from execution.shared.claude_client import ClaudeClient
+
+        client = ClaudeClient(budget_gbp=Decimal(budget_gbp))
+        call = client.smoke()
+        emit_success(
+            {
+                "model": call.model,
+                "input_tokens": call.usage.input_tokens,
+                "output_tokens": call.usage.output_tokens,
+                "cost_gbp": format(call.cost_gbp, "f"),
+                "budget": client.budget.stats(),
+            }
+        )
+    except PipelineError as err:
+        emit_error(err)
+    except Exception as err:
+        emit_error(err)
+
+
+@ops_app.command("setup-sheets")
+def ops_setup_sheets() -> None:
+    """Run the Google OAuth flow and cache a refresh-capable token."""
+    try:
+        from execution.shared import sheet as sheet_mod
+
+        sheet_mod.load_credentials()
+        emit_success(
+            {
+                "token_path": str(sheet_mod.token_path()),
+                "scopes": list(sheet_mod.SCOPES),
+            }
+        )
+    except PipelineError as err:
+        emit_error(err)
+    except Exception as err:
+        emit_error(err)
+
+
+# ---------------------------------------------------------------------------
+# output subcommands (Phase 1B + Phase 4)
+# ---------------------------------------------------------------------------
+
+
+@output_app.command("create-fy")
+def output_create_fy(
+    fiscal_year: Annotated[str, typer.Argument(help="FY label, e.g. FY-2026-27.")],
+    db_path: Annotated[Path | None, typer.Option("--db")] = None,
+) -> None:
+    """Create the Drive folder + Sheets workbook for ``fiscal_year``."""
+    try:
+        from execution.shared import sheet as sheet_mod
+
+        conn = db_mod.connect(db_path)
+        db_mod.apply_migrations(conn)
+        clients = sheet_mod.GoogleClients.connect()
+        fy_sheet = sheet_mod.create_fy_workbook(clients, conn, fiscal_year)
+        emit_success(
+            {
+                "fiscal_year": fy_sheet.fiscal_year,
+                "spreadsheet_id": fy_sheet.spreadsheet_id,
+                "drive_folder_id": fy_sheet.drive_folder_id,
+                "web_view_link": fy_sheet.web_view_link,
+            }
+        )
+    except PipelineError as err:
+        emit_error(err)
+    except Exception as err:
+        emit_error(err)
+
+
 # ---------------------------------------------------------------------------
 # Placeholders for later phases
 # ---------------------------------------------------------------------------
@@ -171,7 +251,7 @@ def reconcile_callback() -> None:
 
 @output_app.callback()
 def output_callback() -> None:
-    """Stub. Sheet + sales tab output lands in Phase 4."""
+    """Output namespace; Phase 4 mounts the full sheet/sales commands."""
 
 
 if __name__ == "__main__":
