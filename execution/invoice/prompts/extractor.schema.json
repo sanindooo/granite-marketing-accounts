@@ -1,0 +1,107 @@
+{
+  "type": "object",
+  "properties": {
+    "supplier_name": { "type": ["string", "null"] },
+    "supplier_address": { "type": ["string", "null"] },
+    "supplier_vat_number": { "type": ["string", "null"] },
+    "customer_name": { "type": ["string", "null"] },
+    "customer_address": { "type": ["string", "null"] },
+    "invoice_number": { "type": ["string", "null"] },
+    "invoice_date": { "type": ["string", "null"] },
+    "supply_date": { "type": ["string", "null"] },
+    "description": { "type": ["string", "null"] },
+    "currency": { "type": ["string", "null"] },
+    "amount_net": { "type": ["string", "null"] },
+    "amount_vat": { "type": ["string", "null"] },
+    "amount_gross": { "type": ["string", "null"] },
+    "vat_rate": { "type": ["string", "null"] },
+    "reverse_charge": { "type": "boolean" },
+    "arithmetic_ok": { "type": "boolean" },
+    "line_items": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "description": { "type": ["string", "null"] },
+          "quantity": { "type": ["string", "null"] },
+          "unit_price": { "type": ["string", "null"] },
+          "amount_net": { "type": ["string", "null"] },
+          "amount_vat": { "type": ["string", "null"] },
+          "amount_gross": { "type": ["string", "null"] },
+          "vat_rate": { "type": ["string", "null"] }
+        },
+        "required": [
+          "description",
+          "quantity",
+          "unit_price",
+          "amount_net",
+          "amount_vat",
+          "amount_gross",
+          "vat_rate"
+        ],
+        "additionalProperties": false
+      }
+    },
+    "field_confidence": {
+      "type": "object",
+      "properties": {
+        "supplier_name": { "type": "number" },
+        "supplier_address": { "type": "number" },
+        "supplier_vat_number": { "type": "number" },
+        "customer_name": { "type": "number" },
+        "customer_address": { "type": "number" },
+        "invoice_number": { "type": "number" },
+        "invoice_date": { "type": "number" },
+        "supply_date": { "type": "number" },
+        "description": { "type": "number" },
+        "currency": { "type": "number" },
+        "amount_net": { "type": "number" },
+        "amount_vat": { "type": "number" },
+        "amount_gross": { "type": "number" },
+        "vat_rate": { "type": "number" }
+      },
+      "required": [
+        "supplier_name",
+        "supplier_address",
+        "supplier_vat_number",
+        "customer_name",
+        "customer_address",
+        "invoice_number",
+        "invoice_date",
+        "supply_date",
+        "description",
+        "currency",
+        "amount_net",
+        "amount_vat",
+        "amount_gross",
+        "vat_rate"
+      ],
+      "additionalProperties": false
+    },
+    "overall_confidence": { "type": "number" },
+    "extraction_notes": { "type": ["string", "null"] }
+  },
+  "required": [
+    "supplier_name",
+    "supplier_address",
+    "supplier_vat_number",
+    "customer_name",
+    "customer_address",
+    "invoice_number",
+    "invoice_date",
+    "supply_date",
+    "description",
+    "currency",
+    "amount_net",
+    "amount_vat",
+    "amount_gross",
+    "vat_rate",
+    "reverse_charge",
+    "arithmetic_ok",
+    "line_items",
+    "field_confidence",
+    "overall_confidence",
+    "extraction_notes"
+  ],
+  "additionalProperties": false
+}
