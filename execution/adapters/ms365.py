@@ -54,7 +54,13 @@ DEFAULT_SCOPES: Final[tuple[str, ...]] = (
     "Mail.Read",
     "offline_access",
 )
-AUTHORITY: Final[str] = "https://login.microsoftonline.com/common"
+# Fallback authority used by tests and when ``tenant_id`` is not yet in
+# Keychain. The production adapter resolves a single-tenant authority via
+# :func:`resolve_authority` which appends the Entra tenant id stored at
+# ``granite-accounts/ms365/tenant_id`` — the app registration is single-tenant.
+DEFAULT_AUTHORITY: Final[str] = "https://login.microsoftonline.com/common"
+AUTHORITY_BASE: Final[str] = "https://login.microsoftonline.com"
+AUTHORITY: Final[str] = DEFAULT_AUTHORITY  # backwards-compat alias for tests
 GRAPH_BASE: Final[str] = "https://graph.microsoft.com/v1.0"
 INBOX_DELTA_URL: Final[str] = f"{GRAPH_BASE}/me/mailFolders/inbox/messages/delta"
 
@@ -125,16 +131,18 @@ class Ms365Auth:
         *,
         client_id: str,
         scopes: tuple[str, ...] = DEFAULT_SCOPES,
+        authority: str = DEFAULT_AUTHORITY,
         msal_app: msal.PublicClientApplication | None = None,
     ) -> None:
         self.client_id = client_id
         self.scopes = scopes
+        self.authority = authority
         self._cache_loaded = False
         self._msal_app_override = msal_app
 
     @classmethod
     def from_keychain(cls) -> Ms365Auth:
-        """Load client_id from Keychain; fail loudly if not configured."""
+        """Load client_id + single-tenant authority from Keychain."""
         if secrets.is_mock():
             raise ConfigError(
                 "Ms365Auth.from_keychain() under MOCK_MODE — inject a fake auth "
@@ -142,7 +150,8 @@ class Ms365Auth:
                 source=SOURCE_ID,
             )
         client_id = secrets.require(SECRETS_NAMESPACE, "client_id")
-        return cls(client_id=client_id)
+        authority = resolve_authority()
+        return cls(client_id=client_id, authority=authority)
 
     def _app(self) -> msal.PublicClientApplication:
         if self._msal_app_override is not None:
@@ -156,7 +165,7 @@ class Ms365Auth:
             self._cache_loaded = True
         return msal.PublicClientApplication(
             client_id=self.client_id,
-            authority=AUTHORITY,
+            authority=self.authority,
             token_cache=cache,
         )
 
@@ -400,8 +409,41 @@ def _parse_graph_datetime(value: str) -> datetime:
     return datetime.fromisoformat(cleaned)
 
 
+def resolve_authority() -> str:
+    """Build the single-tenant MSAL authority from the Keychain tenant_id.
+
+    Falls back to :data:`DEFAULT_AUTHORITY` (``/common``) when ``tenant_id``
+    is not yet populated — this keeps the adapter usable during the very
+    first setup, where the user has not run ``granite ops reauth ms365``
+    and therefore hasn't stored a tenant yet. Once a tenant_id is present
+    we pin the authority to ``/<tenant_id>`` so the app registration's
+    single-tenant restriction is honoured (running against ``/common``
+    with a single-tenant app fails with ``AADSTS50194`` at the token
+    endpoint).
+    """
+    tenant_id = secrets.get(SECRETS_NAMESPACE, "tenant_id")
+    if not tenant_id:
+        return DEFAULT_AUTHORITY
+    cleaned = tenant_id.strip()
+    # Defensive: tenant IDs are GUIDs or ``<org>.onmicrosoft.com`` strings.
+    # Anything that contains a ``/`` would let a mis-set secret redirect the
+    # authority URL, so we refuse and fall back rather than interpolate.
+    if not cleaned or "/" in cleaned or " " in cleaned:
+        raise ConfigError(
+            f"ms365 tenant_id looks malformed: {cleaned!r}",
+            source=SOURCE_ID,
+            user_message=(
+                "Store a GUID or onmicrosoft.com tenant id in Keychain "
+                "under granite-accounts/ms365/tenant_id."
+            ),
+        )
+    return f"{AUTHORITY_BASE}/{cleaned}"
+
+
 __all__ = [
     "AUTHORITY",
+    "AUTHORITY_BASE",
+    "DEFAULT_AUTHORITY",
     "DEFAULT_BATCH_SIZE",
     "DEFAULT_PAGE_SIZE",
     "DEFAULT_SCOPES",
@@ -414,4 +456,5 @@ __all__ = [
     "Ms365Adapter",
     "Ms365Auth",
     "RawEmail",
+    "resolve_authority",
 ]

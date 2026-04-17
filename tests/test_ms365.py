@@ -11,6 +11,8 @@ import pytest
 
 from execution.adapters import ms365
 from execution.adapters.ms365 import (
+    AUTHORITY_BASE,
+    DEFAULT_AUTHORITY,
     DEFAULT_BATCH_SIZE,
     INBOX_DELTA_URL,
     SOURCE_ID,
@@ -20,6 +22,7 @@ from execution.adapters.ms365 import (
     _parse_graph_datetime,
     _parse_graph_message,
     _raise_for_graph_status,
+    resolve_authority,
 )
 from execution.shared import secrets
 from execution.shared.errors import (
@@ -132,6 +135,52 @@ def test_from_keychain_refuses_mock_mode(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(secrets, "is_mock", lambda: True)
     with pytest.raises(ConfigError, match="MOCK_MODE"):
         Ms365Auth.from_keychain()
+
+
+class TestResolveAuthority:
+    def test_falls_back_to_common_when_tenant_missing(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        monkeypatch.setattr(secrets, "get", lambda *_a, **_k: None)
+        assert resolve_authority() == DEFAULT_AUTHORITY
+
+    def test_builds_single_tenant_authority_from_guid(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        tenant = "11111111-2222-3333-4444-555555555555"
+        monkeypatch.setattr(secrets, "get", lambda *_a, **_k: tenant)
+        assert resolve_authority() == f"{AUTHORITY_BASE}/{tenant}"
+
+    def test_builds_single_tenant_authority_from_domain(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        monkeypatch.setattr(
+            secrets, "get", lambda *_a, **_k: "granitemarketing.onmicrosoft.com"
+        )
+        assert (
+            resolve_authority()
+            == f"{AUTHORITY_BASE}/granitemarketing.onmicrosoft.com"
+        )
+
+    def test_refuses_tenant_with_slash(self, monkeypatch: pytest.MonkeyPatch):
+        monkeypatch.setattr(secrets, "get", lambda *_a, **_k: "evil/tenant")
+        with pytest.raises(ConfigError, match="tenant_id"):
+            resolve_authority()
+
+    def test_refuses_tenant_with_whitespace(self, monkeypatch: pytest.MonkeyPatch):
+        monkeypatch.setattr(secrets, "get", lambda *_a, **_k: "bad tenant")
+        with pytest.raises(ConfigError, match="tenant_id"):
+            resolve_authority()
+
+
+def test_auth_constructor_stores_authority():
+    auth = Ms365Auth(client_id="cid", authority="https://login.microsoftonline.com/t1")
+    assert auth.authority == "https://login.microsoftonline.com/t1"
+
+
+def test_auth_defaults_to_common_authority():
+    auth = Ms365Auth(client_id="cid")
+    assert auth.authority == DEFAULT_AUTHORITY
 
 
 class _FakeMsalApp:
