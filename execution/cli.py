@@ -308,6 +308,83 @@ def ingest_email_ms365(
 
 
 # ---------------------------------------------------------------------------
+# ingest bank subcommands (Phase 3)
+# ---------------------------------------------------------------------------
+
+
+ingest_bank_app = typer.Typer(
+    name="bank", help="Bank-adapter ingestion.", no_args_is_help=True
+)
+ingest_app.add_typer(ingest_bank_app)
+
+
+@ingest_bank_app.command("wise")
+def ingest_bank_wise(
+    db_path: Annotated[Path | None, typer.Option("--db")] = None,
+    initial: Annotated[
+        bool,
+        typer.Option(
+            "--initial",
+            help="Ignore the saved watermark and pull the full sliding window.",
+        ),
+    ] = False,
+) -> None:
+    """Pull Wise statements across every profile + balance into ``transactions``."""
+    try:
+        from typing import cast
+
+        from execution.adapters.wise import SOURCE_ID, WiseAdapter, WiseAuth
+        from execution.reconcile.ledger import RawTransactionLike, write_batch
+
+        conn = db_mod.connect(db_path)
+        db_mod.apply_migrations(conn)
+
+        watermark = None if initial else _load_watermark(conn, SOURCE_ID)
+        auth = WiseAuth.from_keychain()
+        adapter = WiseAdapter(auth=auth)
+        try:
+            batches = 0
+            transactions = 0
+            for batch in adapter.fetch_since(watermark):
+                batches += 1
+                transactions += len(batch)
+                # Frozen+slots dataclasses don't match Protocols via mypy
+                # structural subtyping across modules; runtime isinstance
+                # confirms the shape (see ledger.RawTransactionLike).
+                stats = write_batch(
+                    conn, cast("list[RawTransactionLike]", batch)
+                )
+                del stats
+            _save_watermark(
+                conn,
+                SOURCE_ID,
+                watermark=adapter.next_watermark,
+                emit_count=transactions,
+            )
+            _clear_reauth(conn, SOURCE_ID)
+        finally:
+            adapter.close()
+
+        emit_success(
+            {
+                "source": SOURCE_ID,
+                "batches": batches,
+                "transactions": transactions,
+                "next_watermark_saved": adapter.next_watermark is not None,
+                "initial": initial,
+            }
+        )
+    except PipelineError as err:
+        if err.error_code == "needs_reauth":
+            conn = db_mod.connect(db_path)
+            db_mod.apply_migrations(conn)
+            _record_reauth(conn, err.source, message=str(err))
+        emit_error(err)
+    except Exception as err:
+        emit_error(err)
+
+
+# ---------------------------------------------------------------------------
 # ops reauth subcommands (Phase 2)
 # ---------------------------------------------------------------------------
 

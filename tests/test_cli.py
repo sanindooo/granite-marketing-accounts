@@ -57,6 +57,62 @@ def test_ingest_email_subcommand_registered() -> None:
     assert "ms365" in result.stdout
 
 
+def test_ingest_bank_subcommand_registered() -> None:
+    """`granite ingest bank wise` should be exposed."""
+    result = runner.invoke(app, ["ingest", "bank", "--help"])
+    assert result.exit_code == 0
+    assert "wise" in result.stdout
+
+
+def test_ingest_bank_wise_surfaces_reauth_required(tmp_path, monkeypatch) -> None:
+    db = tmp_path / "pipeline.db"
+    runner.invoke(app, ["db", "migrate", "--db", str(db)])
+
+    from execution.adapters import wise as wise_mod
+    from execution.shared.errors import AuthExpiredError
+
+    class _BrokenAuth:
+        def authorization_header(self) -> str:
+            return "Bearer fake"
+
+        def sign_challenge(self, _c: str) -> str:
+            raise AuthExpiredError("simulated", source="wise")
+
+    class _BrokenAdapter:
+        def __init__(self, *, auth, http=None):
+            del auth, http
+
+        def fetch_since(self, _watermark, *, now=None):
+            raise AuthExpiredError("simulated wise expiry", source="wise")
+
+        def close(self) -> None:
+            return None
+
+        @property
+        def next_watermark(self) -> str | None:
+            return None
+
+    monkeypatch.setattr(
+        wise_mod.WiseAuth, "from_keychain", staticmethod(lambda: _BrokenAuth())
+    )
+    monkeypatch.setattr(wise_mod, "WiseAdapter", _BrokenAdapter)
+
+    result = runner.invoke(app, ["ingest", "bank", "wise", "--db", str(db)])
+    assert result.exit_code != 0
+    doc = json.loads(result.stdout.strip().splitlines()[-1])
+    assert doc["status"] == "error"
+    assert doc["error_code"] == "needs_reauth"
+
+    import sqlite3
+
+    conn = sqlite3.connect(str(db))
+    conn.row_factory = sqlite3.Row
+    row = conn.execute(
+        "SELECT * FROM reauth_required WHERE source = 'wise'"
+    ).fetchone()
+    assert row is not None and row["resolved_at"] is None
+
+
 def test_ops_reauth_rejects_unknown_source() -> None:
     result = runner.invoke(app, ["ops", "reauth", "gmail"])
     # Unknown source path emits an error JSON and non-zero exit.

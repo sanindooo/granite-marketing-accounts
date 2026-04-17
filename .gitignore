@@ -9,6 +9,11 @@
 credentials.json
 token.json
 
+# Wise SCA key material — the private key lives in Keychain, the
+# public key is uploaded to the Wise developer portal. Neither PEM
+# ever belongs in git.
+*.pem
+
 # Virtual environment
 venv/
 .venv/

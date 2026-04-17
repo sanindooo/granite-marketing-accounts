@@ -38,19 +38,38 @@ import re
 import sqlite3
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
+from datetime import date
 from decimal import Decimal
-from typing import TYPE_CHECKING, Final, Literal
+from typing import Final, Literal, Protocol, runtime_checkable
 
 from execution.shared.errors import DataQualityError
 from execution.shared.fx import convert, get_rate
 from execution.shared.money import to_money
 
-if TYPE_CHECKING:  # pragma: no cover
-    from datetime import date
-
-    from execution.adapters.amex_csv import RawTransaction
-
 TxnType = Literal["purchase", "income", "transfer", "refund"]
+
+
+@runtime_checkable
+class RawTransactionLike(Protocol):
+    """Structural type every bank adapter's ``RawTransaction`` implements.
+
+    Keeping this as a Protocol (not a base class) lets the Amex-CSV,
+    Wise, and Monzo adapters stay independent frozen dataclasses
+    without a synthetic inheritance web. Optional fields (``status``,
+    ``provider_auth_id``) are read via ``getattr`` at call sites — see
+    :func:`write_batch`.
+    """
+
+    txn_id: str
+    account: str
+    booking_date: date
+    description_raw: str
+    description_canonical: str
+    currency: str
+    amount: Decimal
+    reference: str | None
+    category_hint: str | None
+    source: str
 
 # Description patterns that signal an inter-account transfer. Matched
 # against the canonical (upper-case, whitespace-collapsed) description —
@@ -129,7 +148,7 @@ def category_hint_for(canonical_description: str) -> str | None:
 
 def write_batch(
     conn: sqlite3.Connection,
-    rows: Iterable[RawTransaction],
+    rows: Iterable[RawTransactionLike],
     *,
     initial_status: Literal["pending", "settled"] = "settled",
     fx_target: str = "GBP",
@@ -166,6 +185,12 @@ def write_batch(
                 target=fx_target,
             )
             category = category_hint_for(raw.description_canonical) or raw.category_hint
+            # Adapters that surface pending/settled per-row (Wise, Monzo) set
+            # a ``status`` attribute on the RawTransaction; adapters that only
+            # see settled rows (Amex CSV) omit it and fall back to the
+            # caller-supplied default.
+            row_status = getattr(raw, "status", None) or initial_status
+            provider_auth_id = getattr(raw, "provider_auth_id", None) or raw.reference
 
             rowcount = conn.execute(
                 """
@@ -205,8 +230,8 @@ def write_batch(
                     format(raw.amount, "f"),
                     format(amount_gbp, "f"),
                     format(fx_rate, "f") if fx_rate is not None else None,
-                    initial_status,
-                    raw.reference,
+                    row_status,
+                    provider_auth_id,
                     raw.source,
                     category,
                 ),
@@ -327,7 +352,9 @@ def _to_gbp(
 
 
 # Re-export for callers that import directly.
-def rows_from_amex_csv(rows: Sequence[RawTransaction]) -> list[RawTransaction]:
+def rows_from_amex_csv(
+    rows: Sequence[RawTransactionLike],
+) -> list[RawTransactionLike]:
     """Identity pass-through (kept to avoid adapters importing ledger)."""
     return list(rows)
 
@@ -337,6 +364,7 @@ __all__ = [
     "REFUND_LOOKBACK_DAYS",
     "TRANSFER_DESCRIPTION_RE",
     "LedgerWriteStats",
+    "RawTransactionLike",
     "TxnType",
     "category_hint_for",
     "classify_txn_type",
