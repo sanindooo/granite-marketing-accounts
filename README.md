@@ -1,160 +1,202 @@
-# CEDOE Template
+# Granite Marketing Accounts
 
-A project template for building AI-assisted operations systems using **CEDOE** — [Compound Engineering](https://github.com/EveryInc/compound-engineering-plugin) + [DOE (Directive-Orchestration-Execution)](https://every.to/p/how-to-build-ai-agents-that-actually-work). Two well-defined systems, built by others, combined here:
+Self-hosted accounting pipeline for a UK Ltd: email invoice ingestion + Amex/Wise/Monzo bank reconciliation. Runs daily via launchd, produces a per-fiscal-year Google Sheet with matched expenses and exceptions.
 
-- **DOE** (by [Nicholas Potts](https://x.com/nick_potts_)) separates AI decision-making from deterministic execution via structured directives
-- **Compound Engineering** (by [Every](https://every.to)) adds planning, multi-agent review, and captured learnings on top
+## How to Use
 
-LLMs handle decision-making; deterministic Python scripts handle the work. This separation keeps things reliable at scale.
+**Talk to me naturally.** This system uses a 3-layer architecture where you (via an AI agent like Claude Code) orchestrate deterministic Python scripts. You don't need to memorize commands — just ask:
 
-## How It Works
+> "Fetch new emails and process any invoices"
+> "Show me all invoices from April 2026"
+> "Run the full reconciliation for this fiscal year"
+> "Which transactions are still unmatched?"
 
-The system uses a 3-layer architecture:
-
-| Layer | Role | Lives in |
-|-------|------|----------|
-| **Directive** | SOPs that define what to do — goals, inputs, tools, outputs, edge cases | `directives/` |
-| **Orchestration** | The AI agent reads directives, calls scripts in the right order, handles errors | Your AI tool (Claude, Gemini, Codex, etc.) |
-| **Execution** | Deterministic Python scripts that do the actual work — API calls, scraping, data processing | `execution/` |
-
-**Why not let the AI do everything?** Accuracy compounds. 90% accuracy per step = 59% over 5 steps. By pushing work into deterministic scripts, the AI only needs to make good decisions — not also produce flawless code on every run.
+I'll translate your request into the right CLI commands or database queries.
 
 ## Quick Start
 
-### Prerequisites
+```bash
+# 1. Initial setup (one-time)
+granite db migrate
+granite ops setup-sheets
+granite ops reauth ms365
 
-- Python 3.10+
-- An AI coding tool (Claude Code, Cursor, Windsurf, etc.)
+# 2. Daily workflow (or let launchd run it)
+granite reconcile run --adapters ms365,amex_csv,wise,monzo
+```
 
-### Setup
+## CLI Reference
+
+### Database
+
+| Command | Description |
+|---------|-------------|
+| `granite db migrate` | Apply pending migrations |
+| `granite db status` | Show DB path and schema version |
+
+### Operations
+
+| Command | Description |
+|---------|-------------|
+| `granite ops health` | Quick health probe |
+| `granite ops healthcheck` | Full pre-run check (JSON output) |
+| `granite ops smoke-claude` | Verify Claude API connectivity |
+| `granite ops setup-sheets` | Run Google OAuth flow |
+| `granite ops reauth <source>` | Re-authenticate MS365, Monzo, or Wise |
+
+### Email Ingestion
+
+| Command | Description |
+|---------|-------------|
+| `granite ingest email ms365` | Fetch new emails from MS365 inbox |
+| `granite ingest email ms365 --initial` | Ignore watermark, fetch all recent |
+
+### Invoice Processing
+
+| Command | Description |
+|---------|-------------|
+| `granite ingest invoice process` | Classify + extract + file pending emails |
+| `granite ingest invoice process --backfill` | Bulk mode: £20 budget, 1h cache |
+| `granite ingest invoice process --limit 10` | Process at most N emails |
+
+### Bank Ingestion
+
+| Command | Description |
+|---------|-------------|
+| `granite ingest bank monzo` | Pull Monzo transactions |
+| `granite ingest bank wise` | Pull Wise statements (SCA-signed) |
+| `granite ingest bank amex-csv` | Process CSVs from drop folder |
+
+### Reconciliation
+
+| Command | Description |
+|---------|-------------|
+| `granite reconcile run` | End-to-end: ingest → match → sheet |
+| `granite reconcile run --skip-ingest` | Match only (skip adapter fetches) |
+| `granite reconcile run --skip-sheet` | Match only (skip sheet write) |
+
+### Output
+
+| Command | Description |
+|---------|-------------|
+| `granite output create-fy FY-2026-27` | Create Drive folder + Sheets workbook |
+
+## Example Queries
+
+Since the data lives in SQLite, you can query it directly:
 
 ```bash
-# Clone the template
-git clone <repo-url>
-cd <your-project-name>
+# Invoices from this month (April 2026)
+sqlite3 .state/pipeline.db "SELECT vendor_name_raw, amount_gross, invoice_date FROM invoices WHERE invoice_date >= '2026-04-01'"
 
-# Install base dependencies
-pip install -r requirements.txt
+# Unmatched transactions
+sqlite3 .state/pipeline.db "SELECT booking_date, description_raw, amount_gbp FROM transactions WHERE txn_id NOT IN (SELECT txn_id FROM reconciliation_rows WHERE txn_id IS NOT NULL)"
 
-# Add your credentials
-cp .env.example .env  # Then fill in your API keys
+# Processing errors
+sqlite3 .state/pipeline.db "SELECT msg_id, error_code FROM emails WHERE outcome = 'error'"
+
+# Total expenses this FY
+sqlite3 .state/pipeline.db "SELECT SUM(CAST(amount_gbp AS REAL)) FROM transactions WHERE txn_type = 'purchase' AND booking_date >= '2026-03-01'"
 ```
 
-### Your First Directive + Script
+Or just ask me — I'll run the query for you.
 
-See [GETTING_STARTED.md](GETTING_STARTED.md) for a step-by-step walkthrough.
-
-## Project Structure
+## Architecture
 
 ```
-.
-├── directives/          # SOPs in Markdown (the instruction set)
-├── execution/           # Deterministic Python scripts (the tools)
-├── docs/
-│   ├── plans/           # Feature implementation plans
-│   ├── solutions/       # Documented learnings and fixes
-│   └── brainstorms/     # Early-stage thinking
-├── templates/           # Data files used by execution scripts
-├── .tmp/                # Intermediate files (never committed, always regenerated)
-├── .env.example         # Environment variable template
-├── CLAUDE.md            # Agent instructions (mirrored across AI tools)
-├── AGENTS.md            # Mirror for Codex/other agents
-├── GEMINI.md            # Mirror for Gemini
-├── compound-engineering.local.md  # Compound Engineering plugin config
-└── requirements.txt
+┌─────────────────────────────────────────────────────────────┐
+│  directives/          (Layer 1 — SOPs in Markdown)          │
+│  ingest_email.md  setup.md  reauth.md                       │
+└─────────────────────────┬───────────────────────────────────┘
+                          │ You talk to the AI agent (Layer 2)
+                          ▼
+┌─────────────────────────────────────────────────────────────┐
+│  execution/           (Layer 3 — Deterministic Python)      │
+│                                                             │
+│  adapters/           invoice/          reconcile/           │
+│  ├─ ms365.py         ├─ classifier.py  ├─ match.py          │
+│  ├─ wise.py          ├─ extractor.py   ├─ split.py          │
+│  ├─ monzo.py         ├─ filer.py       └─ state.py          │
+│  └─ amex_csv.py      └─ processor.py                        │
+│                                                             │
+│  shared/             output/           ops/                 │
+│  ├─ db.py            └─ sheet.py       ├─ healthcheck.py    │
+│  ├─ claude_client.py                   └─ launchd/          │
+│  └─ ...                                                     │
+└─────────────────────────────────────────────────────────────┘
 ```
 
-## Running a Directive
-
-Open your AI tool in this repo and tell it what to do. The agent reads the relevant directive and orchestrates the execution scripts.
+## Data Flow
 
 ```
-> Run the [your directive name] directive
+MS365 Inbox ──► emails table ──► classifier ──► extractor ──► invoices table
+                                     │                              │
+                                     │                              ▼
+Amex CSV    ──┐                      │                    Google Drive PDFs
+Wise API    ──┼──► transactions ─────┴──► reconciler ──► Google Sheets
+Monzo API   ──┘        table                                 │
+                                                             ▼
+                                              Expenses | Invoices | Exceptions
 ```
 
-The agent will:
-1. Read the directive from `directives/`
-2. Run execution scripts in the right order
-3. Handle errors and self-anneal
-4. Write results to your configured output (Google Sheets, etc.)
-5. Report a summary
+## Project Status
 
-You don't write any code at runtime. The directive tells the agent what to do; the scripts do the work.
+| Phase | Status | Description |
+|-------|--------|-------------|
+| 1. Foundation | Complete | SQLite, Keychain, CLI scaffold |
+| 2. Email + Invoice | Complete | MS365 ingest, Claude classify/extract, Drive filing |
+| 3. Bank Adapters | Complete | Amex CSV, Wise SCA, Monzo OAuth |
+| 4. Reconciliation | Complete | Weighted matcher, sheet output |
+| 5. Scheduling | Complete | launchd, healthcheck |
+| 6. Expansion | Pending | Gmail, IMAP, vendor learning, year-end |
 
-## Building New Skills (The DOE Loop)
+**The core pipeline is operational.** Phase 6 adds secondary inboxes and quality-of-life features.
 
-A "skill" is a directive + its execution script(s), built as a pair:
+## Directives
 
-1. **Write the directive** — define the goal, inputs, workflow steps, outputs, and edge cases in `directives/your_skill.md`
-2. **Write the script** — create the execution script(s) in `execution/` that the directive references
-3. **Test** — run the directive end-to-end through your AI tool
-4. **Self-anneal** — when something breaks, fix the script, test again, and update the directive with what you learned
+| Directive | Purpose |
+|-----------|---------|
+| `ingest_email.md` | Full email → invoice pipeline documentation |
+| `setup.md` | Initial credential configuration |
+| `reauth.md` | Token renewal procedures |
 
-Directives and scripts evolve together. When you discover API limits, timing issues, or better approaches, both get updated. If a learning applies beyond a single directive, write it up in `docs/solutions/`.
+## Costs
 
-## Compound Engineering (Optional)
+- **Subscriptions:** £0/year (no paid APIs)
+- **Claude API:** ~£5-10/year steady-state, ~£5-10 one-time backfill
+- **Storage:** Google Drive (existing account)
 
-[Compound Engineering](https://github.com/EveryInc/compound-engineering-plugin) adds structured planning, multi-agent code review, and captured learnings on top of the DOE loop. It's useful for complex features; overkill for simple skills.
+## Setup
 
-### Installation
+See `directives/setup.md` for full instructions. Quick version:
 
 ```bash
-# In Claude Code CLI
-/plugin install compound-engineering
+# 1. Install dependencies
+pip install -e ".[all,dev]"
+
+# 2. Store credentials in Keychain
+security add-generic-password -a granite-accounts -s granite-accounts/anthropic/api_key -w "sk-ant-..."
+
+# 3. Run OAuth flows
+granite ops setup-sheets
+granite ops reauth ms365
+
+# 4. Initialize database
+granite db migrate
+
+# 5. Create fiscal year workbook
+granite output create-fy FY-2026-27
 ```
 
-After installing, run `/setup` to auto-detect your stack. Then review `compound-engineering.local.md` to make sure the 3-layer architecture context is preserved (the setup wizard may overwrite it — restore from git if needed).
+## Development
 
-> **Note:** `compound-engineering.local.md` is committed to this repo. It contains DOE-specific review context that teaches the Compound Engineering agents about the 3-layer architecture. If you re-run `/setup`, compare the generated file against git before committing.
+```bash
+# Run tests
+pytest tests/ -k 'not live'
 
-### Workflows
+# Lint
+ruff check .
 
-| Command | What it does | When to use it |
-|---------|-------------|----------------|
-| `/workflows:brainstorm` | Explore an approach with structured thinking | Early-stage ideas |
-| `/workflows:plan` | Research codebase, produce an implementation plan | Before building new features |
-| `/workflows:work` | Execute the plan step by step | Complex multi-step features |
-| `/workflows:review` | Multi-agent code review | Before merging |
-| `/workflows:compound` | Record learnings from completed work | After finishing a feature |
-
-### When to Use What
-
-**Running an existing directive** — DOE only, no CE needed. The agent reads the directive, runs scripts, self-anneals on errors. This is 80% of daily usage.
-
-**Building a new simple skill** (one directive, one script) — DOE + CE at the end:
-1. Write the directive and script (DOE loop: write, test, self-anneal)
-2. `/workflows:review` to catch issues
-3. `/workflows:compound` to capture learnings
-
-**Building something complex** (multiple scripts, new integrations, open questions) — full CE cycle:
-1. `/workflows:brainstorm` to explore the approach
-2. `/workflows:plan` to design the implementation
-3. Build out the plan
-4. `/workflows:review` for multi-agent review
-5. `/workflows:compound` to capture learnings
-
-**The relationship:** DOE is the engine (how every directive runs). CE is the workshop (how you build and improve the engine). You always use DOE. You use CE when building or evolving.
-
-### Configuration
-
-Review agents and project context are configured in `compound-engineering.local.md`. The default agents are:
-
-- **code-simplicity-reviewer** — flags unnecessary complexity
-- **security-sentinel** — checks for security issues
-- **performance-oracle** — checks for performance problems
-
-Edit the YAML frontmatter to add, remove, or swap agents.
-
-## Agent Instructions
-
-Agent instructions live in `CLAUDE.md` (mirrored to `AGENTS.md` and `GEMINI.md`). These files teach the AI agent how to operate within the 3-layer architecture — they're the framework's operating manual. Changes to one must be mirrored to all three.
-
-The instructions include execution script standards (structured output, security patterns, performance guidelines) learned from real-world usage. See `CLAUDE.md` for the full reference.
-
-## Contributing
-
-- **Mirror agent instructions** — changes to `CLAUDE.md` must be mirrored to `AGENTS.md` and `GEMINI.md`
-- **Deliverables go to cloud services** — Google Sheets, Slides, etc. Local files are for processing only
-- **`.tmp/` is ephemeral** — everything in it can be deleted and regenerated
-- **Update directives as you learn** — directives are living documents, not write-once specs
-- **Don't commit secrets** — `.env`, `credentials.json`, and `token.json` are in `.gitignore`
+# Type check
+mypy execution/shared/
+```
