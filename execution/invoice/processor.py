@@ -46,7 +46,7 @@ from execution.invoice.filer import (
 from execution.invoice.pdf_fetcher import FetchOutcome, FetchStatus, fetch_invoice_pdf
 from execution.shared.claude_client import ClaudeClient
 from execution.shared.clock import now_utc
-from execution.shared.errors import BudgetExhaustedError, PipelineError
+from execution.shared.errors import BudgetExceededError, PipelineError
 from execution.shared.http import SafeHttpClient
 from execution.shared.prompts import LoadedPrompt
 
@@ -165,7 +165,7 @@ def process_pending_emails(
                 elif outcome == "needs_manual_download":
                     stats.needs_manual_download += 1
 
-            except BudgetExhaustedError:
+            except BudgetExceededError:
                 raise
             except PipelineError as err:
                 stats.errors += 1
@@ -182,7 +182,7 @@ def process_pending_emails(
                 )
                 _update_email_outcome(conn, email_row.msg_id, "error", error_code="unexpected")
 
-        stats.cost_gbp = claude.budget.spent
+        stats.cost_gbp = claude.budget.spent_gbp
         return stats
 
     finally:

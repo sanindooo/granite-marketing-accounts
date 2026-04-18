@@ -52,7 +52,7 @@ SECRETS_NAMESPACE: Final[str] = "ms365"
 
 DEFAULT_SCOPES: Final[tuple[str, ...]] = (
     "Mail.Read",
-    "offline_access",
+    # Note: offline_access is added automatically by MSAL for device flow
 )
 # Fallback authority used by tests and when ``tenant_id`` is not yet in
 # Keychain. The production adapter resolves a single-tenant authority via
@@ -269,7 +269,7 @@ class Ms365Adapter:
             return self._http
         import httpx
 
-        self._http = httpx.Client(timeout=httpx.Timeout(connect=5.0, read=60.0))
+        self._http = httpx.Client(timeout=httpx.Timeout(30.0, connect=5.0, read=60.0))
         return self._http
 
     def close(self) -> None:
@@ -301,7 +301,7 @@ class Ms365Adapter:
                 params=params,
                 headers={
                     "Authorization": f"Bearer {token}",
-                    "Prefer": 'odata.maxpagesize="' + str(self._page_size) + '"',
+                    "Prefer": f"odata.maxpagesize={self._page_size}",
                 },
             )
             _raise_for_graph_status(response)

@@ -117,8 +117,23 @@ def classify_email(
     return _parse_response(text), call
 
 
+def _strip_markdown_fences(text: str) -> str:
+    """Strip markdown code fences if present."""
+    text = text.strip()
+    if text.startswith("```"):
+        lines = text.split("\n")
+        # Remove first line (```json or ```)
+        lines = lines[1:]
+        # Remove last line if it's just ```
+        if lines and lines[-1].strip() == "```":
+            lines = lines[:-1]
+        text = "\n".join(lines)
+    return text.strip()
+
+
 def _parse_response(text: str) -> ClassifierResult:
     """Parse + validate the classifier response."""
+    text = _strip_markdown_fences(text)
     try:
         data = json.loads(text)
     except json.JSONDecodeError as err:

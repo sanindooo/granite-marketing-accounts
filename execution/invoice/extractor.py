@@ -294,7 +294,20 @@ def _one_call(
     return _parse_response(text), call
 
 
+def _strip_markdown_fences(text: str) -> str:
+    """Strip markdown code fences if present."""
+    text = text.strip()
+    if text.startswith("```"):
+        lines = text.split("\n")
+        lines = lines[1:]
+        if lines and lines[-1].strip() == "```":
+            lines = lines[:-1]
+        text = "\n".join(lines)
+    return text.strip()
+
+
 def _parse_response(text: str) -> ExtractorResult:
+    text = _strip_markdown_fences(text)
     try:
         data = json.loads(text)
     except json.JSONDecodeError as err:

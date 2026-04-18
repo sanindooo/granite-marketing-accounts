@@ -412,7 +412,12 @@ def ingest_invoice_process(
             process_pending_emails,
         )
         from execution.shared.claude_client import ClaudeClient
-        from execution.shared.prompts import load_prompt
+        from execution.shared.claude_client import HAIKU
+        from execution.shared.prompts import (
+            CLASSIFIER_WEIGHTS,
+            EXTRACTOR_WEIGHTS,
+            load_prompt,
+        )
         from execution.shared.sheet import GoogleClients
 
         conn = db_mod.connect(db_path)
@@ -424,8 +429,8 @@ def ingest_invoice_process(
         claude = ClaudeClient(budget_gbp=budget_gbp, ttl=ttl)
 
         # Load prompts
-        classifier_prompt = load_prompt("classifier")
-        extractor_prompt = load_prompt("extractor")
+        classifier_prompt = load_prompt("classifier", model_id=HAIKU, weights=CLASSIFIER_WEIGHTS)
+        extractor_prompt = load_prompt("extractor", model_id=HAIKU, weights=EXTRACTOR_WEIGHTS)
 
         # Setup adapters
         auth = Ms365Auth.from_keychain()
