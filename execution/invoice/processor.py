@@ -131,13 +131,24 @@ def process_pending_emails(
     tmp_root: Path,
     batch_size: int = DEFAULT_BATCH_SIZE,
     limit: int | None = None,
+    on_progress: Any | None = None,
 ) -> ProcessStats:
     """Process all unprocessed emails and return stats.
 
     Commits each email individually so partial progress is preserved on crash.
+
+    Args:
+        on_progress: Optional callback(current, total, detail) called after each email.
     """
     stats = ProcessStats()
     http_client = SafeHttpClient()
+
+    # Get total count for progress reporting
+    total = conn.execute(
+        "SELECT COUNT(*) FROM emails WHERE processed_at IS NULL"
+    ).fetchone()[0]
+    if limit and limit < total:
+        total = limit
 
     try:
         for email_row in _pending_emails(conn, batch_size=batch_size, limit=limit):
@@ -173,6 +184,10 @@ def process_pending_emails(
                     stats.classified_neither += 1
                 elif outcome == "needs_manual_download":
                     stats.needs_manual_download += 1
+
+                # Emit progress if callback provided
+                if on_progress:
+                    on_progress(stats.processed, total, f"Processed: {outcome}")
 
             except BudgetExceededError:
                 raise

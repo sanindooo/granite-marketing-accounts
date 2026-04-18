@@ -123,6 +123,29 @@ class SSRFValidationError(PipelineError):
     error_code = "ssrf_rejected"
 
 
+def emit_progress(
+    stage: str,
+    current: int,
+    total: int,
+    detail: str = "",
+) -> None:
+    """Write a progress event to stderr as NDJSON.
+
+    Progress events go to stderr so they don't interfere with the final
+    success/error JSON on stdout. The frontend can stream stderr via SSE.
+    """
+    doc = {
+        "event": "progress",
+        "stage": stage,
+        "current": current,
+        "total": total,
+        "detail": detail,
+    }
+    sys.stderr.write(json.dumps(doc, default=_json_default))
+    sys.stderr.write("\n")
+    sys.stderr.flush()
+
+
 def emit_success(payload: dict[str, Any]) -> None:
     """Write a single success JSON document to stdout."""
     doc = {"status": "success", **payload}

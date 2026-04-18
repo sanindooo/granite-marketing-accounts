@@ -29,7 +29,7 @@ if TYPE_CHECKING:  # pragma: no cover
 import typer
 
 from execution.shared import db as db_mod
-from execution.shared.errors import ConfigError, PipelineError, emit_error, emit_success
+from execution.shared.errors import ConfigError, PipelineError, emit_error, emit_progress, emit_success
 from execution.shared.fiscal import london_today_fy
 from execution.shared.secrets import ensure_backend, is_mock
 
@@ -369,6 +369,7 @@ def ingest_email_ms365(
             # Backfill mode: search historical + set up delta sync
             if backfill_from:
                 # Phase 1: Backfill historical emails via search
+                emit_progress("backfill_search", 0, 0, f"Searching emails from {backfill_from}")
                 for batch in adapter.search_inbox(date_from=backfill_from):
                     batches += 1
                     with conn:
@@ -382,9 +383,11 @@ def ingest_email_ms365(
                                 continue
                             _upsert_email(conn, email.as_email_row())
                             backfill_emails += 1
+                    emit_progress("backfill_search", backfill_emails, 0, f"Fetched {backfill_emails} emails")
                 emails += backfill_emails
 
                 # Phase 2: Run delta sync to establish watermark for future runs
+                emit_progress("backfill_delta", 0, 0, "Setting up incremental sync")
                 delta_emails = 0
                 for batch in adapter.fetch_since(None):
                     batches += 1
@@ -399,6 +402,7 @@ def ingest_email_ms365(
                                 continue
                             _upsert_email(conn, email.as_email_row())
                             delta_emails += 1
+                    emit_progress("backfill_delta", delta_emails, 0, f"Delta sync: {delta_emails} new emails")
                 emails += delta_emails
                 _save_watermark(
                     conn, SOURCE_ID, watermark=adapter.next_watermark, emit_count=emails
@@ -406,6 +410,8 @@ def ingest_email_ms365(
 
             # Search mode: use filters but don't set up delta sync
             elif sender or date_from or date_to:
+                filter_desc = sender or date_from or "filtered"
+                emit_progress("search", 0, 0, f"Searching emails: {filter_desc}")
                 for batch in adapter.search_inbox(
                     sender=sender, date_from=date_from, date_to=date_to
                 ):
@@ -421,6 +427,7 @@ def ingest_email_ms365(
                                 continue
                             _upsert_email(conn, email.as_email_row())
                             emails += 1
+                    emit_progress("search", emails, 0, f"Found {emails} new emails")
 
             # Standard delta sync
             else:
@@ -428,21 +435,16 @@ def ingest_email_ms365(
 
                 # First-run warning: no watermark means historical emails will be missed
                 if watermark is None and not initial:
-                    import sys
-                    print(
-                        '{"warning": "first_run_no_backfill", "message": '
-                        '"No prior sync found. Historical emails will not be captured. '
-                        'Consider running with --backfill-from YYYY-MM-DD (e.g., --backfill-from 2026-03-01) '
-                        'to capture historical invoices."}',
-                        file=sys.stderr,
-                    )
+                    emit_progress("sync", 0, 0, "No prior sync found - consider using --backfill-from")
 
+                emit_progress("sync", 0, 0, "Fetching new emails")
                 for batch in adapter.fetch_since(watermark):
                     batches += 1
                     emails += len(batch)
                     with conn:
                         for email in batch:
                             _upsert_email(conn, email.as_email_row())
+                    emit_progress("sync", emails, 0, f"Synced {emails} emails")
                 _save_watermark(
                     conn, SOURCE_ID, watermark=adapter.next_watermark, emit_count=emails
                 )
@@ -565,6 +567,10 @@ def ingest_invoice_process(
         resolved_tmp = tmp_root or Path(".tmp")
         resolved_tmp.mkdir(parents=True, exist_ok=True)
 
+        def progress_callback(current: int, total: int, detail: str) -> None:
+            emit_progress("process", current, total, detail)
+
+        emit_progress("process", 0, 0, "Starting invoice processing")
         try:
             stats = process_pending_emails(
                 conn,
@@ -575,6 +581,7 @@ def ingest_invoice_process(
                 extractor_prompt=extractor_prompt,
                 tmp_root=resolved_tmp,
                 limit=limit,
+                on_progress=progress_callback,
             )
             emit_success(
                 {
@@ -1007,7 +1014,11 @@ def reconcile_run(
         warnings: list[str] = []
         requested = {a.strip() for a in adapters.split(",") if a.strip()}
 
+        total_phases = 4 if not skip_sheet else 3
+        phase = 0
+
         if not skip_ingest:
+            emit_progress("reconcile", phase, total_phases, "Ingesting transactions")
             if "ms365" in requested:
                 outcomes["ms365"] = _safe_run_adapter(conn, "ms365")
             if "amex_csv" in requested:
@@ -1018,8 +1029,10 @@ def reconcile_run(
                 outcomes["monzo"] = _safe_run_adapter(conn, "monzo")
         else:
             warnings.append("ingest skipped via --skip-ingest")
+        phase += 1
 
         # Ledger post-processing — refund linking.
+        emit_progress("reconcile", phase, total_phases, "Linking refunds")
         try:
             from execution.reconcile.ledger import link_refunds
 
@@ -1027,15 +1040,19 @@ def reconcile_run(
         except PipelineError as err:
             warnings.append(f"link_refunds: {err.user_message}")
             refunds_linked = 0
+        phase += 1
 
         # Matcher.
+        emit_progress("reconcile", phase, total_phases, "Matching invoices to transactions")
         from execution.reconcile.run import run_matcher
 
         match_stats = run_matcher(conn, run_id=run_id, fiscal_year=fiscal_year)
+        phase += 1
 
         # Sheet writer (optional).
         sheet_outcome = "skipped"
         if not skip_sheet:
+            emit_progress("reconcile", phase, total_phases, "Writing to Google Sheet")
             sheet_outcome = _safe_write_sheet(
                 conn,
                 fiscal_year=fiscal_year or london_today_fy(),
