@@ -5,6 +5,7 @@ import { useQueryState, parseAsString } from "nuqs";
 import { toast } from "sonner";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
 import {
   Table,
   TableBody,
@@ -14,28 +15,10 @@ import {
   TableRow,
 } from "@/components/ui/table";
 import { getCurrentFY } from "@/lib/fiscal";
+import { formatCurrency, formatDateTime } from "@/lib/formatters";
 import type { DashboardMetrics, LastRun } from "@/lib/queries/dashboard";
 import { fetchDashboardMetrics, fetchLastRuns } from "@/lib/actions/dashboard";
-import { runPipelineCommand, type PipelineCommand } from "@/lib/actions/pipeline";
-
-function formatCurrency(amount: number): string {
-  return new Intl.NumberFormat("en-GB", {
-    style: "currency",
-    currency: "GBP",
-    minimumFractionDigits: 0,
-    maximumFractionDigits: 0,
-  }).format(amount);
-}
-
-function formatDate(dateStr: string | null): string {
-  if (!dateStr) return "Never";
-  return new Date(dateStr).toLocaleDateString("en-GB", {
-    day: "numeric",
-    month: "short",
-    hour: "2-digit",
-    minute: "2-digit",
-  });
-}
+import { runPipelineCommand, type PipelineCommand, type PipelineOptions } from "@/lib/actions/pipeline";
 
 const PIPELINE_COMMANDS: { key: PipelineCommand; label: string; description: string }[] = [
   { key: "syncEmails", label: "Sync emails", description: "Fetch new invoices from MS365" },
@@ -49,6 +32,19 @@ export function DashboardContent() {
   const [lastRuns, setLastRuns] = useState<LastRun[]>([]);
   const [loading, setLoading] = useState(true);
   const [runningCommand, setRunningCommand] = useState<PipelineCommand | null>(null);
+
+  const [showFilters, setShowFilters] = useState(false);
+  const [pipelineFilters, setPipelineFilters] = useState<{
+    dateFrom: string;
+    dateTo: string;
+    senderSearch: string;
+    limit?: number;
+  }>({
+    dateFrom: "",
+    dateTo: "",
+    senderSearch: "",
+    limit: undefined,
+  });
 
   useEffect(() => {
     async function loadData() {
@@ -72,7 +68,13 @@ export function DashboardContent() {
   const handleRunCommand = async (command: PipelineCommand) => {
     setRunningCommand(command);
     try {
-      const result = await runPipelineCommand(command, { fiscalYear: fy });
+      const options: PipelineOptions = { fiscalYear: fy };
+      if (pipelineFilters.senderSearch) options.sender = pipelineFilters.senderSearch;
+      if (pipelineFilters.dateFrom) options.dateFrom = pipelineFilters.dateFrom;
+      if (pipelineFilters.dateTo) options.dateTo = pipelineFilters.dateTo;
+      if (pipelineFilters.limit) options.limit = pipelineFilters.limit;
+
+      const result = await runPipelineCommand(command, options);
       if (result.ok) {
         toast.success(`${command} completed successfully`);
         const [metricsResult, runsResult] = await Promise.all([
@@ -120,7 +122,9 @@ export function DashboardContent() {
             </CardTitle>
           </CardHeader>
           <CardContent>
-            <div className="text-2xl font-bold">{metrics.invoiceCount}</div>
+            <div className="text-2xl font-bold font-mono tabular-nums">
+              {metrics.invoiceCount}
+            </div>
           </CardContent>
         </Card>
 
@@ -131,7 +135,9 @@ export function DashboardContent() {
             </CardTitle>
           </CardHeader>
           <CardContent>
-            <div className="text-2xl font-bold">{formatCurrency(metrics.totalSpend)}</div>
+            <div className="text-2xl font-bold font-mono tabular-nums">
+              {formatCurrency(metrics.totalSpend)}
+            </div>
           </CardContent>
         </Card>
 
@@ -142,7 +148,9 @@ export function DashboardContent() {
             </CardTitle>
           </CardHeader>
           <CardContent>
-            <div className="text-2xl font-bold text-green-600">{matchedCount}</div>
+            <div className="text-2xl font-bold font-mono tabular-nums text-green-600">
+              {matchedCount}
+            </div>
           </CardContent>
         </Card>
 
@@ -153,7 +161,7 @@ export function DashboardContent() {
             </CardTitle>
           </CardHeader>
           <CardContent>
-            <div className="text-2xl font-bold text-amber-600">
+            <div className="text-2xl font-bold font-mono tabular-nums text-amber-600">
               {unmatchedCount + pendingCount}
             </div>
           </CardContent>
@@ -180,7 +188,9 @@ export function DashboardContent() {
                   {metrics.categoryBreakdown.map((cat) => (
                     <TableRow key={cat.category}>
                       <TableCell className="capitalize">{cat.category}</TableCell>
-                      <TableCell className="text-right">{formatCurrency(cat.total)}</TableCell>
+                      <TableCell className="text-right font-mono tabular-nums">
+                        {formatCurrency(cat.total)}
+                      </TableCell>
                     </TableRow>
                   ))}
                 </TableBody>
@@ -208,7 +218,9 @@ export function DashboardContent() {
                   {metrics.topVendors.map((vendor) => (
                     <TableRow key={vendor.name}>
                       <TableCell>{vendor.name}</TableCell>
-                      <TableCell className="text-right">{formatCurrency(vendor.total)}</TableCell>
+                      <TableCell className="text-right font-mono tabular-nums">
+                        {formatCurrency(vendor.total)}
+                      </TableCell>
                     </TableRow>
                   ))}
                 </TableBody>
@@ -219,10 +231,113 @@ export function DashboardContent() {
       </div>
 
       <Card>
-        <CardHeader>
+        <CardHeader className="flex flex-row items-center justify-between">
           <CardTitle>Pipeline Controls</CardTitle>
+          <Button
+            variant="ghost"
+            size="sm"
+            onClick={() => setShowFilters(!showFilters)}
+          >
+            {showFilters ? "Hide filters" : "Show filters"}
+          </Button>
         </CardHeader>
         <CardContent>
+          {showFilters && (
+            <div className="mb-6 space-y-4 rounded-md border bg-muted/30 p-4">
+              <div className="space-y-4">
+                <div className="space-y-2">
+                  <label className="text-sm font-medium">Search vendor/sender</label>
+                  <div className="flex gap-2">
+                    <Input
+                      type="text"
+                      placeholder="e.g. Uber, Anthropic, Adobe..."
+                      value={pipelineFilters.senderSearch}
+                      onChange={(e) =>
+                        setPipelineFilters((f) => ({ ...f, senderSearch: e.target.value }))
+                      }
+                      className="max-w-xs"
+                    />
+                    {pipelineFilters.senderSearch && (
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        onClick={() => {
+                          window.location.href = `/invoices?search=${encodeURIComponent(pipelineFilters.senderSearch)}`;
+                        }}
+                      >
+                        View existing →
+                      </Button>
+                    )}
+                  </div>
+                  <p className="text-xs text-muted-foreground">
+                    Sync will search your inbox for emails from this sender and fetch new invoices
+                  </p>
+                </div>
+
+                <div className="grid gap-4 sm:grid-cols-3">
+                  <div className="space-y-2">
+                    <label className="text-sm font-medium">From date</label>
+                    <Input
+                      type="date"
+                      value={pipelineFilters.dateFrom}
+                      onChange={(e) =>
+                        setPipelineFilters((f) => ({ ...f, dateFrom: e.target.value }))
+                      }
+                    />
+                  </div>
+                  <div className="space-y-2">
+                    <label className="text-sm font-medium">To date</label>
+                    <Input
+                      type="date"
+                      value={pipelineFilters.dateTo}
+                      onChange={(e) =>
+                        setPipelineFilters((f) => ({ ...f, dateTo: e.target.value }))
+                      }
+                    />
+                  </div>
+                  <div className="space-y-2">
+                    <label className="text-sm font-medium">Process limit</label>
+                    <Input
+                      type="number"
+                      placeholder="All"
+                      min={1}
+                      max={100}
+                      value={pipelineFilters.limit || ""}
+                      onChange={(e) =>
+                        setPipelineFilters((f) => ({
+                          ...f,
+                          limit: e.target.value ? parseInt(e.target.value, 10) : undefined,
+                        }))
+                      }
+                    />
+                  </div>
+                </div>
+              </div>
+
+              {(pipelineFilters.senderSearch || pipelineFilters.dateFrom || pipelineFilters.dateTo || pipelineFilters.limit) && (
+                <div className="flex items-center justify-between border-t pt-3">
+                  <p className="text-sm text-muted-foreground">
+                    {pipelineFilters.senderSearch && `Searching for "${pipelineFilters.senderSearch}"`}
+                    {pipelineFilters.senderSearch && (pipelineFilters.dateFrom || pipelineFilters.dateTo) && " • "}
+                    {pipelineFilters.dateFrom && `From ${pipelineFilters.dateFrom}`}
+                    {pipelineFilters.dateFrom && pipelineFilters.dateTo && " to "}
+                    {pipelineFilters.dateTo && !pipelineFilters.dateFrom && `Until ${pipelineFilters.dateTo}`}
+                    {pipelineFilters.dateTo && pipelineFilters.dateFrom && pipelineFilters.dateTo}
+                    {pipelineFilters.limit && ` • Limit: ${pipelineFilters.limit}`}
+                  </p>
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    onClick={() =>
+                      setPipelineFilters({ dateFrom: "", dateTo: "", senderSearch: "", limit: undefined })
+                    }
+                  >
+                    Clear
+                  </Button>
+                </div>
+              )}
+            </div>
+          )}
           <div className="space-y-4">
             {PIPELINE_COMMANDS.map((cmd) => {
               const lastRun = lastRuns.find(
@@ -244,7 +359,7 @@ export function DashboardContent() {
                     <p className="font-medium">{cmd.label}</p>
                     <p className="text-sm text-muted-foreground">{cmd.description}</p>
                     <p className="text-xs text-muted-foreground">
-                      Last run: {formatDate(lastRun?.completedAt || null)}
+                      Last run: {formatDateTime(lastRun?.completedAt || null)}
                       {lastRun?.status && lastRun.status !== "never" && (
                         <span
                           className={

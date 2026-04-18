@@ -1,4 +1,4 @@
-import { google } from "googleapis";
+import { google, type Auth } from "googleapis";
 import { readFileSync, existsSync } from "fs";
 import { resolve } from "path";
 import type { Readable } from "stream";
@@ -6,7 +6,13 @@ import type { Readable } from "stream";
 const CREDENTIALS_PATH = resolve(process.cwd(), "..", "credentials.json");
 const TOKEN_PATH = resolve(process.cwd(), "..", ".state", "token.json");
 
-function getAuthClient() {
+let cachedAuthClient: Auth.OAuth2Client | null = null;
+
+function getAuthClient(): Auth.OAuth2Client {
+  if (cachedAuthClient) {
+    return cachedAuthClient;
+  }
+
   if (!existsSync(CREDENTIALS_PATH)) {
     throw new Error("credentials.json not found");
   }
@@ -23,6 +29,7 @@ function getAuthClient() {
     credentials.installed.redirect_uris[0]
   );
   oauth2.setCredentials(token);
+  cachedAuthClient = oauth2;
   return oauth2;
 }
 

@@ -1,5 +1,7 @@
 "use client";
 
+const GOOGLE_DRIVE_URL_PATTERN = /^https:\/\/(docs|drive)\.google\.com\//;
+
 interface PDFViewerProps {
   driveWebViewLink: string | null;
   driveFileId: string | null;
@@ -10,6 +12,14 @@ export function PDFViewer({ driveWebViewLink, driveFileId }: PDFViewerProps) {
     return (
       <div className="flex h-96 items-center justify-center rounded-md border bg-muted">
         <p className="text-muted-foreground">PDF not available</p>
+      </div>
+    );
+  }
+
+  if (!GOOGLE_DRIVE_URL_PATTERN.test(driveWebViewLink)) {
+    return (
+      <div className="flex h-96 items-center justify-center rounded-md border bg-muted">
+        <p className="text-muted-foreground">Invalid PDF link</p>
       </div>
     );
   }

@@ -6,7 +6,6 @@ import {
   useReactTable,
   getCoreRowModel,
   getSortedRowModel,
-  getFilteredRowModel,
   flexRender,
   type ColumnDef,
   type SortingState,
@@ -21,6 +20,7 @@ import {
 } from "@/components/ui/table";
 import { Badge } from "@/components/ui/badge";
 import { Checkbox } from "@/components/ui/checkbox";
+import { formatDate } from "@/lib/formatters";
 import type { InvoiceRow } from "@/lib/types";
 
 interface InvoiceTableProps {
@@ -30,21 +30,13 @@ interface InvoiceTableProps {
   onSelectionChange?: (ids: Set<string>) => void;
 }
 
-function formatCurrency(amount: string | null, currency: string): string {
+function formatAmount(amount: string | null, currency: string): string {
   if (!amount) return "-";
   const num = parseFloat(amount);
   return new Intl.NumberFormat("en-GB", {
     style: "currency",
     currency: currency || "GBP",
   }).format(num);
-}
-
-function formatDate(dateStr: string): string {
-  return new Date(dateStr).toLocaleDateString("en-GB", {
-    day: "numeric",
-    month: "short",
-    year: "numeric",
-  });
 }
 
 export function InvoiceTable({
@@ -99,7 +91,11 @@ export function InvoiceTable({
     {
       accessorKey: "invoice_date",
       header: "Date",
-      cell: ({ row }) => formatDate(row.original.invoice_date),
+      cell: ({ row }) => (
+        <span className="font-mono tabular-nums">
+          {formatDate(row.original.invoice_date)}
+        </span>
+      ),
     },
     {
       accessorKey: "vendor_name",
@@ -113,17 +109,23 @@ export function InvoiceTable({
     },
     {
       accessorKey: "amount_gross",
-      header: "Amount",
-      cell: ({ row }) =>
-        formatCurrency(row.original.amount_gross, row.original.currency),
+      header: () => <span className="text-right block">Amount</span>,
+      cell: ({ row }) => (
+        <span className="text-right block font-mono tabular-nums">
+          {formatAmount(row.original.amount_gross, row.original.currency)}
+        </span>
+      ),
     },
     {
       accessorKey: "amount_gross_gbp",
-      header: "GBP",
-      cell: ({ row }) =>
-        row.original.currency === "GBP"
-          ? "-"
-          : formatCurrency(row.original.amount_gross_gbp, "GBP"),
+      header: () => <span className="text-right block">GBP</span>,
+      cell: ({ row }) => (
+        <span className="text-right block font-mono tabular-nums">
+          {row.original.currency === "GBP"
+            ? "-"
+            : formatAmount(row.original.amount_gross_gbp, "GBP")}
+        </span>
+      ),
     },
     {
       accessorKey: "category",
@@ -155,13 +157,12 @@ export function InvoiceTable({
     onSortingChange: setSorting,
     getCoreRowModel: getCoreRowModel(),
     getSortedRowModel: getSortedRowModel(),
-    getFilteredRowModel: getFilteredRowModel(),
   });
 
   return (
     <div className="rounded-md border">
       <Table>
-        <TableHeader>
+        <TableHeader className="sticky top-0 z-10 bg-background">
           {table.getHeaderGroups().map((headerGroup) => (
             <TableRow key={headerGroup.id}>
               {headerGroup.headers.map((header) => (

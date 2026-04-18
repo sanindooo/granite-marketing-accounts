@@ -1,6 +1,8 @@
 "use client";
 
+import { useState, useEffect } from "react";
 import { useQueryStates, parseAsString, parseAsBoolean } from "nuqs";
+import { useDebouncedCallback } from "use-debounce";
 import { Input } from "@/components/ui/input";
 import {
   Select,
@@ -30,12 +32,23 @@ export function InvoiceFilters({ vendors, categories }: InvoiceFiltersProps) {
       dateTo: parseAsString,
       exceptions: parseAsBoolean.withDefault(false),
     },
-    { shallow: false }
+    { shallow: true }
   );
+
+  const [localSearch, setLocalSearch] = useState(filters.search || "");
+
+  useEffect(() => {
+    setLocalSearch(filters.search || "");
+  }, [filters.search]);
+
+  const debouncedSetSearch = useDebouncedCallback((value: string) => {
+    setFilters({ search: value || null });
+  }, 300);
 
   const fys = getAvailableFYs();
 
   const clearFilters = () => {
+    setLocalSearch("");
     setFilters({
       fy: getCurrentFY(),
       vendor: null,
@@ -151,8 +164,11 @@ export function InvoiceFilters({ vendors, categories }: InvoiceFiltersProps) {
       <div className="flex items-center gap-3">
         <Input
           type="search"
-          value={filters.search || ""}
-          onChange={(e) => setFilters({ search: e.target.value || null })}
+          value={localSearch}
+          onChange={(e) => {
+            setLocalSearch(e.target.value);
+            debouncedSetSearch(e.target.value);
+          }}
           placeholder="Search vendor or invoice #..."
           className="max-w-xs"
         />

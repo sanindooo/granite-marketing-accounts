@@ -11,12 +11,22 @@ const COMMANDS = {
 } as const;
 
 const FiscalYearSchema = z.string().regex(/^FY-\d{4}-\d{2}$/);
+const DateSchema = z.string().regex(/^\d{4}-\d{2}-\d{2}$/);
+const SenderSchema = z.string().min(1).max(100);
 
 export type PipelineCommand = keyof typeof COMMANDS;
 
+export interface PipelineOptions {
+  fiscalYear?: string;
+  limit?: number;
+  sender?: string;
+  dateFrom?: string;
+  dateTo?: string;
+}
+
 export async function runPipelineCommand(
   command: PipelineCommand,
-  options?: { fiscalYear?: string }
+  options?: PipelineOptions
 ): Promise<Result<CliOutput>> {
   return new Promise((resolve) => {
     const args: string[] = [...COMMANDS[command]];
@@ -37,7 +47,55 @@ export async function runPipelineCommand(
       }
     }
 
-    args.push("--json");
+    // Sender search (for email sync)
+    if (options?.sender && command === "syncEmails") {
+      try {
+        const sender = SenderSchema.parse(options.sender);
+        args.push("--sender", sender);
+      } catch {
+        resolve({
+          ok: false,
+          error: { code: "INVALID_SENDER", message: "Invalid sender search" },
+        });
+        return;
+      }
+    }
+
+    // Date range filters (for email sync)
+    if (options?.dateFrom && command === "syncEmails") {
+      try {
+        const date = DateSchema.parse(options.dateFrom);
+        args.push("--from", date);
+      } catch {
+        resolve({
+          ok: false,
+          error: { code: "INVALID_DATE", message: "Invalid from date" },
+        });
+        return;
+      }
+    }
+
+    if (options?.dateTo && command === "syncEmails") {
+      try {
+        const date = DateSchema.parse(options.dateTo);
+        args.push("--to", date);
+      } catch {
+        resolve({
+          ok: false,
+          error: { code: "INVALID_DATE", message: "Invalid to date" },
+        });
+        return;
+      }
+    }
+
+    if (options?.limit && command === "processInvoices") {
+      args.push("--limit", String(options.limit));
+    }
+
+    // Only add --json for commands that support it
+    if (command === "processInvoices" || command === "runReconciliation") {
+      args.push("--json");
+    }
 
     const proc = spawn("granite", args, {
       cwd: process.cwd().replace("/web", ""),

@@ -2,33 +2,31 @@ import { NextResponse } from "next/server";
 import archiver from "archiver";
 import pLimit from "p-limit";
 import { PassThrough } from "stream";
-import { getInvoiceById } from "@/lib/queries/invoices";
+import { z } from "zod";
+import { getInvoicesByIds } from "@/lib/queries/invoices";
 import { downloadFileFromDrive } from "@/lib/drive";
 
 const MAX_INVOICES = 100;
 const CONCURRENCY = 5;
 
+const downloadSchema = z.object({
+  invoiceIds: z.array(z.string().uuid()).min(1).max(MAX_INVOICES),
+});
+
 export async function POST(request: Request) {
   try {
-    const { invoiceIds } = await request.json();
+    const body = await request.json();
+    const result = downloadSchema.safeParse(body);
 
-    if (!Array.isArray(invoiceIds) || invoiceIds.length === 0) {
+    if (!result.success) {
       return NextResponse.json(
-        { error: "No invoice IDs provided" },
+        { error: "Invalid invoice IDs" },
         { status: 400 }
       );
     }
 
-    if (invoiceIds.length > MAX_INVOICES) {
-      return NextResponse.json(
-        { error: `Maximum ${MAX_INVOICES} invoices allowed` },
-        { status: 400 }
-      );
-    }
-
-    const invoices = invoiceIds
-      .map((id: string) => getInvoiceById(id))
-      .filter(Boolean);
+    const { invoiceIds } = result.data;
+    const invoices = getInvoicesByIds(invoiceIds);
 
     const invoicesWithFiles = invoices.filter((i) => i?.drive_file_id);
 

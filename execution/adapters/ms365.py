@@ -319,6 +319,106 @@ class Ms365Adapter:
         """Delta link from the most recent fetch, or ``None`` if fetch not run."""
         return getattr(self, "_last_watermark", None)
 
+    def search_inbox(
+        self,
+        sender: str | None = None,
+        date_from: str | None = None,
+        date_to: str | None = None,
+        max_pages: int = 10,
+    ) -> Iterator[list[RawEmail]]:
+        """Search inbox with optional filters.
+
+        Unlike ``fetch_since``, this uses a regular search query instead of
+        delta sync. Useful for finding emails from a specific sender or
+        within a date range.
+
+        Note: MS Graph doesn't allow $search with $filter together. When both
+        sender and date filters are specified, we use $search for sender and
+        filter dates in Python.
+
+        Args:
+            sender: Filter by sender name/email (e.g., "uber", "anthropic")
+            date_from: Filter emails received on or after this date (YYYY-MM-DD)
+            date_to: Filter emails received on or before this date (YYYY-MM-DD)
+            max_pages: Maximum number of API pages to fetch (default 10, ~1000 emails)
+
+        Yields:
+            Batches of :class:`RawEmail` matching the search criteria.
+        """
+        from datetime import datetime as dt
+
+        token = self._auth.access_token()
+        client = self._client()
+
+        url = f"{GRAPH_BASE}/me/mailFolders/inbox/messages"
+        params: dict[str, str] = {
+            "$top": str(self._page_size),
+            "$select": SELECT_FIELDS,
+        }
+        headers: dict[str, str] = {
+            "Authorization": f"Bearer {token}",
+            "Prefer": f"odata.maxpagesize={self._page_size}",
+        }
+
+        # MS Graph doesn't allow $search with $filter or $orderby
+        # Strategy: use $search for sender (more flexible), filter dates in Python
+        use_search = sender is not None
+        filter_dates_in_python = use_search and (date_from or date_to)
+
+        if sender:
+            # Normalize: remove spaces for better matching
+            # "Open AI" → search for "openai" (more likely to match openai.com)
+            normalized = sender.lower().replace(" ", "")
+            params["$search"] = f'"from:{normalized}"'
+            headers["ConsistencyLevel"] = "eventual"  # Required for $search
+            # Note: Can't use $orderby with $search
+        else:
+            # No sender search, can use $filter and $orderby
+            params["$orderby"] = "receivedDateTime desc"
+            if date_from or date_to:
+                filters: list[str] = []
+                if date_from:
+                    filters.append(f"receivedDateTime ge {date_from}T00:00:00Z")
+                if date_to:
+                    filters.append(f"receivedDateTime le {date_to}T23:59:59Z")
+                params["$filter"] = " and ".join(filters)
+
+        # Parse date boundaries for Python filtering (make timezone-aware)
+        from datetime import timezone
+        date_from_dt = dt.fromisoformat(f"{date_from}T00:00:00").replace(tzinfo=timezone.utc) if date_from else None
+        date_to_dt = dt.fromisoformat(f"{date_to}T23:59:59").replace(tzinfo=timezone.utc) if date_to else None
+
+        buffered: list[RawEmail] = []
+        pages_fetched = 0
+        while url and pages_fetched < max_pages:
+            response = client.get(url, params=params, headers=headers)
+            _raise_for_graph_status(response)
+            payload = response.json()
+            pages_fetched += 1
+
+            for raw in payload.get("value", []):
+                parsed = _parse_graph_message(raw)
+                if parsed is None:
+                    continue
+
+                # Apply date filter in Python if using $search
+                if filter_dates_in_python:
+                    if date_from_dt and parsed.received_at < date_from_dt:
+                        continue
+                    if date_to_dt and parsed.received_at > date_to_dt:
+                        continue
+
+                buffered.append(parsed)
+                if len(buffered) >= self._batch_size:
+                    yield buffered
+                    buffered = []
+
+            url = payload.get("@odata.nextLink")
+            params = {}  # nextLink already carries params
+
+        if buffered:
+            yield buffered
+
     def fetch_message_body(self, msg_id: str) -> str:
         """Fetch the full plaintext body for a message.
 

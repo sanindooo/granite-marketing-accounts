@@ -90,6 +90,18 @@ export function getInvoiceById(invoiceId: string): InvoiceRow | null {
   return (db.prepare(sql).get(invoiceId) as InvoiceRow) ?? null;
 }
 
+export function getInvoicesByIds(invoiceIds: string[]): InvoiceRow[] {
+  if (invoiceIds.length === 0) return [];
+  const placeholders = invoiceIds.map(() => "?").join(",");
+  const sql = `
+    SELECT i.*, v.canonical_name as vendor_name
+    FROM invoices i
+    LEFT JOIN vendors v ON i.vendor_id = v.vendor_id
+    WHERE i.invoice_id IN (${placeholders})
+  `;
+  return db.prepare(sql).all(...invoiceIds) as InvoiceRow[];
+}
+
 export function getVendors(): VendorRow[] {
   return db.prepare("SELECT * FROM vendors ORDER BY canonical_name").all() as VendorRow[];
 }
@@ -142,6 +154,7 @@ export function getExceptionInvoices(fy?: string): InvoiceRow[] {
     LEFT JOIN vendors v ON i.vendor_id = v.vendor_id
     WHERE ${conditions.join(" AND ")}
     ORDER BY i.invoice_date DESC
+    LIMIT 500
   `;
 
   return db.prepare(sql).all(...params) as InvoiceRow[];

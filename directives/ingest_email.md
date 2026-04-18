@@ -24,16 +24,29 @@ granite ingest invoice process
 ### Fetch Emails
 
 ```bash
-granite ingest email ms365 [--initial]
+granite ingest email ms365 [--initial] [--sender NAME] [--from DATE] [--to DATE]
 ```
 
 - Fetches new messages from MS365 inbox using delta queries
 - Stores email metadata in `emails` table
 - `--initial`: Ignore saved watermark, fetch all recent messages
+- `--sender NAME`: Search for emails from a specific sender (e.g., `--sender uber`)
+- `--from DATE`: Only fetch emails received on or after this date (YYYY-MM-DD)
+- `--to DATE`: Only fetch emails received on or before this date (YYYY-MM-DD)
 
-Output:
+When using `--sender`, `--from`, or `--to`, the command uses search mode instead of delta sync:
+- Searches your inbox for matching emails
+- Automatically skips emails already in the database (deduplication)
+- Does not update the watermark
+
+**Standard sync (delta mode):**
 ```json
 {"source": "ms365", "batches": 2, "emails": 47, "next_watermark_saved": true}
+```
+
+**Search mode:**
+```json
+{"source": "ms365", "batches": 1, "emails": 5, "search_mode": true, "sender_filter": "uber", "skipped_duplicates": 12}
 ```
 
 ### Process Invoices
@@ -67,6 +80,29 @@ Output:
   "cost_gbp": "0.1850"
 }
 ```
+
+## Search for Specific Vendor
+
+To find and process invoices from a specific company:
+
+```bash
+# Search for Uber invoices from the last 6 months
+granite ingest email ms365 --sender uber --from 2025-10-01
+
+# Process the newly fetched emails
+granite ingest invoice process
+```
+
+The search mode:
+- Searches your inbox for emails from the specified sender
+- Checks each email against the database to skip duplicates
+- Reports how many new emails were found vs skipped
+- Does not affect your delta sync watermark (regular syncs still work)
+
+This is useful when:
+- You want invoices from a new vendor you haven't tracked before
+- You need to backfill historical invoices from a specific company
+- You're troubleshooting missing invoices from a particular sender
 
 ## Backfill Mode
 

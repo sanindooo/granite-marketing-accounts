@@ -10,7 +10,7 @@ interface Props {
   params: Promise<{ id: string }>;
 }
 
-function formatCurrency(amount: string | null, currency: string): string {
+function formatAmount(amount: string | null, currency: string): string {
   if (!amount) return "-";
   const num = parseFloat(amount);
   return new Intl.NumberFormat("en-GB", {
@@ -19,7 +19,7 @@ function formatCurrency(amount: string | null, currency: string): string {
   }).format(num);
 }
 
-function formatDate(dateStr: string): string {
+function formatLongDate(dateStr: string): string {
   return new Date(dateStr).toLocaleDateString("en-GB", {
     weekday: "long",
     day: "numeric",
@@ -36,24 +36,25 @@ export default async function InvoiceDetailPage({ params }: Props) {
     notFound();
   }
 
-  const metadata = [
+  const metadata: { label: string; value: string; mono?: boolean }[] = [
     { label: "Invoice Number", value: invoice.invoice_number },
-    { label: "Date", value: formatDate(invoice.invoice_date) },
+    { label: "Date", value: formatLongDate(invoice.invoice_date) },
     { label: "Vendor", value: invoice.vendor_name || invoice.vendor_name_raw },
     {
       label: "Amount",
-      value: formatCurrency(invoice.amount_gross, invoice.currency),
+      value: formatAmount(invoice.amount_gross, invoice.currency),
+      mono: true,
     },
     ...(invoice.currency !== "GBP" && invoice.amount_gross_gbp
-      ? [{ label: "Amount (GBP)", value: formatCurrency(invoice.amount_gross_gbp, "GBP") }]
+      ? [{ label: "Amount (GBP)", value: formatAmount(invoice.amount_gross_gbp, "GBP"), mono: true }]
       : []),
     ...(invoice.amount_net
-      ? [{ label: "Net", value: formatCurrency(invoice.amount_net, invoice.currency) }]
+      ? [{ label: "Net", value: formatAmount(invoice.amount_net, invoice.currency), mono: true }]
       : []),
     ...(invoice.amount_vat
-      ? [{ label: "VAT", value: formatCurrency(invoice.amount_vat, invoice.currency) }]
+      ? [{ label: "VAT", value: formatAmount(invoice.amount_vat, invoice.currency), mono: true }]
       : []),
-    ...(invoice.vat_rate ? [{ label: "VAT Rate", value: `${invoice.vat_rate}%` }] : []),
+    ...(invoice.vat_rate ? [{ label: "VAT Rate", value: `${invoice.vat_rate}%`, mono: true }] : []),
     ...(invoice.vat_number_supplier
       ? [{ label: "Supplier VAT #", value: invoice.vat_number_supplier }]
       : []),
@@ -90,10 +91,12 @@ export default async function InvoiceDetailPage({ params }: Props) {
           </CardHeader>
           <CardContent>
             <dl className="space-y-3">
-              {metadata.map(({ label, value }) => (
+              {metadata.map(({ label, value, mono }) => (
                 <div key={label} className="flex justify-between">
                   <dt className="text-muted-foreground">{label}</dt>
-                  <dd className="font-medium">{value}</dd>
+                  <dd className={`font-medium ${mono ? "font-mono tabular-nums" : ""}`}>
+                    {value}
+                  </dd>
                 </div>
               ))}
             </dl>

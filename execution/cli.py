@@ -313,12 +313,36 @@ def ingest_email_ms365(
             help="Ignore the saved watermark and start a fresh delta sync.",
         ),
     ] = False,
+    sender: Annotated[
+        str | None,
+        typer.Option(
+            "--sender",
+            help="Search for emails from a specific sender (e.g., 'uber', 'anthropic').",
+        ),
+    ] = None,
+    date_from: Annotated[
+        str | None,
+        typer.Option(
+            "--from",
+            help="Only fetch emails received on or after this date (YYYY-MM-DD).",
+        ),
+    ] = None,
+    date_to: Annotated[
+        str | None,
+        typer.Option(
+            "--to",
+            help="Only fetch emails received on or before this date (YYYY-MM-DD).",
+        ),
+    ] = None,
 ) -> None:
     """Fetch new MS Graph inbox messages into the ``emails`` table.
 
     Classification + extraction + filing run in a later stage; this command
     only handles the ingest → email-row side so each concern stays
     separately runnable and observable.
+
+    Use --sender to search for emails from a specific company (e.g., --sender uber).
+    Use --from and --to to limit the date range.
     """
     try:
         from execution.adapters.ms365 import SOURCE_ID, Ms365Adapter, Ms365Auth
@@ -326,34 +350,67 @@ def ingest_email_ms365(
         conn = db_mod.connect(db_path)
         db_mod.apply_migrations(conn)
 
-        watermark = None if initial else _load_watermark(conn, SOURCE_ID)
         auth = Ms365Auth.from_keychain()
         adapter = Ms365Adapter(auth=auth)
         try:
             batches = 0
             emails = 0
-            for batch in adapter.fetch_since(watermark):
-                batches += 1
-                emails += len(batch)
-                with conn:
-                    for email in batch:
-                        _upsert_email(conn, email.as_email_row())
-            _save_watermark(
-                conn, SOURCE_ID, watermark=adapter.next_watermark, emit_count=emails
-            )
+            skipped = 0
+
+            # Use search mode if any filter is specified
+            if sender or date_from or date_to:
+                for batch in adapter.search_inbox(
+                    sender=sender, date_from=date_from, date_to=date_to
+                ):
+                    batches += 1
+                    with conn:
+                        for email in batch:
+                            # Check if already exists (dedup)
+                            existing = conn.execute(
+                                "SELECT 1 FROM emails WHERE msg_id = ?",
+                                (email.msg_id,),
+                            ).fetchone()
+                            if existing:
+                                skipped += 1
+                                continue
+                            _upsert_email(conn, email.as_email_row())
+                            emails += 1
+            else:
+                # Standard delta sync
+                watermark = None if initial else _load_watermark(conn, SOURCE_ID)
+                for batch in adapter.fetch_since(watermark):
+                    batches += 1
+                    emails += len(batch)
+                    with conn:
+                        for email in batch:
+                            _upsert_email(conn, email.as_email_row())
+                _save_watermark(
+                    conn, SOURCE_ID, watermark=adapter.next_watermark, emit_count=emails
+                )
+
             _clear_reauth(conn, SOURCE_ID)
         finally:
             adapter.close()
 
-        emit_success(
-            {
-                "source": SOURCE_ID,
-                "batches": batches,
-                "emails": emails,
-                "next_watermark_saved": adapter.next_watermark is not None,
-                "initial": initial,
-            }
-        )
+        result = {
+            "source": SOURCE_ID,
+            "batches": batches,
+            "emails": emails,
+        }
+        if sender or date_from or date_to:
+            result["search_mode"] = True
+            result["skipped_duplicates"] = skipped
+            if sender:
+                result["sender_filter"] = sender
+            if date_from:
+                result["date_from"] = date_from
+            if date_to:
+                result["date_to"] = date_to
+        else:
+            result["next_watermark_saved"] = adapter.next_watermark is not None
+            result["initial"] = initial
+
+        emit_success(result)
     except PipelineError as err:
         if err.error_code == "needs_reauth":
             conn = db_mod.connect(db_path)

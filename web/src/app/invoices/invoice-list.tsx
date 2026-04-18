@@ -18,16 +18,19 @@ export function InvoiceList() {
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
   const [downloading, setDownloading] = useState(false);
 
-  const [filters] = useQueryStates({
-    fy: parseAsString.withDefault(getCurrentFY()),
-    vendor: parseAsString,
-    category: parseAsString,
-    status: parseAsString.withDefault("all"),
-    search: parseAsString,
-    dateFrom: parseAsString,
-    dateTo: parseAsString,
-    exceptions: parseAsBoolean.withDefault(false),
-  });
+  const [filters] = useQueryStates(
+    {
+      fy: parseAsString.withDefault(getCurrentFY()),
+      vendor: parseAsString,
+      category: parseAsString,
+      status: parseAsString.withDefault("all"),
+      search: parseAsString,
+      dateFrom: parseAsString,
+      dateTo: parseAsString,
+      exceptions: parseAsBoolean.withDefault(false),
+    },
+    { shallow: true }
+  );
 
   useEffect(() => {
     async function loadInvoices() {
