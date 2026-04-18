@@ -16,8 +16,8 @@ import {
 } from "@/components/ui/table";
 import { getCurrentFY } from "@/lib/fiscal";
 import { formatCurrency, formatDateTime } from "@/lib/formatters";
-import type { DashboardMetrics, LastRun, SyncCoverage } from "@/lib/queries/dashboard";
-import { fetchDashboardMetrics, fetchLastRuns, fetchSyncCoverage } from "@/lib/actions/dashboard";
+import type { DashboardMetrics, LastRun, SyncCoverage, PendingAction } from "@/lib/queries/dashboard";
+import { fetchDashboardMetrics, fetchLastRuns, fetchSyncCoverage, fetchPendingActions } from "@/lib/actions/dashboard";
 import type { PipelineCommand, PipelineOptions } from "@/lib/actions/pipeline";
 import { usePipelineStream } from "@/hooks/use-pipeline-stream";
 
@@ -32,6 +32,7 @@ export function DashboardContent() {
   const [metrics, setMetrics] = useState<DashboardMetrics | null>(null);
   const [lastRuns, setLastRuns] = useState<LastRun[]>([]);
   const [syncCoverage, setSyncCoverage] = useState<SyncCoverage | null>(null);
+  const [pendingActions, setPendingActions] = useState<PendingAction[]>([]);
   const [loading, setLoading] = useState(true);
   const stream = usePipelineStream();
 
@@ -54,14 +55,16 @@ export function DashboardContent() {
     async function loadData() {
       setLoading(true);
       try {
-        const [metricsResult, runsResult, coverageResult] = await Promise.all([
+        const [metricsResult, runsResult, coverageResult, actionsResult] = await Promise.all([
           fetchDashboardMetrics(fy),
           fetchLastRuns(),
           fetchSyncCoverage(),
+          fetchPendingActions(),
         ]);
         if (metricsResult.ok) setMetrics(metricsResult.data);
         if (runsResult.ok) setLastRuns(runsResult.data);
         if (coverageResult.ok) setSyncCoverage(coverageResult.data);
+        if (actionsResult.ok) setPendingActions(actionsResult.data);
       } catch (err) {
         console.error("Failed to load metrics:", err);
       } finally {
@@ -96,10 +99,12 @@ export function DashboardContent() {
           fetchDashboardMetrics(fy),
           fetchLastRuns(),
           fetchSyncCoverage(),
-        ]).then(([metricsResult, runsResult, coverageResult]) => {
+          fetchPendingActions(),
+        ]).then(([metricsResult, runsResult, coverageResult, actionsResult]) => {
           if (metricsResult.ok) setMetrics(metricsResult.data);
           if (runsResult.ok) setLastRuns(runsResult.data);
           if (coverageResult.ok) setSyncCoverage(coverageResult.data);
+          if (actionsResult.ok) setPendingActions(actionsResult.data);
         });
       } else if (stream.error) {
         if (stream.error.error_code === "needs_reauth") {
@@ -243,6 +248,59 @@ export function DashboardContent() {
           </CardContent>
         </Card>
       </div>
+
+      {pendingActions.length > 0 && (
+        <Card className="border-amber-200 bg-amber-50/50">
+          <CardHeader>
+            <CardTitle className="flex items-center gap-2 text-amber-800">
+              <span className="inline-flex h-2 w-2 rounded-full bg-amber-500" />
+              Needs Attention ({pendingActions.length})
+            </CardTitle>
+          </CardHeader>
+          <CardContent>
+            <Table>
+              <TableHeader>
+                <TableRow>
+                  <TableHead>From</TableHead>
+                  <TableHead>Subject</TableHead>
+                  <TableHead>Date</TableHead>
+                  <TableHead>Issue</TableHead>
+                </TableRow>
+              </TableHeader>
+              <TableBody>
+                {pendingActions.map((action) => (
+                  <TableRow key={action.msgId}>
+                    <TableCell className="max-w-32 truncate text-sm">
+                      {action.fromAddr}
+                    </TableCell>
+                    <TableCell className="max-w-64 truncate text-sm">
+                      {action.subject}
+                    </TableCell>
+                    <TableCell className="text-sm text-muted-foreground">
+                      {new Date(action.receivedAt).toLocaleDateString()}
+                    </TableCell>
+                    <TableCell>
+                      <span className={`inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium ${
+                        action.outcome === "needs_manual_download"
+                          ? "bg-amber-100 text-amber-800"
+                          : "bg-red-100 text-red-800"
+                      }`}>
+                        {action.outcome === "needs_manual_download"
+                          ? "Manual download needed"
+                          : "Processing error"}
+                      </span>
+                    </TableCell>
+                  </TableRow>
+                ))}
+              </TableBody>
+            </Table>
+            <p className="mt-3 text-xs text-muted-foreground">
+              These emails contain invoices that could not be automatically processed.
+              Visit the vendor portal to download the PDF manually.
+            </p>
+          </CardContent>
+        </Card>
+      )}
 
       <Card>
         <CardHeader className="flex flex-row items-center justify-between">

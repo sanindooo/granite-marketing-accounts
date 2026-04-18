@@ -168,3 +168,39 @@ export function getActiveRun(operation: string): ActiveRun | null {
     startedAt: row.started_at,
   };
 }
+
+export interface PendingAction {
+  msgId: string;
+  fromAddr: string;
+  subject: string;
+  receivedAt: string;
+  outcome: string;
+}
+
+export function getPendingActions(): PendingAction[] {
+  const rows = db
+    .prepare(
+      `
+      SELECT msg_id, from_addr, subject, received_at, outcome
+      FROM emails
+      WHERE outcome IN ('needs_manual_download', 'error')
+      ORDER BY received_at DESC
+      LIMIT 20
+    `
+    )
+    .all() as {
+    msg_id: string;
+    from_addr: string;
+    subject: string;
+    received_at: string;
+    outcome: string;
+  }[];
+
+  return rows.map((row) => ({
+    msgId: row.msg_id,
+    fromAddr: row.from_addr,
+    subject: row.subject,
+    receivedAt: row.received_at,
+    outcome: row.outcome,
+  }));
+}

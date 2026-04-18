@@ -5,10 +5,12 @@ import {
   getLastRuns as getRuns,
   getSyncCoverage as getCoverage,
   getActiveRun as getActive,
+  getPendingActions as getPending,
   type DashboardMetrics,
   type LastRun,
   type SyncCoverage,
   type ActiveRun,
+  type PendingAction,
 } from "@/lib/queries/dashboard";
 import type { Result } from "@/lib/types";
 
@@ -65,6 +67,21 @@ export async function fetchActiveRun(
   try {
     const run = getActive(operation);
     return { ok: true, data: run };
+  } catch (error) {
+    return {
+      ok: false,
+      error: {
+        code: "FETCH_ERROR",
+        message: error instanceof Error ? error.message : "Unknown error",
+      },
+    };
+  }
+}
+
+export async function fetchPendingActions(): Promise<Result<PendingAction[]>> {
+  try {
+    const actions = getPending();
+    return { ok: true, data: actions };
   } catch (error) {
     return {
       ok: false,
