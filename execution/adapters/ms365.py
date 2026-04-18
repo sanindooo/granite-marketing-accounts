@@ -260,7 +260,7 @@ class Ms365Adapter:
             return self._http
         import httpx
 
-        self._http = httpx.Client(timeout=httpx.Timeout(30.0, connect=5.0, read=60.0))
+        self._http = httpx.Client(timeout=httpx.Timeout(60.0, connect=10.0, read=120.0))
         return self._http
 
     def close(self) -> None:
