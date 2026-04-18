@@ -1,7 +1,7 @@
 ---
 title: "feat: Invoice Management Web UI"
 type: feat
-status: active
+status: completed
 date: 2026-04-18
 deepened: 2026-04-18
 origin: docs/brainstorms/2026-04-18-invoice-management-ui-requirements.md
