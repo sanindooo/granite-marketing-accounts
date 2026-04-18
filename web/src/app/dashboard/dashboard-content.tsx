@@ -16,8 +16,8 @@ import {
 } from "@/components/ui/table";
 import { getCurrentFY } from "@/lib/fiscal";
 import { formatCurrency, formatDateTime } from "@/lib/formatters";
-import type { DashboardMetrics, LastRun } from "@/lib/queries/dashboard";
-import { fetchDashboardMetrics, fetchLastRuns } from "@/lib/actions/dashboard";
+import type { DashboardMetrics, LastRun, SyncCoverage } from "@/lib/queries/dashboard";
+import { fetchDashboardMetrics, fetchLastRuns, fetchSyncCoverage } from "@/lib/actions/dashboard";
 import { runPipelineCommand, type PipelineCommand, type PipelineOptions } from "@/lib/actions/pipeline";
 
 const PIPELINE_COMMANDS: { key: PipelineCommand; label: string; description: string }[] = [
@@ -30,6 +30,7 @@ export function DashboardContent() {
   const [fy] = useQueryState("fy", parseAsString.withDefault(getCurrentFY()));
   const [metrics, setMetrics] = useState<DashboardMetrics | null>(null);
   const [lastRuns, setLastRuns] = useState<LastRun[]>([]);
+  const [syncCoverage, setSyncCoverage] = useState<SyncCoverage | null>(null);
   const [loading, setLoading] = useState(true);
   const [runningCommand, setRunningCommand] = useState<PipelineCommand | null>(null);
 
@@ -39,23 +40,27 @@ export function DashboardContent() {
     dateTo: string;
     senderSearch: string;
     limit?: number;
+    backfillFrom: string;
   }>({
     dateFrom: "",
     dateTo: "",
     senderSearch: "",
     limit: undefined,
+    backfillFrom: "",
   });
 
   useEffect(() => {
     async function loadData() {
       setLoading(true);
       try {
-        const [metricsResult, runsResult] = await Promise.all([
+        const [metricsResult, runsResult, coverageResult] = await Promise.all([
           fetchDashboardMetrics(fy),
           fetchLastRuns(),
+          fetchSyncCoverage(),
         ]);
         if (metricsResult.ok) setMetrics(metricsResult.data);
         if (runsResult.ok) setLastRuns(runsResult.data);
+        if (coverageResult.ok) setSyncCoverage(coverageResult.data);
       } catch (err) {
         console.error("Failed to load metrics:", err);
       } finally {
@@ -73,16 +78,19 @@ export function DashboardContent() {
       if (pipelineFilters.dateFrom) options.dateFrom = pipelineFilters.dateFrom;
       if (pipelineFilters.dateTo) options.dateTo = pipelineFilters.dateTo;
       if (pipelineFilters.limit) options.limit = pipelineFilters.limit;
+      if (pipelineFilters.backfillFrom) options.backfillFrom = pipelineFilters.backfillFrom;
 
       const result = await runPipelineCommand(command, options);
       if (result.ok) {
         toast.success(`${command} completed successfully`);
-        const [metricsResult, runsResult] = await Promise.all([
+        const [metricsResult, runsResult, coverageResult] = await Promise.all([
           fetchDashboardMetrics(fy),
           fetchLastRuns(),
+          fetchSyncCoverage(),
         ]);
         if (metricsResult.ok) setMetrics(metricsResult.data);
         if (runsResult.ok) setLastRuns(runsResult.data);
+        if (coverageResult.ok) setSyncCoverage(coverageResult.data);
       } else {
         if (result.error.code === "NEEDS_REAUTH") {
           toast.error("Authentication expired", {
@@ -232,7 +240,22 @@ export function DashboardContent() {
 
       <Card>
         <CardHeader className="flex flex-row items-center justify-between">
-          <CardTitle>Pipeline Controls</CardTitle>
+          <div>
+            <CardTitle>Pipeline Controls</CardTitle>
+            {syncCoverage && syncCoverage.emailCount > 0 && (
+              <p className="mt-1 text-sm text-muted-foreground">
+                Synced: {syncCoverage.emailCount} emails
+                {syncCoverage.earliestEmail && syncCoverage.latestEmail && (
+                  <> from {new Date(syncCoverage.earliestEmail).toLocaleDateString()} to {new Date(syncCoverage.latestEmail).toLocaleDateString()}</>
+                )}
+              </p>
+            )}
+            {syncCoverage && syncCoverage.emailCount === 0 && (
+              <p className="mt-1 text-sm text-amber-600">
+                No emails synced yet. Run &quot;Sync emails&quot; to fetch invoices.
+              </p>
+            )}
+          </div>
           <Button
             variant="ghost"
             size="sm"
@@ -312,11 +335,39 @@ export function DashboardContent() {
                     />
                   </div>
                 </div>
+
+                <div className="border-t pt-4">
+                  <div className="space-y-2">
+                    <label className="text-sm font-medium">Backfill historical emails</label>
+                    <div className="flex gap-2 items-end">
+                      <Input
+                        type="date"
+                        value={pipelineFilters.backfillFrom}
+                        onChange={(e) =>
+                          setPipelineFilters((f) => ({ ...f, backfillFrom: e.target.value }))
+                        }
+                        className="max-w-xs"
+                      />
+                      {pipelineFilters.backfillFrom && (
+                        <span className="text-sm text-muted-foreground pb-2">
+                          Will fetch all emails from {pipelineFilters.backfillFrom} and set up incremental sync
+                        </span>
+                      )}
+                    </div>
+                    <p className="text-xs text-muted-foreground">
+                      Use this to capture historical invoices that were missed by initial sync
+                    </p>
+                  </div>
+                </div>
               </div>
 
-              {(pipelineFilters.senderSearch || pipelineFilters.dateFrom || pipelineFilters.dateTo || pipelineFilters.limit) && (
+              {(pipelineFilters.senderSearch || pipelineFilters.dateFrom || pipelineFilters.dateTo || pipelineFilters.limit || pipelineFilters.backfillFrom) && (
                 <div className="flex items-center justify-between border-t pt-3">
                   <p className="text-sm text-muted-foreground">
+                    {pipelineFilters.backfillFrom && (
+                      <span className="text-amber-600 font-medium">Backfill from {pipelineFilters.backfillFrom}</span>
+                    )}
+                    {pipelineFilters.backfillFrom && pipelineFilters.senderSearch && " • "}
                     {pipelineFilters.senderSearch && `Searching for "${pipelineFilters.senderSearch}"`}
                     {pipelineFilters.senderSearch && (pipelineFilters.dateFrom || pipelineFilters.dateTo) && " • "}
                     {pipelineFilters.dateFrom && `From ${pipelineFilters.dateFrom}`}
@@ -329,7 +380,7 @@ export function DashboardContent() {
                     variant="ghost"
                     size="sm"
                     onClick={() =>
-                      setPipelineFilters({ dateFrom: "", dateTo: "", senderSearch: "", limit: undefined })
+                      setPipelineFilters({ dateFrom: "", dateTo: "", senderSearch: "", limit: undefined, backfillFrom: "" })
                     }
                   >
                     Clear

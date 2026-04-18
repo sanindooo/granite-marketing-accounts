@@ -22,6 +22,7 @@ export interface PipelineOptions {
   sender?: string;
   dateFrom?: string;
   dateTo?: string;
+  backfillFrom?: string;
 }
 
 export async function runPipelineCommand(
@@ -84,6 +85,20 @@ export async function runPipelineCommand(
         resolve({
           ok: false,
           error: { code: "INVALID_DATE", message: "Invalid to date" },
+        });
+        return;
+      }
+    }
+
+    // Backfill from date (for email sync - captures historical + sets up delta)
+    if (options?.backfillFrom && command === "syncEmails") {
+      try {
+        const date = DateSchema.parse(options.backfillFrom);
+        args.push("--backfill-from", date);
+      } catch {
+        resolve({
+          ok: false,
+          error: { code: "INVALID_DATE", message: "Invalid backfill date" },
         });
         return;
       }

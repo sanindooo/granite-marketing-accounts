@@ -106,3 +106,33 @@ export function getLastRuns(): LastRun[] {
     };
   });
 }
+
+export interface SyncCoverage {
+  emailCount: number;
+  earliestEmail: string | null;
+  latestEmail: string | null;
+}
+
+export function getSyncCoverage(): SyncCoverage {
+  const row = db
+    .prepare(
+      `
+      SELECT
+        COUNT(*) as email_count,
+        MIN(received_at) as earliest_email,
+        MAX(received_at) as latest_email
+      FROM emails
+    `
+    )
+    .get() as {
+    email_count: number;
+    earliest_email: string | null;
+    latest_email: string | null;
+  };
+
+  return {
+    emailCount: row.email_count || 0,
+    earliestEmail: row.earliest_email,
+    latestEmail: row.latest_email,
+  };
+}

@@ -334,6 +334,13 @@ def ingest_email_ms365(
             help="Only fetch emails received on or before this date (YYYY-MM-DD).",
         ),
     ] = None,
+    backfill_from: Annotated[
+        str | None,
+        typer.Option(
+            "--backfill-from",
+            help="Backfill historical emails from this date (YYYY-MM-DD), then set up delta sync for future runs.",
+        ),
+    ] = None,
 ) -> None:
     """Fetch new MS Graph inbox messages into the ``emails`` table.
 
@@ -343,6 +350,7 @@ def ingest_email_ms365(
 
     Use --sender to search for emails from a specific company (e.g., --sender uber).
     Use --from and --to to limit the date range.
+    Use --backfill-from to capture historical emails and set up incremental sync.
     """
     try:
         from execution.adapters.ms365 import SOURCE_ID, Ms365Adapter, Ms365Auth
@@ -356,16 +364,54 @@ def ingest_email_ms365(
             batches = 0
             emails = 0
             skipped = 0
+            backfill_emails = 0
 
-            # Use search mode if any filter is specified
-            if sender or date_from or date_to:
+            # Backfill mode: search historical + set up delta sync
+            if backfill_from:
+                # Phase 1: Backfill historical emails via search
+                for batch in adapter.search_inbox(date_from=backfill_from):
+                    batches += 1
+                    with conn:
+                        for email in batch:
+                            existing = conn.execute(
+                                "SELECT 1 FROM emails WHERE msg_id = ?",
+                                (email.msg_id,),
+                            ).fetchone()
+                            if existing:
+                                skipped += 1
+                                continue
+                            _upsert_email(conn, email.as_email_row())
+                            backfill_emails += 1
+                emails += backfill_emails
+
+                # Phase 2: Run delta sync to establish watermark for future runs
+                delta_emails = 0
+                for batch in adapter.fetch_since(None):
+                    batches += 1
+                    with conn:
+                        for email in batch:
+                            existing = conn.execute(
+                                "SELECT 1 FROM emails WHERE msg_id = ?",
+                                (email.msg_id,),
+                            ).fetchone()
+                            if existing:
+                                skipped += 1
+                                continue
+                            _upsert_email(conn, email.as_email_row())
+                            delta_emails += 1
+                emails += delta_emails
+                _save_watermark(
+                    conn, SOURCE_ID, watermark=adapter.next_watermark, emit_count=emails
+                )
+
+            # Search mode: use filters but don't set up delta sync
+            elif sender or date_from or date_to:
                 for batch in adapter.search_inbox(
                     sender=sender, date_from=date_from, date_to=date_to
                 ):
                     batches += 1
                     with conn:
                         for email in batch:
-                            # Check if already exists (dedup)
                             existing = conn.execute(
                                 "SELECT 1 FROM emails WHERE msg_id = ?",
                                 (email.msg_id,),
@@ -375,9 +421,22 @@ def ingest_email_ms365(
                                 continue
                             _upsert_email(conn, email.as_email_row())
                             emails += 1
+
+            # Standard delta sync
             else:
-                # Standard delta sync
                 watermark = None if initial else _load_watermark(conn, SOURCE_ID)
+
+                # First-run warning: no watermark means historical emails will be missed
+                if watermark is None and not initial:
+                    import sys
+                    print(
+                        '{"warning": "first_run_no_backfill", "message": '
+                        '"No prior sync found. Historical emails will not be captured. '
+                        'Consider running with --backfill-from YYYY-MM-DD (e.g., --backfill-from 2026-03-01) '
+                        'to capture historical invoices."}',
+                        file=sys.stderr,
+                    )
+
                 for batch in adapter.fetch_since(watermark):
                     batches += 1
                     emails += len(batch)
@@ -397,7 +456,13 @@ def ingest_email_ms365(
             "batches": batches,
             "emails": emails,
         }
-        if sender or date_from or date_to:
+        if backfill_from:
+            result["backfill_mode"] = True
+            result["backfill_from"] = backfill_from
+            result["backfill_emails"] = backfill_emails
+            result["skipped_duplicates"] = skipped
+            result["watermark_saved"] = adapter.next_watermark is not None
+        elif sender or date_from or date_to:
             result["search_mode"] = True
             result["skipped_duplicates"] = skipped
             if sender:
