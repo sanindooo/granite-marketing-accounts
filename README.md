@@ -75,11 +75,29 @@ granite reconcile run --adapters ms365,amex_csv,wise,monzo
 | `granite reconcile run --skip-ingest` | Match only (skip adapter fetches) |
 | `granite reconcile run --skip-sheet` | Match only (skip sheet write) |
 
+### Vendors
+
+| Command | Description |
+|---------|-------------|
+| `granite vendors list` | List all known vendors with invoice counts |
+| `granite vendors list --search uber` | Filter by name or domain |
+
 ### Output
 
 | Command | Description |
 |---------|-------------|
 | `granite output create-fy FY-2026-27` | Create Drive folder + Sheets workbook |
+
+## Where Data Lives
+
+| What | Where | Purpose |
+|------|-------|---------|
+| **SQLite database** | `.state/pipeline.db` | All structured data: emails, invoices, transactions, vendors, reconciliation state |
+| **Invoice PDFs** | Google Drive `Accounts/` | Filed invoices organized by fiscal year |
+| **Reconciliation output** | Google Sheets | Per-FY workbook with Expenses, Invoices, Exceptions tabs (Phase 4) |
+| **OAuth tokens** | `.state/token.json` + macOS Keychain | Google, MS365, Monzo, Wise credentials |
+
+The SQLite database is the source of truth. Google Sheets is an output format for human review.
 
 ## Example Queries
 
@@ -97,6 +115,12 @@ sqlite3 .state/pipeline.db "SELECT msg_id, error_code FROM emails WHERE outcome 
 
 # Total expenses this FY
 sqlite3 .state/pipeline.db "SELECT SUM(CAST(amount_gbp AS REAL)) FROM transactions WHERE txn_type = 'purchase' AND booking_date >= '2026-03-01'"
+
+# All vendors with invoice counts
+sqlite3 .state/pipeline.db "SELECT v.canonical_name, COUNT(i.invoice_id) FROM vendors v LEFT JOIN invoices i ON v.vendor_id = i.vendor_id GROUP BY v.vendor_id"
+
+# Invoices from a specific vendor
+sqlite3 .state/pipeline.db "SELECT invoice_date, amount_gross, currency FROM invoices WHERE vendor_id IN (SELECT vendor_id FROM vendors WHERE canonical_name LIKE '%anthropic%')"
 ```
 
 Or just ask me — I'll run the query for you.

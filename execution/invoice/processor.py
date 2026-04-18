@@ -18,13 +18,14 @@ token cap, circuit breaker on 3 consecutive budget breaches.
 
 from __future__ import annotations
 
+import re
 import sqlite3
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 from datetime import date, datetime
 from decimal import Decimal
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any, Final, Literal
 
 import pdfplumber
 
@@ -62,9 +63,17 @@ if TYPE_CHECKING:  # pragma: no cover
 DEFAULT_BUDGET_GBP: Decimal = Decimal("2.00")
 BACKFILL_BUDGET_GBP: Decimal = Decimal("20.00")
 DEFAULT_BATCH_SIZE: int = 50
-PDF_TEXT_DENSITY_THRESHOLD: int = 20  # chars per page to prefer text-path
-PDF_SANITY_MARKERS: tuple[str, ...] = ("£", "$", "€", "VAT", "Total", "Invoice")
 MAX_PDF_SIZE_BYTES: int = 20 * 1024 * 1024  # 20 MB
+
+_PDF_URL_PATTERNS: Final[tuple[re.Pattern[str], ...]] = tuple(
+    re.compile(p, re.IGNORECASE)
+    for p in [
+        r"https?://[^\s<>\"']+\.pdf\b",
+        r"https?://pay\.stripe\.com/[^\s<>\"']+",
+        r"https?://invoice\.stripe\.com/[^\s<>\"']+",
+        r"https?://[^\s<>\"']*paddle[^\s<>\"']+/invoice[^\s<>\"']*",
+    ]
+)
 
 Outcome = Literal[
     "invoice",
@@ -243,18 +252,16 @@ def _process_one(
     # Extract text from PDF
     source_text = _extract_pdf_text(pdf_bytes)
 
-    # Determine extraction path (text vs vision)
-    use_text_path = _should_use_text_path(source_text)
-
     # Run extractor
     received_date = _parse_received_date(email_row.received_at)
     extractor_input = ExtractorInput(
-        source_text=source_text if use_text_path else None,
-        pdf_base64=None if use_text_path else _encode_pdf_for_vision(pdf_bytes),
-        sender_domain=_extract_domain(email_row.from_addr),
+        subject=email_row.subject,
+        sender=email_row.from_addr,
+        source_text=source_text,
         email_received_date=received_date,
     )
-    extraction, _call = extract_invoice(claude, extractor_prompt, extractor_input)
+    extraction_outcome = extract_invoice(claude, extractor_prompt, extractor_input)
+    extraction = extraction_outcome.result
 
     # Assign category
     category_decision = resolve_category(
@@ -269,16 +276,12 @@ def _process_one(
         pdf_bytes=pdf_bytes,
         extraction=extraction,
         extractor_version=extractor_prompt.version,
-        invoice_number_confidence=extraction.field_confidence.get("invoice_number", 0.0),
+        invoice_number_confidence=extraction.field_confidence.invoice_number,
         category=category_decision.category,
         sender_domain=_extract_domain(email_row.from_addr),
         tmp_root=tmp_root,
     )
-    filed = file_invoice(
-        conn=conn,
-        google=google,
-        inp=filer_input,
-    )
+    filed = file_invoice(google, conn, filer_input)
 
     return result.classification, filed
 
@@ -301,10 +304,12 @@ def _pending_emails(
         WHERE processed_at IS NULL
         ORDER BY received_at ASC
     """
+    params: tuple[int, ...] = ()
     if limit:
-        query += f" LIMIT {limit}"
+        query += " LIMIT ?"
+        params = (limit,)
 
-    cursor = conn.execute(query)
+    cursor = conn.execute(query, params)
     while True:
         rows = cursor.fetchmany(batch_size)
         if not rows:
@@ -353,43 +358,14 @@ def _extract_pdf_text(pdf_bytes: bytes) -> str:
     return "\n\n".join(text_parts)
 
 
-def _should_use_text_path(source_text: str) -> bool:
-    """Determine if we should use text-only extraction (cheaper) vs vision."""
-    if not source_text:
-        return False
-    # Check density
-    lines = source_text.strip().split("\n")
-    if len(source_text) < PDF_TEXT_DENSITY_THRESHOLD * max(1, len(lines) // 50):
-        return False
-    # Check for sanity markers
-    text_lower = source_text.lower()
-    return any(marker.lower() in text_lower for marker in PDF_SANITY_MARKERS)
-
-
-def _encode_pdf_for_vision(pdf_bytes: bytes) -> str:
-    """Encode PDF bytes as base64 for Claude vision."""
-    import base64
-
-    return base64.standard_b64encode(pdf_bytes).decode("ascii")
-
-
 def _try_fetch_pdf_from_body(
     body_text: str,
     *,
     http_client: SafeHttpClient,
 ) -> tuple[bytes | None, FetchOutcome | None]:
     """Try to extract and fetch a PDF URL from the email body."""
-    import re
-
-    # Common invoice URL patterns
-    url_patterns = [
-        r"https?://[^\s<>\"']+\.pdf\b",
-        r"https?://pay\.stripe\.com/[^\s<>\"']+",
-        r"https?://invoice\.stripe\.com/[^\s<>\"']+",
-        r"https?://[^\s<>\"']*paddle[^\s<>\"']+/invoice[^\s<>\"']*",
-    ]
-    for pattern in url_patterns:
-        match = re.search(pattern, body_text, re.IGNORECASE)
+    for pattern in _PDF_URL_PATTERNS:
+        match = pattern.search(body_text)
         if match:
             url = match.group(0).rstrip(".,;:)")
             outcome = fetch_invoice_pdf(url, client=http_client)
@@ -408,8 +384,12 @@ def _extract_domain(email_addr: str) -> str | None:
 
 
 def _parse_received_date(received_at: str) -> date:
-    """Parse ISO 8601 datetime string to date."""
-    return datetime.fromisoformat(received_at.replace("Z", "+00:00")).date()
+    """Parse ISO 8601 datetime string to date.
+
+    Handles both "T" and space-separated formats from MS Graph.
+    """
+    normalized = received_at.replace(" ", "T").replace("Z", "+00:00")
+    return datetime.fromisoformat(normalized).date()
 
 
 __all__ = [

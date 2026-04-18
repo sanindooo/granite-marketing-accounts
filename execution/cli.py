@@ -45,12 +45,14 @@ ops_app = typer.Typer(name="ops", help="Operational commands (health, reauth, ba
 ingest_app = typer.Typer(name="ingest", help="Email + bank ingestion (Phase 2+).", no_args_is_help=True)
 reconcile_app = typer.Typer(name="reconcile", help="Matching engine (Phase 4).", no_args_is_help=True)
 output_app = typer.Typer(name="output", help="Sheet + sales output (Phase 4).", no_args_is_help=True)
+vendors_app = typer.Typer(name="vendors", help="List and search known vendors.", no_args_is_help=True)
 
 app.add_typer(db_app)
 app.add_typer(ops_app)
 app.add_typer(ingest_app)
 app.add_typer(reconcile_app)
 app.add_typer(output_app)
+app.add_typer(vendors_app)
 
 
 # ---------------------------------------------------------------------------
@@ -1341,9 +1343,12 @@ def _parse_iso_or_none(value: str | None) -> date | None:
     from datetime import date as _date
     from datetime import datetime as _datetime
 
-    if "T" in value:
-        return _datetime.fromisoformat(value).date()
-    return _date.fromisoformat(value)
+    try:
+        if "T" in value:
+            return _datetime.fromisoformat(value).date()
+        return _date.fromisoformat(value)
+    except ValueError:
+        return None
 
 
 def _decimal_or_none(value: str | None) -> Decimal | None:
@@ -1355,6 +1360,65 @@ def _decimal_or_none(value: str | None) -> Decimal | None:
 @output_app.callback()
 def output_callback() -> None:
     """Output namespace; Phase 4 mounts the full sheet/sales commands."""
+
+
+# ---------------------------------------------------------------------------
+# vendors subcommands
+# ---------------------------------------------------------------------------
+
+
+@vendors_app.command("list")
+def vendors_list(
+    db_path: Annotated[Path | None, typer.Option("--db")] = None,
+    search: Annotated[
+        str | None,
+        typer.Option("--search", "-s", help="Filter by name or domain (case-insensitive)."),
+    ] = None,
+) -> None:
+    """List all known vendors from processed invoices."""
+    import json as _json
+
+    conn = db_mod.connect(db_path)
+    db_mod.apply_migrations(conn)
+
+    query = """
+        SELECT
+            v.vendor_id,
+            v.canonical_name,
+            v.domain,
+            v.default_category,
+            COUNT(i.invoice_id) as invoice_count,
+            SUM(CASE WHEN i.currency = 'GBP' THEN i.amount_gross ELSE 0 END) as total_gbp,
+            MAX(i.invoice_date) as last_invoice
+        FROM vendors v
+        LEFT JOIN invoices i ON v.vendor_id = i.vendor_id
+    """
+    params: list[str] = []
+    if search:
+        query += " WHERE v.canonical_name LIKE ? ESCAPE '\\' OR v.domain LIKE ? ESCAPE '\\'"
+        escaped = search.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        params = [f"%{escaped}%", f"%{escaped}%"]
+    query += " GROUP BY v.vendor_id ORDER BY invoice_count DESC, v.canonical_name"
+
+    rows = conn.execute(query, params).fetchall()
+    conn.close()
+
+    vendors = []
+    for row in rows:
+        vendors.append({
+            "vendor_id": row[0],
+            "name": row[1],
+            "domain": row[2],
+            "category": row[3],
+            "invoice_count": row[4],
+            "total_gbp": format(Decimal(row[5] or 0), ".2f"),
+            "last_invoice": row[6],
+        })
+
+    payload = {"status": "success", "count": len(vendors), "vendors": vendors}
+    sys.stdout.write(_json.dumps(payload, default=str))
+    sys.stdout.write("\n")
+    sys.stdout.flush()
 
 
 if __name__ == "__main__":

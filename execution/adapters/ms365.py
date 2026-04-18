@@ -115,15 +115,6 @@ class MessageAttachment:
     content: bytes
 
 
-@dataclass(frozen=True, slots=True)
-class FetchStats:
-    """Per-run summary the orchestrator records on ``runs.stats_json``."""
-
-    batches: int
-    emails: int
-    next_watermark: str | None
-
-
 # ---------------------------------------------------------------------------
 # Auth
 # ---------------------------------------------------------------------------
@@ -357,37 +348,59 @@ class Ms365Adapter:
         Returns a list of :class:`MessageAttachment` dataclasses with
         the binary content. Only fetches file attachments (not itemAttachment
         or referenceAttachment).
+
+        Uses two-step fetch: list attachments first, then fetch each with content.
         """
+        import base64
+
         token = self._auth.access_token()
         client = self._client()
-        url = f"{GRAPH_BASE}/me/messages/{msg_id}/attachments"
+
+        # Step 1: List attachments (without content)
+        list_url = f"{GRAPH_BASE}/me/messages/{msg_id}/attachments"
         response = client.get(
-            url,
-            params={"$select": "id,name,contentType,size,contentBytes,@odata.type"},
+            list_url,
+            params={"$select": "id,name,contentType,size"},
             headers={"Authorization": f"Bearer {token}"},
         )
         _raise_for_graph_status(response)
         payload = response.json()
+
         attachments: list[MessageAttachment] = []
         for raw in payload.get("value", []):
-            # Only handle file attachments (not itemAttachment or referenceAttachment)
             odata_type = raw.get("@odata.type", "")
             if "#microsoft.graph.fileAttachment" not in odata_type:
                 continue
-            content_b64 = raw.get("contentBytes")
+
+            attachment_id = raw.get("id")
+            if not attachment_id:
+                continue
+
+            # Step 2: Fetch individual attachment with content
+            att_url = f"{GRAPH_BASE}/me/messages/{msg_id}/attachments/{attachment_id}"
+            att_response = client.get(
+                att_url,
+                headers={"Authorization": f"Bearer {token}"},
+            )
+            if att_response.status_code != 200:
+                continue
+
+            att_data = att_response.json()
+            content_b64 = att_data.get("contentBytes")
             if not content_b64:
                 continue
-            import base64
+
             try:
                 content = base64.b64decode(content_b64)
             except Exception:  # noqa: S112 — skip malformed attachments silently
                 continue
+
             attachments.append(
                 MessageAttachment(
-                    attachment_id=str(raw.get("id") or ""),
-                    name=str(raw.get("name") or "attachment"),
-                    content_type=str(raw.get("contentType") or "application/octet-stream"),
-                    size=int(raw.get("size") or len(content)),
+                    attachment_id=str(attachment_id),
+                    name=str(att_data.get("name") or "attachment"),
+                    content_type=str(att_data.get("contentType") or "application/octet-stream"),
+                    size=int(att_data.get("size") or len(content)),
                     content=content,
                 )
             )
@@ -528,7 +541,6 @@ __all__ = [
     "SECRETS_NAMESPACE",
     "SELECT_FIELDS",
     "SOURCE_ID",
-    "FetchStats",
     "MessageAttachment",
     "Ms365Adapter",
     "Ms365Auth",

@@ -180,6 +180,43 @@ sqlite3 .state/pipeline.db "SELECT COUNT(*) FROM emails WHERE processed_at IS NU
 sqlite3 .state/pipeline.db "SELECT outcome, COUNT(*) FROM emails GROUP BY outcome"
 ```
 
+## Vendors
+
+As invoices are processed, vendors are automatically tracked. View known vendors:
+
+```bash
+# List all vendors with invoice counts
+granite vendors list
+
+# Search for a specific vendor
+granite vendors list --search anthropic
+granite vendors list --search uber
+```
+
+Output:
+```json
+{
+  "status": "success",
+  "count": 1,
+  "vendors": [
+    {
+      "vendor_id": "f967244e07c8f78c",
+      "name": "anthropic, pbc",
+      "domain": "mail.anthropic.com",
+      "category": "software_saas",
+      "invoice_count": 3,
+      "total_gbp": "90.00",
+      "last_invoice": "2026-04-17"
+    }
+  ]
+}
+```
+
+Use this to:
+- Find all invoices from a specific vendor
+- Verify vendor categorization
+- Track spending patterns by vendor
+
 ## Troubleshooting
 
 ### "needs_reauth" Error
