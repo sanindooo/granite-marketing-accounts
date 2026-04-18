@@ -9,7 +9,9 @@ export default function DashboardPage() {
       <div className="mx-auto max-w-7xl px-4 py-8 sm:px-6 lg:px-8">
         <div className="mb-6 flex items-center justify-between">
           <h1 className="text-2xl font-semibold">Dashboard</h1>
-          <FYSelector />
+          <Suspense fallback={<div className="h-9 w-36 animate-pulse rounded-md bg-muted" />}>
+            <FYSelector />
+          </Suspense>
         </div>
 
         <Suspense fallback={<div className="text-muted-foreground">Loading...</div>}>
