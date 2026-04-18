@@ -16,7 +16,9 @@ export default function InvoicesPage() {
         </div>
 
         <div className="space-y-6">
-          <InvoiceFilters vendors={vendors} categories={categories} />
+          <Suspense fallback={<div className="h-24 animate-pulse rounded-md bg-muted" />}>
+            <InvoiceFilters vendors={vendors} categories={categories} />
+          </Suspense>
 
           <Suspense fallback={<div className="text-muted-foreground">Loading invoices...</div>}>
             <InvoiceList />
