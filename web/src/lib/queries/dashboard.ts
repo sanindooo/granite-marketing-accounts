@@ -7,6 +7,7 @@ export interface DashboardMetrics {
   reconStatus: { state: string; count: number }[];
   categoryBreakdown: { category: string; total: number }[];
   topVendors: { name: string; total: number }[];
+  pendingEmails: number;
 }
 
 export function getDashboardMetrics(fy: string): DashboardMetrics {
@@ -42,13 +43,19 @@ export function getDashboardMetrics(fy: string): DashboardMetrics {
       GROUP BY v.vendor_id
       ORDER BY total DESC
       LIMIT 5
+    ),
+    pending_emails AS (
+      SELECT COUNT(*) as count
+      FROM emails
+      WHERE processed_at IS NULL
     )
     SELECT
       (SELECT count FROM invoice_totals) as invoice_count,
       (SELECT total FROM invoice_totals) as total_spend,
       (SELECT json_group_array(json_object('state', state, 'count', count)) FROM recon_status) as recon_json,
       (SELECT json_group_array(json_object('category', category, 'total', total)) FROM category_breakdown) as category_json,
-      (SELECT json_group_array(json_object('name', name, 'total', total)) FROM top_vendors) as vendors_json
+      (SELECT json_group_array(json_object('name', name, 'total', total)) FROM top_vendors) as vendors_json,
+      (SELECT count FROM pending_emails) as pending_emails
   `
     )
     .get(start, end, fy, start, end, start, end) as {
@@ -57,6 +64,7 @@ export function getDashboardMetrics(fy: string): DashboardMetrics {
     recon_json: string;
     category_json: string;
     vendors_json: string;
+    pending_emails: number;
   };
 
   return {
@@ -65,6 +73,7 @@ export function getDashboardMetrics(fy: string): DashboardMetrics {
     reconStatus: JSON.parse(result.recon_json || "[]"),
     categoryBreakdown: JSON.parse(result.category_json || "[]"),
     topVendors: JSON.parse(result.vendors_json || "[]"),
+    pendingEmails: result.pending_emails || 0,
   };
 }
 

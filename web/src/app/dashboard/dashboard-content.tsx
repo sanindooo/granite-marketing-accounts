@@ -350,13 +350,22 @@ export function DashboardContent() {
                     : "reconcile")
               );
 
+              const hasPending = cmd.key === "processInvoices" && metrics.pendingEmails > 0;
+
               return (
                 <div
                   key={cmd.key}
                   className="flex items-center justify-between border-b pb-4 last:border-0 last:pb-0"
                 >
                   <div>
-                    <p className="font-medium">{cmd.label}</p>
+                    <p className="font-medium">
+                      {cmd.label}
+                      {hasPending && (
+                        <span className="ml-2 inline-flex items-center rounded-full bg-amber-100 px-2 py-0.5 text-xs font-medium text-amber-800">
+                          {metrics.pendingEmails} pending
+                        </span>
+                      )}
+                    </p>
                     <p className="text-sm text-muted-foreground">{cmd.description}</p>
                     <p className="text-xs text-muted-foreground">
                       Last run: {formatDateTime(lastRun?.completedAt || null)}
