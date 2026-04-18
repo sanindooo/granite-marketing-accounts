@@ -32,7 +32,7 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, Final
 
 from execution.shared import secrets
@@ -351,13 +351,8 @@ class Ms365Adapter:
         client = self._client()
 
         url = f"{GRAPH_BASE}/me/mailFolders/inbox/messages"
-        params: dict[str, str] = {
-            "$top": str(self._page_size),
-            "$select": SELECT_FIELDS,
-        }
         headers: dict[str, str] = {
             "Authorization": f"Bearer {token}",
-            "Prefer": f"odata.maxpagesize={self._page_size}",
         }
 
         # MS Graph doesn't allow $search with $filter or $orderby
@@ -365,41 +360,62 @@ class Ms365Adapter:
         use_search = sender is not None
         filter_dates_in_python = use_search and (date_from or date_to)
 
+        # Build base params (rebuilt each page for $skip pagination)
+        base_params: dict[str, str] = {
+            "$top": str(self._page_size),
+            "$select": SELECT_FIELDS,
+        }
+
         if sender:
             # Normalize: remove spaces for better matching
             # "Open AI" → search for "openai" (more likely to match openai.com)
             normalized = sender.lower().replace(" ", "")
-            params["$search"] = f'"from:{normalized}"'
+            base_params["$search"] = f'"from:{normalized}"'
             headers["ConsistencyLevel"] = "eventual"  # Required for $search
             # Note: Can't use $orderby with $search
         else:
             # No sender search, can use $filter and $orderby
-            params["$orderby"] = "receivedDateTime desc"
+            base_params["$orderby"] = "receivedDateTime desc"
             if date_from or date_to:
                 filters: list[str] = []
                 if date_from:
                     filters.append(f"receivedDateTime ge {date_from}T00:00:00Z")
                 if date_to:
                     filters.append(f"receivedDateTime le {date_to}T23:59:59Z")
-                params["$filter"] = " and ".join(filters)
+                base_params["$filter"] = " and ".join(filters)
 
         # Parse date boundaries for Python filtering (make timezone-aware)
-        from datetime import timezone
-        date_from_dt = dt.fromisoformat(f"{date_from}T00:00:00").replace(tzinfo=timezone.utc) if date_from else None
-        date_to_dt = dt.fromisoformat(f"{date_to}T23:59:59").replace(tzinfo=timezone.utc) if date_to else None
+        date_from_dt = dt.fromisoformat(f"{date_from}T00:00:00").replace(tzinfo=UTC) if date_from else None
+        date_to_dt = dt.fromisoformat(f"{date_to}T23:59:59").replace(tzinfo=UTC) if date_to else None
 
         buffered: list[RawEmail] = []
+        seen_ids: set[str] = set()  # MS Graph pagination can return duplicates
         pages_fetched = 0
-        while url and pages_fetched < max_pages:
+
+        # Use $skip-based pagination instead of @odata.nextLink.
+        # MS Graph's nextLink with $filter on datetime fields can return
+        # duplicates and miss results due to a server-side cursor bug.
+        while pages_fetched < max_pages:
+            params = {**base_params, "$skip": str(pages_fetched * self._page_size)}
             response = client.get(url, params=params, headers=headers)
             _raise_for_graph_status(response)
             payload = response.json()
+
+            raw_messages = payload.get("value", [])
+            if not raw_messages:
+                break  # No more results
+
             pages_fetched += 1
 
-            for raw in payload.get("value", []):
+            for raw in raw_messages:
                 parsed = _parse_graph_message(raw)
                 if parsed is None:
                     continue
+
+                # Deduplicate (safety net)
+                if parsed.msg_id in seen_ids:
+                    continue
+                seen_ids.add(parsed.msg_id)
 
                 # Apply date filter in Python if using $search
                 if filter_dates_in_python:
@@ -413,18 +429,31 @@ class Ms365Adapter:
                     yield buffered
                     buffered = []
 
-            url = payload.get("@odata.nextLink")
-            params = {}  # nextLink already carries params
-
         if buffered:
             yield buffered
 
-    def fetch_message_body(self, msg_id: str) -> str:
-        """Fetch the full plaintext body for a message.
+    def fetch_message_body(self, msg_id: str, *, prefer_html: bool = False) -> str:
+        """Fetch the body for a message.
 
-        Returns the body content as a string. If the message has no body
-        or only HTML, returns an empty string. Used by the invoice
-        classifier after the initial envelope-only delta sync.
+        Args:
+            msg_id: The message ID to fetch.
+            prefer_html: If True, return HTML content when available.
+                        If False, return plaintext or bodyPreview.
+
+        Returns the body content as a string.
+        """
+        html, text = self.fetch_message_body_both(msg_id)
+        return html if prefer_html else text
+
+    def fetch_message_body_both(self, msg_id: str) -> tuple[str, str]:
+        """Fetch both HTML and text body in a single API call.
+
+        Args:
+            msg_id: The message ID to fetch.
+
+        Returns:
+            Tuple of (html_body, text_body). HTML may be the raw content or empty.
+            Text is plaintext content or bodyPreview fallback.
         """
         token = self._auth.access_token()
         client = self._client()
@@ -437,10 +466,16 @@ class Ms365Adapter:
         _raise_for_graph_status(response)
         payload = response.json()
         body_obj = payload.get("body", {})
-        if body_obj.get("contentType") == "text":
-            return str(body_obj.get("content") or "")
-        # HTML body — return preview as fallback (classification doesn't need HTML)
-        return str(payload.get("bodyPreview") or "")
+        content_type = body_obj.get("contentType", "")
+        content = body_obj.get("content") or ""
+        preview = str(payload.get("bodyPreview") or "")
+
+        if content_type == "html":
+            return (str(content), preview)
+        elif content_type == "text":
+            return ("", str(content))
+        else:
+            return ("", preview)
 
     def fetch_attachments(self, msg_id: str) -> list[MessageAttachment]:
         """Fetch all attachments for a message.
