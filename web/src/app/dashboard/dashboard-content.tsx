@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useQueryState, parseAsString } from "nuqs";
 import { toast } from "sonner";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -18,7 +18,8 @@ import { getCurrentFY } from "@/lib/fiscal";
 import { formatCurrency, formatDateTime } from "@/lib/formatters";
 import type { DashboardMetrics, LastRun, SyncCoverage } from "@/lib/queries/dashboard";
 import { fetchDashboardMetrics, fetchLastRuns, fetchSyncCoverage } from "@/lib/actions/dashboard";
-import { runPipelineCommand, type PipelineCommand, type PipelineOptions } from "@/lib/actions/pipeline";
+import type { PipelineCommand, PipelineOptions } from "@/lib/actions/pipeline";
+import { usePipelineStream } from "@/hooks/use-pipeline-stream";
 
 const PIPELINE_COMMANDS: { key: PipelineCommand; label: string; description: string }[] = [
   { key: "syncEmails", label: "Sync emails", description: "Fetch new invoices from MS365" },
@@ -32,7 +33,7 @@ export function DashboardContent() {
   const [lastRuns, setLastRuns] = useState<LastRun[]>([]);
   const [syncCoverage, setSyncCoverage] = useState<SyncCoverage | null>(null);
   const [loading, setLoading] = useState(true);
-  const [runningCommand, setRunningCommand] = useState<PipelineCommand | null>(null);
+  const stream = usePipelineStream();
 
   const [showFilters, setShowFilters] = useState(false);
   const [pipelineFilters, setPipelineFilters] = useState<{
@@ -70,43 +71,48 @@ export function DashboardContent() {
     loadData();
   }, [fy]);
 
-  const handleRunCommand = async (command: PipelineCommand) => {
-    setRunningCommand(command);
-    try {
-      const options: PipelineOptions = { fiscalYear: fy };
-      if (pipelineFilters.senderSearch) options.sender = pipelineFilters.senderSearch;
-      if (pipelineFilters.dateFrom) options.dateFrom = pipelineFilters.dateFrom;
-      if (pipelineFilters.dateTo) options.dateTo = pipelineFilters.dateTo;
-      if (pipelineFilters.limit) options.limit = pipelineFilters.limit;
-      if (pipelineFilters.backfillFrom) options.backfillFrom = pipelineFilters.backfillFrom;
+  const prevRunningRef = useRef(false);
 
-      const result = await runPipelineCommand(command, options);
-      if (result.ok) {
-        toast.success(`${command} completed successfully`);
-        const [metricsResult, runsResult, coverageResult] = await Promise.all([
+  const handleRunCommand = async (command: PipelineCommand) => {
+    const options: PipelineOptions = { fiscalYear: fy };
+    if (pipelineFilters.senderSearch) options.sender = pipelineFilters.senderSearch;
+    if (pipelineFilters.dateFrom) options.dateFrom = pipelineFilters.dateFrom;
+    if (pipelineFilters.dateTo) options.dateTo = pipelineFilters.dateTo;
+    if (pipelineFilters.limit) options.limit = pipelineFilters.limit;
+    if (pipelineFilters.backfillFrom) options.backfillFrom = pipelineFilters.backfillFrom;
+
+    await stream.run(command, options);
+  };
+
+  // Handle stream completion - only react when isRunning transitions from true to false
+  useEffect(() => {
+    const wasRunning = prevRunningRef.current;
+    prevRunningRef.current = stream.isRunning;
+
+    if (wasRunning && !stream.isRunning) {
+      if (stream.result) {
+        toast.success("Command completed successfully");
+        Promise.all([
           fetchDashboardMetrics(fy),
           fetchLastRuns(),
           fetchSyncCoverage(),
-        ]);
-        if (metricsResult.ok) setMetrics(metricsResult.data);
-        if (runsResult.ok) setLastRuns(runsResult.data);
-        if (coverageResult.ok) setSyncCoverage(coverageResult.data);
-      } else {
-        if (result.error.code === "NEEDS_REAUTH") {
+        ]).then(([metricsResult, runsResult, coverageResult]) => {
+          if (metricsResult.ok) setMetrics(metricsResult.data);
+          if (runsResult.ok) setLastRuns(runsResult.data);
+          if (coverageResult.ok) setSyncCoverage(coverageResult.data);
+        });
+      } else if (stream.error) {
+        if (stream.error.error_code === "needs_reauth") {
           toast.error("Authentication expired", {
-            description: result.error.userMessage || "Run `granite ops reauth ms365` in terminal",
+            description: stream.error.user_message || "Run `granite ops reauth ms365` in terminal",
             duration: 10000,
           });
         } else {
-          toast.error(result.error.message);
+          toast.error(stream.error.message);
         }
       }
-    } catch {
-      toast.error("Command failed");
-    } finally {
-      setRunningCommand(null);
     }
-  };
+  }, [stream.isRunning, stream.result, stream.error, fy]);
 
   if (loading) {
     return <div className="text-muted-foreground">Loading metrics...</div>;
@@ -402,13 +408,14 @@ export function DashboardContent() {
               );
 
               const hasPending = cmd.key === "processInvoices" && metrics.pendingEmails > 0;
+              const isThisRunning = stream.isRunning && stream.activeCommand === cmd.key;
 
               return (
                 <div
                   key={cmd.key}
                   className="flex items-center justify-between border-b pb-4 last:border-0 last:pb-0"
                 >
-                  <div>
+                  <div className="flex-1">
                     <p className="font-medium">
                       {cmd.label}
                       {hasPending && (
@@ -418,27 +425,51 @@ export function DashboardContent() {
                       )}
                     </p>
                     <p className="text-sm text-muted-foreground">{cmd.description}</p>
-                    <p className="text-xs text-muted-foreground">
-                      Last run: {formatDateTime(lastRun?.completedAt || null)}
-                      {lastRun?.status && lastRun.status !== "never" && (
-                        <span
-                          className={
-                            lastRun.status === "success"
-                              ? "ml-2 text-green-600"
-                              : "ml-2 text-red-600"
-                          }
-                        >
-                          ({lastRun.status})
-                        </span>
-                      )}
-                    </p>
+                    {isThisRunning && stream.progress ? (
+                      <div className="mt-2 space-y-1">
+                        <div className="flex items-center gap-2 text-sm">
+                          <div className="h-2 w-2 animate-pulse rounded-full bg-blue-500" />
+                          <span className="text-blue-600">{stream.progress.detail}</span>
+                        </div>
+                        {stream.progress.total > 0 && (
+                          <div className="flex items-center gap-2">
+                            <div className="h-1.5 flex-1 overflow-hidden rounded-full bg-muted">
+                              <div
+                                className="h-full bg-blue-500 transition-all duration-300"
+                                style={{
+                                  width: `${Math.min(100, (stream.progress.current / stream.progress.total) * 100)}%`,
+                                }}
+                              />
+                            </div>
+                            <span className="text-xs text-muted-foreground tabular-nums">
+                              {stream.progress.current}/{stream.progress.total}
+                            </span>
+                          </div>
+                        )}
+                      </div>
+                    ) : (
+                      <p className="text-xs text-muted-foreground">
+                        Last run: {formatDateTime(lastRun?.completedAt || null)}
+                        {lastRun?.status && lastRun.status !== "never" && (
+                          <span
+                            className={
+                              lastRun.status === "success" || lastRun.status === "ok"
+                                ? "ml-2 text-green-600"
+                                : "ml-2 text-red-600"
+                            }
+                          >
+                            ({lastRun.status})
+                          </span>
+                        )}
+                      </p>
+                    )}
                   </div>
                   <Button
                     onClick={() => handleRunCommand(cmd.key)}
-                    disabled={runningCommand !== null}
-                    variant={runningCommand === cmd.key ? "secondary" : "default"}
+                    disabled={stream.isRunning}
+                    variant={isThisRunning ? "secondary" : "default"}
                   >
-                    {runningCommand === cmd.key ? "Running..." : "Run"}
+                    {isThisRunning ? "Running..." : "Run"}
                   </Button>
                 </div>
               );

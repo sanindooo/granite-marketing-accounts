@@ -136,3 +136,35 @@ export function getSyncCoverage(): SyncCoverage {
     latestEmail: row.latest_email,
   };
 }
+
+export interface ActiveRun {
+  runId: string;
+  operation: string;
+  startedAt: string;
+}
+
+export function getActiveRun(operation: string): ActiveRun | null {
+  const row = db
+    .prepare(
+      `
+      SELECT run_id, operation, started_at
+      FROM runs
+      WHERE operation = ? AND status = 'running'
+      ORDER BY started_at DESC
+      LIMIT 1
+    `
+    )
+    .get(operation) as {
+    run_id: string;
+    operation: string;
+    started_at: string;
+  } | undefined;
+
+  if (!row) return null;
+
+  return {
+    runId: row.run_id,
+    operation: row.operation,
+    startedAt: row.started_at,
+  };
+}

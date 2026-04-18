@@ -357,6 +357,7 @@ def ingest_email_ms365(
 
         conn = db_mod.connect(db_path)
         db_mod.apply_migrations(conn)
+        run_id = _begin_run(conn, kind="email", operation="ingest_email")
 
         auth = Ms365Auth.from_keychain()
         adapter = Ms365Adapter(auth=auth)
@@ -450,10 +451,20 @@ def ingest_email_ms365(
                 )
 
             _clear_reauth(conn, SOURCE_ID)
+            _complete_run(
+                conn,
+                run_id=run_id,
+                status="ok",
+                stats={"emails": emails, "batches": batches, "skipped": skipped},
+            )
+        except Exception:
+            _complete_run(conn, run_id=run_id, status="failed", stats={})
+            raise
         finally:
             adapter.close()
 
         result = {
+            "run_id": run_id,
             "source": SOURCE_ID,
             "batches": batches,
             "emails": emails,
@@ -548,6 +559,7 @@ def ingest_invoice_process(
 
         conn = db_mod.connect(db_path)
         db_mod.apply_migrations(conn)
+        run_id = _begin_run(conn, kind="invoice", operation="ingest_invoice")
 
         # Setup Claude client with budget
         budget_gbp = BACKFILL_BUDGET_GBP if backfill else Decimal(budget)
@@ -583,8 +595,20 @@ def ingest_invoice_process(
                 limit=limit,
                 on_progress=progress_callback,
             )
+            _complete_run(
+                conn,
+                run_id=run_id,
+                status="ok",
+                stats={
+                    "processed": stats.processed,
+                    "filed": stats.filed,
+                    "errors": stats.errors,
+                    "cost_gbp": str(stats.cost_gbp),
+                },
+            )
             emit_success(
                 {
+                    "run_id": run_id,
                     "processed": stats.processed,
                     "classified_invoice": stats.classified_invoice,
                     "classified_receipt": stats.classified_receipt,
@@ -599,6 +623,9 @@ def ingest_invoice_process(
                     "backfill": backfill,
                 }
             )
+        except Exception:
+            _complete_run(conn, run_id=run_id, status="failed", stats={})
+            raise
         finally:
             adapter.close()
 
@@ -944,7 +971,7 @@ def reconcile_match(
 
         conn = db_mod.connect(db_path)
         db_mod.apply_migrations(conn)
-        run_id = _begin_run(conn, kind="match")
+        run_id = _begin_run(conn, kind="match", operation="reconcile")
         try:
             stats = run_matcher(conn, run_id=run_id, fiscal_year=fiscal_year)
             _complete_run(conn, run_id=run_id, status="ok", stats=_stats_dict(stats))
@@ -1009,7 +1036,7 @@ def reconcile_run(
     try:
         conn = db_mod.connect(db_path)
         db_mod.apply_migrations(conn)
-        run_id = _begin_run(conn, kind="pipeline")
+        run_id = _begin_run(conn, kind="pipeline", operation="reconcile")
         outcomes: dict[str, str] = {}
         warnings: list[str] = []
         requested = {a.strip() for a in adapters.split(",") if a.strip()}
@@ -1112,7 +1139,7 @@ def _stats_dict(stats: object) -> dict[str, object]:
     return {}
 
 
-def _begin_run(conn: sqlite3.Connection, *, kind: str) -> str:
+def _begin_run(conn: sqlite3.Connection, *, kind: str, operation: str) -> str:
     """Insert a ``runs`` record and return the generated ``run_id``."""
     import secrets as _rnd
 
@@ -1122,10 +1149,10 @@ def _begin_run(conn: sqlite3.Connection, *, kind: str) -> str:
     with conn:
         conn.execute(
             """
-            INSERT INTO runs (run_id, started_at, status, stats_json, cost_gbp)
-            VALUES (?, ?, 'running', '{}', '0.00')
+            INSERT INTO runs (run_id, operation, started_at, status, stats_json, cost_gbp)
+            VALUES (?, ?, ?, 'running', '{}', '0.00')
             """,
-            (run_id, now_utc().isoformat()),
+            (run_id, operation, now_utc().isoformat()),
         )
     return run_id
 
@@ -1141,14 +1168,15 @@ def _complete_run(
 
     from execution.shared.clock import now_utc
 
+    completed_at = now_utc().isoformat()
     with conn:
         conn.execute(
             """
             UPDATE runs
-               SET ended_at = ?, status = ?, stats_json = ?
+               SET ended_at = ?, completed_at = ?, status = ?, stats_json = ?
              WHERE run_id = ?
             """,
-            (now_utc().isoformat(), status, _json.dumps(stats, default=str), run_id),
+            (completed_at, completed_at, status, _json.dumps(stats, default=str), run_id),
         )
 
 
