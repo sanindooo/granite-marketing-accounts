@@ -97,8 +97,11 @@ export async function runPipelineCommand(
       args.push("--json");
     }
 
-    const proc = spawn("granite", args, {
-      cwd: process.cwd().replace("/web", ""),
+    const projectRoot = process.cwd().replace("/web", "");
+    const granitePath = `${projectRoot}/.venv/bin/granite`;
+
+    const proc = spawn(granitePath, args, {
+      cwd: projectRoot,
       shell: false,
       env: { ...process.env },
     });
