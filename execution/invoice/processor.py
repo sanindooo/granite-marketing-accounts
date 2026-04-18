@@ -1,0 +1,422 @@
+"""Invoice processing orchestrator — email → classify → extract → file.
+
+Coordinates the full pipeline:
+
+1. Query ``emails`` rows with ``processed_at IS NULL``.
+2. For each email, fetch full body + attachments via MS Graph.
+3. Run the classifier (Haiku 4.5).
+4. If classified as invoice/receipt:
+   a. Extract PDF text via pdfplumber (text-path) or base64 vision.
+   b. Run the extractor with Haiku → Sonnet escalation.
+   c. Assign category (override → domain-hint → LLM fallback).
+   d. File PDF to Google Drive + write ``invoices`` row.
+5. Update ``emails.processed_at`` and ``emails.outcome``.
+
+Budget controls: per-run ceiling (default £2, backfill £20), per-invoice
+token cap, circuit breaker on 3 consecutive budget breaches.
+"""
+
+from __future__ import annotations
+
+import sqlite3
+from collections.abc import Iterator
+from dataclasses import dataclass, field
+from datetime import date, datetime
+from decimal import Decimal
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, Literal
+
+import pdfplumber
+
+from execution.invoice.category import resolve_category
+from execution.invoice.classifier import (
+    EmailInput,
+    classify_email,
+)
+from execution.invoice.extractor import (
+    ExtractorInput,
+    extract_invoice,
+)
+from execution.invoice.filer import (
+    FiledInvoice,
+    FilerInput,
+    FilerOutcome,
+    file_invoice,
+)
+from execution.invoice.pdf_fetcher import FetchOutcome, FetchStatus, fetch_invoice_pdf
+from execution.shared.claude_client import ClaudeClient
+from execution.shared.clock import now_utc
+from execution.shared.errors import BudgetExhaustedError, PipelineError
+from execution.shared.http import SafeHttpClient
+from execution.shared.prompts import LoadedPrompt
+
+if TYPE_CHECKING:  # pragma: no cover
+    from execution.adapters.ms365 import Ms365Adapter
+    from execution.shared.sheet import GoogleClients
+
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+DEFAULT_BUDGET_GBP: Decimal = Decimal("2.00")
+BACKFILL_BUDGET_GBP: Decimal = Decimal("20.00")
+DEFAULT_BATCH_SIZE: int = 50
+PDF_TEXT_DENSITY_THRESHOLD: int = 20  # chars per page to prefer text-path
+PDF_SANITY_MARKERS: tuple[str, ...] = ("£", "$", "€", "VAT", "Total", "Invoice")
+MAX_PDF_SIZE_BYTES: int = 20 * 1024 * 1024  # 20 MB
+
+Outcome = Literal[
+    "invoice",
+    "receipt",
+    "statement",
+    "neither",
+    "error",
+    "no_attachment",
+    "needs_manual_download",
+    "duplicate_resend",
+]
+
+
+@dataclass
+class ProcessStats:
+    """Per-run processing summary."""
+
+    processed: int = 0
+    classified_invoice: int = 0
+    classified_receipt: int = 0
+    classified_statement: int = 0
+    classified_neither: int = 0
+    filed: int = 0
+    duplicates: int = 0
+    errors: int = 0
+    needs_manual_download: int = 0
+    cost_gbp: Decimal = Decimal("0.00")
+    error_details: list[dict[str, Any]] = field(default_factory=list)
+
+
+@dataclass(frozen=True, slots=True)
+class EmailRow:
+    """Minimal email data from the DB for processing."""
+
+    msg_id: str
+    source_adapter: str
+    from_addr: str
+    subject: str
+    received_at: str
+
+
+# ---------------------------------------------------------------------------
+# Main processor
+# ---------------------------------------------------------------------------
+
+
+def process_pending_emails(
+    conn: sqlite3.Connection,
+    *,
+    adapter: Ms365Adapter,
+    claude: ClaudeClient,
+    google: GoogleClients,
+    classifier_prompt: LoadedPrompt,
+    extractor_prompt: LoadedPrompt,
+    tmp_root: Path,
+    batch_size: int = DEFAULT_BATCH_SIZE,
+    limit: int | None = None,
+) -> ProcessStats:
+    """Process all unprocessed emails and return stats.
+
+    Commits each email individually so partial progress is preserved on crash.
+    """
+    stats = ProcessStats()
+    http_client = SafeHttpClient()
+
+    try:
+        for email_row in _pending_emails(conn, batch_size=batch_size, limit=limit):
+            try:
+                outcome, invoice = _process_one(
+                    conn=conn,
+                    email_row=email_row,
+                    adapter=adapter,
+                    claude=claude,
+                    google=google,
+                    classifier_prompt=classifier_prompt,
+                    extractor_prompt=extractor_prompt,
+                    http_client=http_client,
+                    tmp_root=tmp_root,
+                )
+                _update_email_outcome(conn, email_row.msg_id, outcome)
+                stats.processed += 1
+
+                if outcome == "invoice":
+                    stats.classified_invoice += 1
+                    if invoice:
+                        if invoice.outcome == FilerOutcome.DUPLICATE_RESEND:
+                            stats.duplicates += 1
+                        else:
+                            stats.filed += 1
+                elif outcome == "receipt":
+                    stats.classified_receipt += 1
+                    if invoice:
+                        stats.filed += 1
+                elif outcome == "statement":
+                    stats.classified_statement += 1
+                elif outcome == "neither":
+                    stats.classified_neither += 1
+                elif outcome == "needs_manual_download":
+                    stats.needs_manual_download += 1
+
+            except BudgetExhaustedError:
+                raise
+            except PipelineError as err:
+                stats.errors += 1
+                stats.error_details.append(
+                    {"msg_id": email_row.msg_id, "error": str(err)}
+                )
+                _update_email_outcome(
+                    conn, email_row.msg_id, "error", error_code=err.error_code
+                )
+            except Exception as err:
+                stats.errors += 1
+                stats.error_details.append(
+                    {"msg_id": email_row.msg_id, "error": str(err)}
+                )
+                _update_email_outcome(conn, email_row.msg_id, "error", error_code="unexpected")
+
+        stats.cost_gbp = claude.budget.spent
+        return stats
+
+    finally:
+        http_client.close()
+
+
+def _process_one(
+    *,
+    conn: sqlite3.Connection,
+    email_row: EmailRow,
+    adapter: Ms365Adapter,
+    claude: ClaudeClient,
+    google: GoogleClients,
+    classifier_prompt: LoadedPrompt,
+    extractor_prompt: LoadedPrompt,
+    http_client: SafeHttpClient,
+    tmp_root: Path,
+) -> tuple[Outcome, FiledInvoice | None]:
+    """Process a single email through the full pipeline."""
+    # Fetch full body
+    body_text = adapter.fetch_message_body(email_row.msg_id)
+
+    # Classify
+    email_input = EmailInput(
+        subject=email_row.subject,
+        sender=email_row.from_addr,
+        body=body_text,
+    )
+    result, _call = classify_email(claude, classifier_prompt, email_input)
+
+    if result.classification not in ("invoice", "receipt"):
+        return result.classification, None
+
+    # Fetch attachments
+    attachments = adapter.fetch_attachments(email_row.msg_id)
+    pdf_attachments = [
+        a for a in attachments
+        if a.content_type == "application/pdf" or a.name.lower().endswith(".pdf")
+    ]
+
+    if not pdf_attachments:
+        # Check email body for invoice URLs (Stripe, Paddle, etc.)
+        pdf_bytes, fetch_outcome = _try_fetch_pdf_from_body(
+            body_text, http_client=http_client
+        )
+        if pdf_bytes is None:
+            if fetch_outcome and fetch_outcome.status == FetchStatus.NEEDS_MANUAL_DOWNLOAD:
+                return "needs_manual_download", None
+            return "no_attachment", None
+        attachment_index = 0
+    else:
+        pdf_bytes = pdf_attachments[0].content
+        attachment_index = 0
+
+    if len(pdf_bytes) > MAX_PDF_SIZE_BYTES:
+        return "error", None
+
+    # Extract text from PDF
+    source_text = _extract_pdf_text(pdf_bytes)
+
+    # Determine extraction path (text vs vision)
+    use_text_path = _should_use_text_path(source_text)
+
+    # Run extractor
+    received_date = _parse_received_date(email_row.received_at)
+    extractor_input = ExtractorInput(
+        source_text=source_text if use_text_path else None,
+        pdf_base64=None if use_text_path else _encode_pdf_for_vision(pdf_bytes),
+        sender_domain=_extract_domain(email_row.from_addr),
+        email_received_date=received_date,
+    )
+    extraction, _call = extract_invoice(claude, extractor_prompt, extractor_input)
+
+    # Assign category
+    category_decision = resolve_category(
+        vendor_name=extraction.supplier_name,
+        sender_domain=_extract_domain(email_row.from_addr),
+    )
+
+    # File to Drive
+    filer_input = FilerInput(
+        source_msg_id=email_row.msg_id,
+        attachment_index=attachment_index,
+        pdf_bytes=pdf_bytes,
+        extraction=extraction,
+        extractor_version=extractor_prompt.version,
+        invoice_number_confidence=extraction.field_confidence.get("invoice_number", 0.0),
+        category=category_decision.category,
+        sender_domain=_extract_domain(email_row.from_addr),
+        tmp_root=tmp_root,
+    )
+    filed = file_invoice(
+        conn=conn,
+        google=google,
+        inp=filer_input,
+    )
+
+    return result.classification, filed
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _pending_emails(
+    conn: sqlite3.Connection,
+    *,
+    batch_size: int = DEFAULT_BATCH_SIZE,
+    limit: int | None = None,
+) -> Iterator[EmailRow]:
+    """Yield unprocessed email rows."""
+    query = """
+        SELECT msg_id, source_adapter, from_addr, subject, received_at
+        FROM emails
+        WHERE processed_at IS NULL
+        ORDER BY received_at ASC
+    """
+    if limit:
+        query += f" LIMIT {limit}"
+
+    cursor = conn.execute(query)
+    while True:
+        rows = cursor.fetchmany(batch_size)
+        if not rows:
+            break
+        for row in rows:
+            yield EmailRow(
+                msg_id=row[0],
+                source_adapter=row[1],
+                from_addr=row[2],
+                subject=row[3],
+                received_at=row[4],
+            )
+
+
+def _update_email_outcome(
+    conn: sqlite3.Connection,
+    msg_id: str,
+    outcome: str,
+    *,
+    error_code: str | None = None,
+) -> None:
+    """Mark an email as processed with the given outcome."""
+    with conn:
+        conn.execute(
+            """
+            UPDATE emails
+            SET processed_at = ?, outcome = ?, error_code = ?
+            WHERE msg_id = ?
+            """,
+            (now_utc().isoformat(), outcome, error_code, msg_id),
+        )
+
+
+def _extract_pdf_text(pdf_bytes: bytes) -> str:
+    """Extract text from PDF using pdfplumber."""
+    import io
+
+    text_parts: list[str] = []
+    try:
+        with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+            for page in pdf.pages[:10]:  # Cap at 10 pages
+                page_text = page.extract_text() or ""
+                text_parts.append(page_text)
+    except Exception:
+        return ""
+    return "\n\n".join(text_parts)
+
+
+def _should_use_text_path(source_text: str) -> bool:
+    """Determine if we should use text-only extraction (cheaper) vs vision."""
+    if not source_text:
+        return False
+    # Check density
+    lines = source_text.strip().split("\n")
+    if len(source_text) < PDF_TEXT_DENSITY_THRESHOLD * max(1, len(lines) // 50):
+        return False
+    # Check for sanity markers
+    text_lower = source_text.lower()
+    return any(marker.lower() in text_lower for marker in PDF_SANITY_MARKERS)
+
+
+def _encode_pdf_for_vision(pdf_bytes: bytes) -> str:
+    """Encode PDF bytes as base64 for Claude vision."""
+    import base64
+
+    return base64.standard_b64encode(pdf_bytes).decode("ascii")
+
+
+def _try_fetch_pdf_from_body(
+    body_text: str,
+    *,
+    http_client: SafeHttpClient,
+) -> tuple[bytes | None, FetchOutcome | None]:
+    """Try to extract and fetch a PDF URL from the email body."""
+    import re
+
+    # Common invoice URL patterns
+    url_patterns = [
+        r"https?://[^\s<>\"']+\.pdf\b",
+        r"https?://pay\.stripe\.com/[^\s<>\"']+",
+        r"https?://invoice\.stripe\.com/[^\s<>\"']+",
+        r"https?://[^\s<>\"']*paddle[^\s<>\"']+/invoice[^\s<>\"']*",
+    ]
+    for pattern in url_patterns:
+        match = re.search(pattern, body_text, re.IGNORECASE)
+        if match:
+            url = match.group(0).rstrip(".,;:)")
+            outcome = fetch_invoice_pdf(url, client=http_client)
+            if outcome.status == FetchStatus.OK and outcome.body:
+                return outcome.body, outcome
+            if outcome.status == FetchStatus.NEEDS_MANUAL_DOWNLOAD:
+                return None, outcome
+    return None, None
+
+
+def _extract_domain(email_addr: str) -> str | None:
+    """Extract domain from an email address."""
+    if "@" not in email_addr:
+        return None
+    return email_addr.split("@")[-1].lower().strip()
+
+
+def _parse_received_date(received_at: str) -> date:
+    """Parse ISO 8601 datetime string to date."""
+    return datetime.fromisoformat(received_at.replace("Z", "+00:00")).date()
+
+
+__all__ = [
+    "BACKFILL_BUDGET_GBP",
+    "DEFAULT_BATCH_SIZE",
+    "DEFAULT_BUDGET_GBP",
+    "Outcome",
+    "ProcessStats",
+    "process_pending_emails",
+]

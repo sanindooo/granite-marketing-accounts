@@ -105,6 +105,17 @@ class RawEmail:
 
 
 @dataclass(frozen=True, slots=True)
+class MessageAttachment:
+    """A file attachment fetched from MS Graph."""
+
+    attachment_id: str
+    name: str
+    content_type: str
+    size: int
+    content: bytes
+
+
+@dataclass(frozen=True, slots=True)
 class FetchStats:
     """Per-run summary the orchestrator records on ``runs.stats_json``."""
 
@@ -317,6 +328,71 @@ class Ms365Adapter:
         """Delta link from the most recent fetch, or ``None`` if fetch not run."""
         return getattr(self, "_last_watermark", None)
 
+    def fetch_message_body(self, msg_id: str) -> str:
+        """Fetch the full plaintext body for a message.
+
+        Returns the body content as a string. If the message has no body
+        or only HTML, returns an empty string. Used by the invoice
+        classifier after the initial envelope-only delta sync.
+        """
+        token = self._auth.access_token()
+        client = self._client()
+        url = f"{GRAPH_BASE}/me/messages/{msg_id}"
+        response = client.get(
+            url,
+            params={"$select": "body,bodyPreview"},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        _raise_for_graph_status(response)
+        payload = response.json()
+        body_obj = payload.get("body", {})
+        if body_obj.get("contentType") == "text":
+            return str(body_obj.get("content") or "")
+        # HTML body — return preview as fallback (classification doesn't need HTML)
+        return str(payload.get("bodyPreview") or "")
+
+    def fetch_attachments(self, msg_id: str) -> list[MessageAttachment]:
+        """Fetch all attachments for a message.
+
+        Returns a list of :class:`MessageAttachment` dataclasses with
+        the binary content. Only fetches file attachments (not itemAttachment
+        or referenceAttachment).
+        """
+        token = self._auth.access_token()
+        client = self._client()
+        url = f"{GRAPH_BASE}/me/messages/{msg_id}/attachments"
+        response = client.get(
+            url,
+            params={"$select": "id,name,contentType,size,contentBytes,@odata.type"},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        _raise_for_graph_status(response)
+        payload = response.json()
+        attachments: list[MessageAttachment] = []
+        for raw in payload.get("value", []):
+            # Only handle file attachments (not itemAttachment or referenceAttachment)
+            odata_type = raw.get("@odata.type", "")
+            if "#microsoft.graph.fileAttachment" not in odata_type:
+                continue
+            content_b64 = raw.get("contentBytes")
+            if not content_b64:
+                continue
+            import base64
+            try:
+                content = base64.b64decode(content_b64)
+            except Exception:  # noqa: S112 — skip malformed attachments silently
+                continue
+            attachments.append(
+                MessageAttachment(
+                    attachment_id=str(raw.get("id") or ""),
+                    name=str(raw.get("name") or "attachment"),
+                    content_type=str(raw.get("contentType") or "application/octet-stream"),
+                    size=int(raw.get("size") or len(content)),
+                    content=content,
+                )
+            )
+        return attachments
+
     def reauth(self) -> None:
         """Run the device-code flow end-to-end."""
         flow = self._auth.initiate_device_flow()
@@ -453,6 +529,7 @@ __all__ = [
     "SELECT_FIELDS",
     "SOURCE_ID",
     "FetchStats",
+    "MessageAttachment",
     "Ms365Adapter",
     "Ms365Auth",
     "RawEmail",

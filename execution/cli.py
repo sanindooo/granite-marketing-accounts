@@ -363,6 +363,116 @@ def ingest_email_ms365(
 
 
 # ---------------------------------------------------------------------------
+# ingest invoice subcommands (Phase 2)
+# ---------------------------------------------------------------------------
+
+
+ingest_invoice_app = typer.Typer(
+    name="invoice", help="Invoice classification + extraction + filing.", no_args_is_help=True
+)
+ingest_app.add_typer(ingest_invoice_app)
+
+
+@ingest_invoice_app.command("process")
+def ingest_invoice_process(
+    db_path: Annotated[Path | None, typer.Option("--db")] = None,
+    budget: Annotated[
+        str,
+        typer.Option("--budget", help="Per-run budget ceiling in GBP (default: 2.00)."),
+    ] = "2.00",
+    backfill: Annotated[
+        bool,
+        typer.Option(
+            "--backfill",
+            help="Backfill mode: £20 budget, 1h cache TTL.",
+        ),
+    ] = False,
+    limit: Annotated[
+        int | None,
+        typer.Option("--limit", help="Process at most N emails."),
+    ] = None,
+    tmp_root: Annotated[
+        Path | None,
+        typer.Option("--tmp", help="Override temp directory (default: .tmp)."),
+    ] = None,
+) -> None:
+    """Classify, extract, and file pending emails as invoices.
+
+    Processes all emails with ``processed_at IS NULL``. Each email is:
+    1. Classified via Haiku 4.5 (invoice | receipt | statement | neither).
+    2. If invoice/receipt: PDF extracted, data extracted via Claude.
+    3. Filed to Google Drive and written to the ``invoices`` table.
+
+    Use ``--backfill`` for initial bulk processing (higher budget, longer cache).
+    """
+    try:
+        from execution.adapters.ms365 import Ms365Adapter, Ms365Auth
+        from execution.invoice.processor import (
+            BACKFILL_BUDGET_GBP,
+            process_pending_emails,
+        )
+        from execution.shared.claude_client import ClaudeClient
+        from execution.shared.prompts import load_prompt
+        from execution.shared.sheet import GoogleClients
+
+        conn = db_mod.connect(db_path)
+        db_mod.apply_migrations(conn)
+
+        # Setup Claude client with budget
+        budget_gbp = BACKFILL_BUDGET_GBP if backfill else Decimal(budget)
+        ttl = "1h" if backfill else "5m"
+        claude = ClaudeClient(budget_gbp=budget_gbp, ttl=ttl)
+
+        # Load prompts
+        classifier_prompt = load_prompt("classifier")
+        extractor_prompt = load_prompt("extractor")
+
+        # Setup adapters
+        auth = Ms365Auth.from_keychain()
+        adapter = Ms365Adapter(auth=auth)
+        google = GoogleClients.connect()
+
+        # Resolve tmp directory
+        resolved_tmp = tmp_root or Path(".tmp")
+        resolved_tmp.mkdir(parents=True, exist_ok=True)
+
+        try:
+            stats = process_pending_emails(
+                conn,
+                adapter=adapter,
+                claude=claude,
+                google=google,
+                classifier_prompt=classifier_prompt,
+                extractor_prompt=extractor_prompt,
+                tmp_root=resolved_tmp,
+                limit=limit,
+            )
+            emit_success(
+                {
+                    "processed": stats.processed,
+                    "classified_invoice": stats.classified_invoice,
+                    "classified_receipt": stats.classified_receipt,
+                    "classified_statement": stats.classified_statement,
+                    "classified_neither": stats.classified_neither,
+                    "filed": stats.filed,
+                    "duplicates": stats.duplicates,
+                    "needs_manual_download": stats.needs_manual_download,
+                    "errors": stats.errors,
+                    "cost_gbp": format(stats.cost_gbp, ".4f"),
+                    "budget_gbp": format(budget_gbp, ".2f"),
+                    "backfill": backfill,
+                }
+            )
+        finally:
+            adapter.close()
+
+    except PipelineError as err:
+        emit_error(err)
+    except Exception as err:
+        emit_error(err)
+
+
+# ---------------------------------------------------------------------------
 # ingest bank subcommands (Phase 3)
 # ---------------------------------------------------------------------------
 
