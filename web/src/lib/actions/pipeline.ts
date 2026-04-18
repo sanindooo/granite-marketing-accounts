@@ -31,7 +31,8 @@ export async function runPipelineCommand(
   return new Promise((resolve) => {
     const args: string[] = [...COMMANDS[command]];
 
-    if (options?.fiscalYear) {
+    // Only reconcile supports --fy
+    if (options?.fiscalYear && command === "runReconciliation") {
       try {
         const fy = FiscalYearSchema.parse(options.fiscalYear);
         args.push("--fy", fy);
