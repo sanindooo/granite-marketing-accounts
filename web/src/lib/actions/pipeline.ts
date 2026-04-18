@@ -93,10 +93,7 @@ export async function runPipelineCommand(
       args.push("--limit", String(options.limit));
     }
 
-    // Only add --json for commands that support it
-    if (command === "processInvoices" || command === "runReconciliation") {
-      args.push("--json");
-    }
+    // Commands output JSON by default, no flag needed
 
     const projectRoot = process.cwd().replace("/web", "");
     const granitePath = `${projectRoot}/.venv/bin/granite`;
