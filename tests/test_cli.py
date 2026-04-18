@@ -69,6 +69,58 @@ def test_ingest_bank_monzo_registered() -> None:
     assert result.exit_code == 0
 
 
+def test_ops_healthcheck_registered() -> None:
+    result = runner.invoke(app, ["ops", "healthcheck", "--help"])
+    assert result.exit_code == 0
+
+
+def test_ops_healthcheck_emits_report(tmp_path, mock_secrets, monkeypatch) -> None:
+    db = tmp_path / "pipeline.db"
+    runner.invoke(app, ["db", "migrate", "--db", str(db)])
+
+    # Seed a fresh run so "no previous run" doesn't dominate the output.
+    import sqlite3
+
+    conn = sqlite3.connect(str(db))
+    conn.execute(
+        "INSERT INTO runs (run_id, started_at, ended_at, status) "
+        "VALUES ('r-seed', '2026-04-18T08:00:00+00:00', "
+        "'2026-04-18T08:00:01+00:00', 'ok')"
+    )
+    conn.commit()
+    conn.close()
+
+    # Force monzo cache empty so the check doesn't touch Keychain.
+    from execution.adapters import monzo as monzo_mod
+
+    monkeypatch.setattr(monzo_mod, "load_token_cache", lambda: None)
+
+    # Shutil.disk_usage on tmp_path gives real disk space; fake it for
+    # deterministic output.
+    import shutil as _shutil
+
+    from execution.ops import healthcheck as hc_mod
+
+    class _Usage:
+        free = 10 * 1024 * 1024 * 1024  # 10 GB
+
+    monkeypatch.setattr(
+        hc_mod.shutil, "disk_usage", lambda _p: _Usage()
+    )
+    del _shutil  # placate unused-import when module load order shifts
+
+    result = runner.invoke(
+        app, ["ops", "healthcheck", "--db", str(db), "--state-dir", str(tmp_path)]
+    )
+    # Exit code may be 0 or 1 depending on whether Keychain entries
+    # happen to exist; the contract we care about is the JSON payload.
+    doc = json.loads(result.stdout.strip().splitlines()[-1])
+    assert "healthy" in doc
+    assert "checks" in doc
+    assert "warnings" in doc
+    assert "errors" in doc
+
+
 def test_reconcile_match_registered() -> None:
     result = runner.invoke(app, ["reconcile", "match", "--help"])
     assert result.exit_code == 0

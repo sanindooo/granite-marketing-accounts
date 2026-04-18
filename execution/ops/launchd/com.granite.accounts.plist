@@ -1,0 +1,66 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+Granite Accounts scheduled pipeline.
+
+Runs 09:00 Europe/London every day. WakeSystem wakes the Mac from
+sleep so overnight stored-up ingests still fire. RunAtLoad is off —
+we don't want the installer to spike a full pipeline run; the user
+can trigger one manually with:
+
+    launchctl start com.granite.accounts
+
+Logs stream to ~/Library/Logs/granite-accounts/run.log. The wrapper
+script lives at ~/Library/Application Support/granite-accounts/run.sh
+(created by install.sh) and invokes:
+
+    granite ops healthcheck && granite reconcile run
+
+so a failing healthcheck aborts the pipeline cleanly.
+
+The ${HOME} tokens below are interpolated by install.sh before the
+plist is copied into ~/Library/LaunchAgents/.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.granite.accounts</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>${HOME}/Library/Application Support/granite-accounts/run.sh</string>
+    </array>
+
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>9</integer>
+        <key>Minute</key>
+        <integer>0</integer>
+    </dict>
+
+    <key>WakeSystem</key>
+    <true/>
+
+    <key>RunAtLoad</key>
+    <false/>
+
+    <key>StandardOutPath</key>
+    <string>${HOME}/Library/Logs/granite-accounts/run.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>${HOME}/Library/Logs/granite-accounts/run.err</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin</string>
+    </dict>
+
+    <key>ProcessType</key>
+    <string>Background</string>
+
+    <key>Nice</key>
+    <integer>5</integer>
+</dict>
+</plist>

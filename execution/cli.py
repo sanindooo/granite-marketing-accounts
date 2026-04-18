@@ -111,6 +111,53 @@ def db_status(
 # ops subcommands (minimal Phase 1A surface)
 # ---------------------------------------------------------------------------
 
+@ops_app.command("healthcheck")
+def ops_healthcheck(
+    db_path: Annotated[Path | None, typer.Option("--db")] = None,
+    state_dir: Annotated[
+        Path | None,
+        typer.Option(
+            "--state-dir",
+            help=(
+                "Directory that holds pipeline.db; defaults to the same "
+                "directory as the DB path."
+            ),
+        ),
+    ] = None,
+) -> None:
+    """Pre-run healthcheck — JSON payload + non-zero exit on failure."""
+    try:
+        import json as _json
+
+        from execution.ops.healthcheck import run_healthcheck
+
+        conn = db_mod.connect(db_path)
+        db_mod.apply_migrations(conn)
+        default_state = db_mod.default_db_path().parent
+        resolved_state = state_dir or (
+            db_path.parent if db_path is not None else default_state
+        )
+        report = run_healthcheck(conn, state_dir=resolved_state)
+        payload = {
+            "checks": report.checks,
+            "warnings": list(report.warnings),
+            "errors": list(report.errors),
+            "healthy": report.healthy,
+        }
+        status = "success" if report.healthy else "error"
+        sys.stdout.write(_json.dumps({"status": status, **payload}, default=str))
+        sys.stdout.write("\n")
+        sys.stdout.flush()
+        if not report.healthy:
+            raise typer.Exit(code=1)
+    except PipelineError as err:
+        emit_error(err)
+    except typer.Exit:
+        raise
+    except Exception as err:
+        emit_error(err)
+
+
 @ops_app.command("health")
 def ops_health(
     db_path: Annotated[Path | None, typer.Option("--db")] = None,
