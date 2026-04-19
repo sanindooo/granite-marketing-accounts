@@ -28,11 +28,6 @@ interface NeedsAttentionCardProps {
   onUploadPdf: (msgId: string, file: File) => Promise<void>;
 }
 
-function extractDomain(email: string): string | null {
-  const match = email.match(/@([^@]+)$/);
-  return match ? match[1].toLowerCase() : null;
-}
-
 export function NeedsAttentionCard({ pendingActions, onDismiss, onBulkDismiss, onUploadPdf }: NeedsAttentionCardProps) {
   const [expandedId, setExpandedId] = useState<string | null>(null);
   const [emailBody, setEmailBody] = useState<EmailBody | null>(null);
@@ -67,11 +62,11 @@ export function NeedsAttentionCard({ pendingActions, onDismiss, onBulkDismiss, o
     }
   };
 
-  const handleBulkDismiss = async () => {
+  const handleBulkDismiss = async (reason: "not_invoice" | "resolved") => {
     if (selectedIds.size === 0) return;
     setBulkDismissing(true);
     try {
-      await onBulkDismiss(Array.from(selectedIds), "not_invoice");
+      await onBulkDismiss(Array.from(selectedIds), reason);
       setSelectedIds(new Set());
     } finally {
       setBulkDismissing(false);
@@ -148,9 +143,18 @@ export function NeedsAttentionCard({ pendingActions, onDismiss, onBulkDismiss, o
                 size="sm"
                 className="h-7 text-xs"
                 disabled={bulkDismissing}
-                onClick={handleBulkDismiss}
+                onClick={() => handleBulkDismiss("not_invoice")}
               >
-                {bulkDismissing ? "Dismissing..." : "Mark Selected as Not Invoice"}
+                {bulkDismissing ? "..." : "Not Invoice"}
+              </Button>
+              <Button
+                variant="outline"
+                size="sm"
+                className="h-7 text-xs text-green-600 border-green-200 hover:bg-green-50"
+                disabled={bulkDismissing}
+                onClick={() => handleBulkDismiss("resolved")}
+              >
+                {bulkDismissing ? "..." : "Resolved"}
               </Button>
               <Button
                 variant="ghost"
@@ -256,14 +260,12 @@ export function NeedsAttentionCard({ pendingActions, onDismiss, onBulkDismiss, o
                         </>
                       )}
                       {confirmingDismiss === action.msgId ? (
-                        <div className="flex items-center gap-1 rounded border bg-white px-2 py-1 shadow-sm">
-                          <span className="text-xs text-muted-foreground mr-1">
-                            Block {extractDomain(action.fromAddr)}?
-                          </span>
+                        <div className="flex items-center gap-0.5 rounded border bg-white px-1.5 py-0.5 shadow-sm">
+                          <span className="text-xs text-muted-foreground">Block?</span>
                           <Button
                             variant="ghost"
                             size="sm"
-                            className="h-5 px-2 text-xs"
+                            className="h-5 px-1.5 text-xs"
                             onClick={() => handleConfirmNotInvoice(action.msgId, true)}
                           >
                             Yes
@@ -271,7 +273,7 @@ export function NeedsAttentionCard({ pendingActions, onDismiss, onBulkDismiss, o
                           <Button
                             variant="ghost"
                             size="sm"
-                            className="h-5 px-2 text-xs"
+                            className="h-5 px-1.5 text-xs"
                             onClick={() => handleConfirmNotInvoice(action.msgId, false)}
                           >
                             No
