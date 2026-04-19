@@ -7,14 +7,6 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Checkbox } from "@/components/ui/checkbox";
 import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle,
-} from "@/components/ui/dialog";
-import {
   Table,
   TableBody,
   TableCell,
@@ -32,6 +24,7 @@ interface EmailBody {
 interface NeedsAttentionCardProps {
   pendingActions: PendingAction[];
   onDismiss: (msgId: string, reason: "not_invoice" | "resolved", blockDomain?: boolean) => Promise<void>;
+  onBulkDismiss: (msgIds: string[], reason: "not_invoice" | "resolved") => Promise<void>;
   onUploadPdf: (msgId: string, file: File) => Promise<void>;
 }
 
@@ -40,28 +33,58 @@ function extractDomain(email: string): string | null {
   return match ? match[1].toLowerCase() : null;
 }
 
-export function NeedsAttentionCard({ pendingActions, onDismiss, onUploadPdf }: NeedsAttentionCardProps) {
+export function NeedsAttentionCard({ pendingActions, onDismiss, onBulkDismiss, onUploadPdf }: NeedsAttentionCardProps) {
   const [expandedId, setExpandedId] = useState<string | null>(null);
   const [emailBody, setEmailBody] = useState<EmailBody | null>(null);
   const [loadingBody, setLoadingBody] = useState(false);
   const [uploadingId, setUploadingId] = useState<string | null>(null);
   const fileInputRefs = useRef<Map<string, HTMLInputElement>>(new Map());
 
-  // Dismiss dialog state
-  const [dismissDialog, setDismissDialog] = useState<{
-    open: boolean;
-    msgId: string;
-    fromAddr: string;
-    blockDomain: boolean;
-  }>({ open: false, msgId: "", fromAddr: "", blockDomain: false });
+  // Bulk selection state
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
+  const [bulkDismissing, setBulkDismissing] = useState(false);
 
-  const handleNotInvoiceClick = (msgId: string, fromAddr: string) => {
-    setDismissDialog({ open: true, msgId, fromAddr, blockDomain: false });
+  // Inline dismiss confirmation state (shows "Block domain? Yes/No" after clicking Not Invoice)
+  const [confirmingDismiss, setConfirmingDismiss] = useState<string | null>(null);
+
+  const toggleSelection = (msgId: string) => {
+    setSelectedIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(msgId)) {
+        next.delete(msgId);
+      } else {
+        next.add(msgId);
+      }
+      return next;
+    });
   };
 
-  const handleConfirmDismiss = async () => {
-    await onDismiss(dismissDialog.msgId, "not_invoice", dismissDialog.blockDomain);
-    setDismissDialog({ open: false, msgId: "", fromAddr: "", blockDomain: false });
+  const toggleSelectAll = () => {
+    if (selectedIds.size === pendingActions.length) {
+      setSelectedIds(new Set());
+    } else {
+      setSelectedIds(new Set(pendingActions.map((a) => a.msgId)));
+    }
+  };
+
+  const handleBulkDismiss = async () => {
+    if (selectedIds.size === 0) return;
+    setBulkDismissing(true);
+    try {
+      await onBulkDismiss(Array.from(selectedIds), "not_invoice");
+      setSelectedIds(new Set());
+    } finally {
+      setBulkDismissing(false);
+    }
+  };
+
+  const handleNotInvoiceClick = (msgId: string) => {
+    setConfirmingDismiss(msgId);
+  };
+
+  const handleConfirmNotInvoice = async (msgId: string, blockDomain: boolean) => {
+    await onDismiss(msgId, "not_invoice", blockDomain);
+    setConfirmingDismiss(null);
   };
 
   const handleFileSelect = async (msgId: string, file: File | undefined) => {
@@ -105,18 +128,53 @@ export function NeedsAttentionCard({ pendingActions, onDismiss, onUploadPdf }: N
     }
   };
 
+  const hasSelection = selectedIds.size > 0;
+
   return (
     <Card className="border-amber-200 bg-amber-50/50">
       <CardHeader>
-        <CardTitle className="flex items-center gap-2 text-amber-800">
-          <span className="inline-flex h-2 w-2 rounded-full bg-amber-500" />
-          Needs Attention ({pendingActions.length})
-        </CardTitle>
+        <div className="flex items-center justify-between">
+          <CardTitle className="flex items-center gap-2 text-amber-800">
+            <span className="inline-flex h-2 w-2 rounded-full bg-amber-500" />
+            Needs Attention ({pendingActions.length})
+          </CardTitle>
+          {hasSelection && (
+            <div className="flex items-center gap-2">
+              <span className="text-sm text-muted-foreground">
+                {selectedIds.size} selected
+              </span>
+              <Button
+                variant="outline"
+                size="sm"
+                className="h-7 text-xs"
+                disabled={bulkDismissing}
+                onClick={handleBulkDismiss}
+              >
+                {bulkDismissing ? "Dismissing..." : "Mark Selected as Not Invoice"}
+              </Button>
+              <Button
+                variant="ghost"
+                size="sm"
+                className="h-7 text-xs"
+                onClick={() => setSelectedIds(new Set())}
+              >
+                Clear
+              </Button>
+            </div>
+          )}
+        </div>
       </CardHeader>
       <CardContent>
         <Table>
           <TableHeader>
             <TableRow>
+              <TableHead className="w-8">
+                <Checkbox
+                  checked={selectedIds.size === pendingActions.length && pendingActions.length > 0}
+                  onCheckedChange={toggleSelectAll}
+                  aria-label="Select all"
+                />
+              </TableHead>
               <TableHead className="w-8"></TableHead>
               <TableHead>From</TableHead>
               <TableHead>Subject</TableHead>
@@ -129,6 +187,13 @@ export function NeedsAttentionCard({ pendingActions, onDismiss, onUploadPdf }: N
             {pendingActions.map((action) => (
               <Fragment key={action.msgId}>
                 <TableRow className="cursor-pointer hover:bg-amber-100/50">
+                  <TableCell className="w-8">
+                    <Checkbox
+                      checked={selectedIds.has(action.msgId)}
+                      onCheckedChange={() => toggleSelection(action.msgId)}
+                      aria-label={`Select ${action.subject}`}
+                    />
+                  </TableCell>
                   <TableCell className="w-8">
                     <Button
                       variant="ghost"
@@ -167,7 +232,7 @@ export function NeedsAttentionCard({ pendingActions, onDismiss, onUploadPdf }: N
                     </span>
                   </TableCell>
                   <TableCell>
-                    <div className="flex gap-1">
+                    <div className="flex items-center gap-1">
                       {(action.outcome === "needs_manual_download" || action.outcome === "no_attachment") && (
                         <>
                           <Input
@@ -190,14 +255,46 @@ export function NeedsAttentionCard({ pendingActions, onDismiss, onUploadPdf }: N
                           </Button>
                         </>
                       )}
-                      <Button
-                        variant="ghost"
-                        size="sm"
-                        className="h-7 px-2 text-xs text-muted-foreground hover:text-foreground"
-                        onClick={() => handleNotInvoiceClick(action.msgId, action.fromAddr)}
-                      >
-                        Not Invoice
-                      </Button>
+                      {confirmingDismiss === action.msgId ? (
+                        <div className="flex items-center gap-1 rounded border bg-white px-2 py-1 shadow-sm">
+                          <span className="text-xs text-muted-foreground mr-1">
+                            Block {extractDomain(action.fromAddr)}?
+                          </span>
+                          <Button
+                            variant="ghost"
+                            size="sm"
+                            className="h-5 px-2 text-xs"
+                            onClick={() => handleConfirmNotInvoice(action.msgId, true)}
+                          >
+                            Yes
+                          </Button>
+                          <Button
+                            variant="ghost"
+                            size="sm"
+                            className="h-5 px-2 text-xs"
+                            onClick={() => handleConfirmNotInvoice(action.msgId, false)}
+                          >
+                            No
+                          </Button>
+                          <Button
+                            variant="ghost"
+                            size="sm"
+                            className="h-5 w-5 p-0 text-xs text-muted-foreground"
+                            onClick={() => setConfirmingDismiss(null)}
+                          >
+                            ✕
+                          </Button>
+                        </div>
+                      ) : (
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          className="h-7 px-2 text-xs text-muted-foreground hover:text-foreground"
+                          onClick={() => handleNotInvoiceClick(action.msgId)}
+                        >
+                          Not Invoice
+                        </Button>
+                      )}
                       <Button
                         variant="ghost"
                         size="sm"
@@ -211,7 +308,7 @@ export function NeedsAttentionCard({ pendingActions, onDismiss, onUploadPdf }: N
                 </TableRow>
                 {expandedId === action.msgId && (
                   <TableRow>
-                    <TableCell colSpan={6} className="bg-white p-4">
+                    <TableCell colSpan={7} className="bg-white p-4">
                       {loadingBody ? (
                         <div className="text-sm text-muted-foreground">Loading email content...</div>
                       ) : emailBody ? (
@@ -241,52 +338,9 @@ export function NeedsAttentionCard({ pendingActions, onDismiss, onUploadPdf }: N
           </TableBody>
         </Table>
         <p className="mt-3 text-xs text-muted-foreground">
-          Click + to view email content. Mark as &quot;Not Invoice&quot; to train the system, or &quot;Resolved&quot; if handled manually.
+          Use checkboxes to select multiple emails for bulk actions. Click + to view email content.
         </p>
       </CardContent>
-
-      <Dialog open={dismissDialog.open} onOpenChange={(open) => {
-        if (!open) setDismissDialog({ open: false, msgId: "", fromAddr: "", blockDomain: false });
-      }}>
-        <DialogContent>
-          <DialogHeader>
-            <DialogTitle>Mark as Not Invoice</DialogTitle>
-            <DialogDescription>
-              This email will be marked as not an invoice and removed from the attention list.
-            </DialogDescription>
-          </DialogHeader>
-          <div className="py-4">
-            <label className="flex items-start gap-3 cursor-pointer">
-              <Checkbox
-                checked={dismissDialog.blockDomain}
-                onCheckedChange={(checked) =>
-                  setDismissDialog((d) => ({ ...d, blockDomain: checked === true }))
-                }
-                className="mt-0.5"
-              />
-              <div>
-                <span className="text-sm font-medium">
-                  Block all emails from {extractDomain(dismissDialog.fromAddr)}
-                </span>
-                <p className="text-xs text-muted-foreground mt-1">
-                  Future emails from this domain will be automatically skipped during processing.
-                </p>
-              </div>
-            </label>
-          </div>
-          <DialogFooter>
-            <Button
-              variant="outline"
-              onClick={() => setDismissDialog({ open: false, msgId: "", fromAddr: "", blockDomain: false })}
-            >
-              Cancel
-            </Button>
-            <Button onClick={handleConfirmDismiss}>
-              Confirm
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
     </Card>
   );
 }

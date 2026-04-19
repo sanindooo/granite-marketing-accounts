@@ -401,6 +401,20 @@ export function DashboardContent() {
               : "Marked as resolved";
             toast.success(message);
           }}
+          onBulkDismiss={async (msgIds, reason) => {
+            const response = await fetch("/api/emails/bulk-dismiss", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ msgIds, reason }),
+            });
+            if (response.ok) {
+              const result = await fetchPendingActions();
+              if (result.ok) setPendingActions(result.data);
+              toast.success(`Marked ${msgIds.length} emails as not invoices`);
+            } else {
+              toast.error("Failed to dismiss emails");
+            }
+          }}
           onUploadPdf={async (msgId, file) => {
             const formData = new FormData();
             formData.append("msgId", msgId);

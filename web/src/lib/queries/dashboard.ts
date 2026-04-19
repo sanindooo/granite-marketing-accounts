@@ -272,3 +272,32 @@ export function blockDomain(domain: string): void {
     `INSERT OR REPLACE INTO blocked_domains (domain, blocked_at) VALUES (?, datetime('now'))`
   ).run(domain.toLowerCase());
 }
+
+export function bulkDismissEmails(
+  msgIds: string[],
+  reason: "not_invoice" | "resolved"
+): number {
+  if (msgIds.length === 0) return 0;
+
+  const placeholders = msgIds.map(() => "?").join(",");
+  const now = "datetime('now')";
+
+  // Update emails table
+  db.prepare(
+    `UPDATE emails SET dismissed_at = ${now}, dismissed_reason = ? WHERE msg_id IN (${placeholders})`
+  ).run(reason, ...msgIds);
+
+  // Insert feedback records
+  const insertStmt = db.prepare(
+    `INSERT INTO email_feedback (msg_id, feedback_type, feedback_value, from_addr, subject, sender_domain)
+     SELECT msg_id, 'dismiss', ?, from_addr, subject,
+            LOWER(SUBSTR(from_addr, INSTR(from_addr, '@') + 1))
+     FROM emails WHERE msg_id = ?`
+  );
+
+  for (const msgId of msgIds) {
+    insertStmt.run(reason, msgId);
+  }
+
+  return msgIds.length;
+}
