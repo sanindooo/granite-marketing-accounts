@@ -1,11 +1,7 @@
 """FX rates with durable SQLite cache.
 
-Primary source: exchangerate.host (free, no key, ECB-backed). Rates published
+Primary source: frankfurter.app (free, no key, ECB-backed). Rates published
 daily ~16:00 CET; weekend/holiday requests fall back to the last working day.
-
-Phase 1A ships the cache layer + the source-switch plumbing. The live HTTP
-fetcher lands with the rest of the HTTP client in Phase 2 — for now the
-only live path is a minimal ``httpx`` call that's easy to mock in tests.
 
 Every rate goes into the ``fx_rates`` table keyed on ``(date, from, to)``.
 Stored as 6-dp Decimal text; ``to_rate`` is the canonical parser.
@@ -24,7 +20,7 @@ from execution.shared.money import to_rate, validate_currency
 
 RateSource = Literal["ecb", "frankfurter", "mock"]
 
-_EXCHANGERATE_HOST = "https://api.exchangerate.host/{iso_date}"
+_FRANKFURTER_URL = "https://api.frankfurter.app/{iso_date}?from={from_ccy}&to={to_ccy}"
 
 # Test seam: set to a dict mapping (date_iso, from, to) → Decimal to make the
 # live path deterministic without touching the network.
@@ -72,7 +68,7 @@ def get_rate(
         prev = d - timedelta(days=i)
         cached_prev = _lookup(conn, prev, from_ccy, to_ccy)
         if cached_prev is not None:
-            _store(conn, d, from_ccy, to_ccy, cached_prev, source="ecb")
+            _store(conn, d, from_ccy, to_ccy, cached_prev, source="frankfurter")
             return cached_prev
 
     if not allow_fetch:
@@ -83,7 +79,7 @@ def get_rate(
         )
 
     rate = _fetch_rate(d, from_ccy, to_ccy)
-    _store(conn, d, from_ccy, to_ccy, rate, source="ecb")
+    _store(conn, d, from_ccy, to_ccy, rate, source="frankfurter")
     return rate
 
 
@@ -125,17 +121,45 @@ def _store(
 
 def _fetch_rate(d: date, from_ccy: str, to_ccy: str) -> Decimal:
     """Live rate fetch. Uses mock table when populated; else HTTP."""
+    import httpx
+
     key = (d.isoformat(), from_ccy, to_ccy)
     if key in _MOCK_RATES:
         return _MOCK_RATES[key]
-    # Live HTTP path — wired in Phase 2 when shared/http.py is established.
-    # Until then raise a clear error; Phase 1A tests always seed via
-    # set_mock_rate() or populate the SQLite cache directly.
-    raise DataQualityError(
-        "live FX fetch not yet wired (Phase 2); seed via fx.set_mock_rate or cache",
-        source="fx",
-        details={"date": d.isoformat(), "from": from_ccy, "to": to_ccy},
+
+    url = _FRANKFURTER_URL.format(
+        iso_date=d.isoformat(), from_ccy=from_ccy, to_ccy=to_ccy
     )
+    try:
+        response = httpx.get(url, timeout=10.0)
+        response.raise_for_status()
+    except httpx.HTTPStatusError as err:
+        raise DataQualityError(
+            f"FX API returned {err.response.status_code} for {from_ccy}->{to_ccy} on {d.isoformat()}",
+            source="fx",
+            details={"url": url, "status": err.response.status_code},
+            cause=err,
+        ) from err
+    except httpx.RequestError as err:
+        raise DataQualityError(
+            f"FX API request failed for {from_ccy}->{to_ccy} on {d.isoformat()}: {err}",
+            source="fx",
+            details={"url": url},
+            cause=err,
+        ) from err
+
+    try:
+        data = response.json()
+        rate_value = data["rates"][to_ccy]
+    except (KeyError, ValueError, TypeError) as err:
+        raise DataQualityError(
+            f"FX API response missing expected rate for {to_ccy}",
+            source="fx",
+            details={"url": url, "response": response.text[:500]},
+            cause=err,
+        ) from err
+
+    return to_rate(rate_value)
 
 
 def convert(
@@ -151,3 +175,35 @@ def convert(
     rate = get_rate(conn, booking_date, from_ccy, to_ccy)
     converted = amount * rate
     return to_money(converted, to_ccy)
+
+
+def get_rate_to_gbp(
+    conn: sqlite3.Connection,
+    currency: str,
+    invoice_date: str,
+) -> tuple[Decimal | None, str | None]:
+    """Get FX rate to GBP, returning (rate, None) on success or (None, error) on failure.
+
+    This is the safe entry point for invoice processing - errors don't raise,
+    they return an error message for the fx_error column.
+    """
+    if currency.upper() == "GBP":
+        return to_rate(1), None
+
+    try:
+        d = date.fromisoformat(invoice_date)
+    except (ValueError, TypeError):
+        return None, f"invalid invoice date: {invoice_date}"
+
+    try:
+        validate_currency(currency)
+    except ValueError:
+        return None, f"unsupported currency: {currency}"
+
+    try:
+        rate = get_rate(conn, d, currency, "GBP")
+        return rate, None
+    except DataQualityError as err:
+        return None, str(err)
+    except Exception as err:
+        return None, f"FX lookup failed: {err}"

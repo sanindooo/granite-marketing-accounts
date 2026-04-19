@@ -109,6 +109,147 @@ def db_status(
         emit_error(err)
 
 
+@db_app.command("backfill-fx")
+def db_backfill_fx(
+    db_path: Annotated[Path | None, typer.Option("--db")] = None,
+    dry_run: Annotated[
+        bool,
+        typer.Option("--dry-run", help="Show what would be updated without making changes."),
+    ] = False,
+    force: Annotated[
+        bool,
+        typer.Option("--force", help="Re-process invoices that previously had FX errors."),
+    ] = False,
+) -> None:
+    """Backfill amount_gross_gbp for existing invoices using their invoice dates."""
+    from execution.shared.fx import get_rate_to_gbp
+    from execution.shared.money import to_money
+
+    try:
+        conn = db_mod.connect(db_path)
+        db_mod.apply_migrations(conn)
+
+        # Find invoices that need FX conversion
+        where_clause = """
+            amount_gross IS NOT NULL
+            AND currency IS NOT NULL
+            AND invoice_date IS NOT NULL
+            AND deleted_at IS NULL
+        """
+        if force:
+            where_clause += " AND (amount_gross_gbp IS NULL OR fx_error IS NOT NULL)"
+        else:
+            where_clause += " AND amount_gross_gbp IS NULL"
+
+        # where_clause is built from constants, not user input
+        invoices = conn.execute(
+            f"""
+            SELECT invoice_id, currency, amount_gross, invoice_date, fx_error
+            FROM invoices
+            WHERE {where_clause}
+            ORDER BY invoice_date
+            """,  # noqa: S608
+        ).fetchall()
+
+        total = len(invoices)
+        if total == 0:
+            emit_success({"message": "No invoices need FX backfill", "processed": 0, "errors": 0})
+            return
+
+        if dry_run:
+            emit_success({
+                "message": f"Dry run: would process {total} invoices",
+                "invoices": [
+                    {
+                        "invoice_id": row["invoice_id"],
+                        "currency": row["currency"],
+                        "amount_gross": row["amount_gross"],
+                        "invoice_date": row["invoice_date"],
+                        "previous_error": row["fx_error"],
+                    }
+                    for row in invoices[:20]  # Limit preview
+                ],
+                "total": total,
+                "showing": min(20, total),
+            })
+            return
+
+        processed = 0
+        errors = 0
+        results: list[dict[str, str | None]] = []
+
+        for row in invoices:
+            invoice_id = row["invoice_id"]
+            currency = row["currency"]
+            amount_gross = row["amount_gross"]
+            invoice_date = row["invoice_date"]
+
+            rate, err = get_rate_to_gbp(conn, currency, invoice_date)
+
+            if rate is not None:
+                try:
+                    gross = Decimal(amount_gross)
+                    converted = to_money(gross * rate, "GBP")
+                    conn.execute(
+                        """
+                        UPDATE invoices
+                        SET amount_gross_gbp = ?, fx_rate_used = ?, fx_error = NULL
+                        WHERE invoice_id = ?
+                        """,
+                        (str(converted), str(rate), invoice_id),
+                    )
+                    processed += 1
+                    results.append({
+                        "invoice_id": invoice_id,
+                        "status": "converted",
+                        "amount_gross_gbp": str(converted),
+                        "rate": str(rate),
+                    })
+                except Exception as e:
+                    errors += 1
+                    conn.execute(
+                        "UPDATE invoices SET fx_error = ? WHERE invoice_id = ?",
+                        (f"conversion failed: {e}", invoice_id),
+                    )
+                    results.append({
+                        "invoice_id": invoice_id,
+                        "status": "error",
+                        "error": f"conversion failed: {e}",
+                    })
+            else:
+                errors += 1
+                conn.execute(
+                    "UPDATE invoices SET fx_error = ? WHERE invoice_id = ?",
+                    (err, invoice_id),
+                )
+                results.append({
+                    "invoice_id": invoice_id,
+                    "status": "error",
+                    "error": err,
+                })
+
+            # Progress output every 50 invoices
+            if (processed + errors) % 50 == 0:
+                sys.stderr.write(f"\rProcessed {processed + errors}/{total}...")
+                sys.stderr.flush()
+
+        if total > 0:
+            sys.stderr.write(f"\rProcessed {processed + errors}/{total}   \n")
+            sys.stderr.flush()
+
+        emit_success({
+            "message": f"Backfill complete: {processed} converted, {errors} errors",
+            "processed": processed,
+            "errors": errors,
+            "total": total,
+            "results": results[:50] if len(results) <= 50 else [*results[:25], {"...": f"{len(results) - 50} more"}, *results[-25:]],
+        })
+    except PipelineError as err:
+        emit_error(err)
+    except Exception as err:
+        emit_error(err)
+
+
 # ---------------------------------------------------------------------------
 # ops subcommands (minimal Phase 1A surface)
 # ---------------------------------------------------------------------------

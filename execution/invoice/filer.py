@@ -203,7 +203,30 @@ def file_invoice(
             else FilerOutcome.CREATED
         )
 
-        # 4. SQLite commit (transactional)
+        # 4. FX conversion - convert to GBP at filing time using invoice date
+        amount_gross_gbp: str | None = None
+        fx_rate_used: str | None = None
+        fx_error: str | None = None
+
+        if inp.extraction.currency and inp.extraction.amount_gross and inp.extraction.invoice_date:
+            from decimal import Decimal
+
+            from execution.shared.fx import get_rate_to_gbp
+            from execution.shared.money import to_money
+
+            rate, err = get_rate_to_gbp(conn, inp.extraction.currency, inp.extraction.invoice_date)
+            if rate is not None:
+                try:
+                    gross = Decimal(inp.extraction.amount_gross)
+                    converted = to_money(gross * rate, "GBP")
+                    amount_gross_gbp = str(converted)
+                    fx_rate_used = str(rate)
+                except Exception as e:
+                    fx_error = f"conversion failed: {e}"
+            else:
+                fx_error = err
+
+        # 5. SQLite commit (transactional)
         _insert_invoice_row(
             conn,
             invoice_id=invoice_id,
@@ -217,9 +240,12 @@ def file_invoice(
             drive_file_id=drive_file_id,
             drive_web_view_link=web_link,
             filed_path=f"{fy_label}/{inp.category}/{year_month}/{drive_name}",
+            amount_gross_gbp=amount_gross_gbp,
+            fx_rate_used=fx_rate_used,
+            fx_error=fx_error,
         )
     finally:
-        # 5. Always clean up the temp file — even on failure, there's no value
+        # 6. Always clean up the temp file — even on failure, there's no value
         #    in leaving it. Crash after upload is handled by the janitor.
         with contextlib.suppress(OSError):
             tmp_pdf_path.unlink(missing_ok=True)
@@ -478,6 +504,9 @@ def _insert_invoice_row(
     drive_file_id: str,
     drive_web_view_link: str | None,
     filed_path: str,
+    amount_gross_gbp: str | None,
+    fx_rate_used: str | None,
+    fx_error: str | None,
 ) -> None:
     import json
 
@@ -497,8 +526,9 @@ def _insert_invoice_row(
                 drive_file_id, drive_web_view_link,
                 confidence_json, classifier_version,
                 hash_schema_version, is_business,
-                deleted_at, deleted_reason
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                deleted_at, deleted_reason,
+                fx_rate_used, fx_error
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 invoice_id,
@@ -511,7 +541,7 @@ def _insert_invoice_row(
                 extraction.amount_net,
                 extraction.amount_vat,
                 extraction.amount_gross,
-                None,  # amount_gross_gbp — filled by reconciler with FX rate
+                amount_gross_gbp,
                 extraction.vat_rate,
                 extraction.supplier_vat_number,
                 1 if extraction.reverse_charge else 0,
@@ -525,6 +555,8 @@ def _insert_invoice_row(
                 None,  # is_business — filled retroactively on match
                 None,
                 notes,
+                fx_rate_used,
+                fx_error,
             ),
         )
         # Watermark the processed email so re-runs are idempotent.
