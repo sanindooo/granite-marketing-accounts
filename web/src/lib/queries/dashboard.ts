@@ -80,31 +80,69 @@ export function getDashboardMetrics(fy: string): DashboardMetrics {
 export interface LastRun {
   operation: string;
   completedAt: string | null;
+  startedAt: string | null;
   status: string;
+  statsJson: string | null;
 }
 
 export function getLastRuns(): LastRun[] {
   const operations = ["ingest_email", "ingest_invoice", "reconcile"];
 
-  return operations.map((op) => {
-    const row = db
-      .prepare(
-        `
-      SELECT operation, completed_at, status
-      FROM runs
-      WHERE operation = ?
-      ORDER BY started_at DESC
-      LIMIT 1
-    `
+  const rows = db
+    .prepare(
+      `
+      WITH ranked AS (
+        SELECT operation, completed_at, started_at, status, stats_json,
+               ROW_NUMBER() OVER (PARTITION BY operation ORDER BY started_at DESC) as rn
+        FROM runs
+        WHERE operation IN ('ingest_email', 'ingest_invoice', 'reconcile')
       )
-      .get(op) as { operation: string; completed_at: string | null; status: string } | undefined;
+      SELECT operation, completed_at, started_at, status, stats_json
+      FROM ranked
+      WHERE rn = 1
+    `
+    )
+    .all() as { operation: string; completed_at: string | null; started_at: string | null; status: string; stats_json: string | null }[];
 
+  const rowMap = new Map(rows.map((r) => [r.operation, r]));
+
+  return operations.map((op) => {
+    const row = rowMap.get(op);
     return {
       operation: op,
       completedAt: row?.completed_at || null,
+      startedAt: row?.started_at || null,
       status: row?.status || "never",
+      statsJson: row?.stats_json || null,
     };
   });
+}
+
+export interface RunningJob {
+  runId: string;
+  operation: string;
+  startedAt: string;
+  statsJson: string | null;
+}
+
+export function getRunningJobs(operation: string): RunningJob[] {
+  const rows = db
+    .prepare(
+      `
+      SELECT run_id, operation, started_at, stats_json
+      FROM runs
+      WHERE operation = ? AND status = 'running'
+      ORDER BY started_at DESC
+    `
+    )
+    .all(operation) as { run_id: string; operation: string; started_at: string; stats_json: string | null }[];
+
+  return rows.map((row) => ({
+    runId: row.run_id,
+    operation: row.operation,
+    startedAt: row.started_at,
+    statsJson: row.stats_json,
+  }));
 }
 
 export interface SyncCoverage {
@@ -137,38 +175,6 @@ export function getSyncCoverage(): SyncCoverage {
   };
 }
 
-export interface ActiveRun {
-  runId: string;
-  operation: string;
-  startedAt: string;
-}
-
-export function getActiveRun(operation: string): ActiveRun | null {
-  const row = db
-    .prepare(
-      `
-      SELECT run_id, operation, started_at
-      FROM runs
-      WHERE operation = ? AND status = 'running'
-      ORDER BY started_at DESC
-      LIMIT 1
-    `
-    )
-    .get(operation) as {
-    run_id: string;
-    operation: string;
-    started_at: string;
-  } | undefined;
-
-  if (!row) return null;
-
-  return {
-    runId: row.run_id,
-    operation: row.operation,
-    startedAt: row.started_at,
-  };
-}
-
 export interface PendingAction {
   msgId: string;
   fromAddr: string;
@@ -183,9 +189,10 @@ export function getPendingActions(): PendingAction[] {
       `
       SELECT msg_id, from_addr, subject, received_at, outcome
       FROM emails
-      WHERE outcome IN ('needs_manual_download', 'error')
+      WHERE outcome IN ('needs_manual_download', 'error', 'no_attachment')
+        AND dismissed_at IS NULL
       ORDER BY received_at DESC
-      LIMIT 20
+      LIMIT 50
     `
     )
     .all() as {
@@ -203,4 +210,26 @@ export function getPendingActions(): PendingAction[] {
     receivedAt: row.received_at,
     outcome: row.outcome,
   }));
+}
+
+export function dismissEmail(
+  msgId: string,
+  reason: "not_invoice" | "resolved" | "duplicate"
+): void {
+  const email = db
+    .prepare("SELECT from_addr, subject FROM emails WHERE msg_id = ?")
+    .get(msgId) as { from_addr: string; subject: string } | undefined;
+
+  if (!email) return;
+
+  const domain = email.from_addr.split("@")[1] || "";
+
+  db.prepare(
+    `UPDATE emails SET dismissed_at = datetime('now'), dismissed_reason = ? WHERE msg_id = ?`
+  ).run(reason, msgId);
+
+  db.prepare(
+    `INSERT INTO email_feedback (msg_id, feedback_type, feedback_value, from_addr, subject, sender_domain)
+     VALUES (?, 'dismiss', ?, ?, ?, ?)`
+  ).run(msgId, reason, email.from_addr, email.subject, domain);
 }

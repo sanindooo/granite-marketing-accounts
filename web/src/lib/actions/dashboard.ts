@@ -5,10 +5,12 @@ import {
   getLastRuns as getRuns,
   getSyncCoverage as getCoverage,
   getPendingActions as getPending,
+  getRunningJobs as getRunning,
   type DashboardMetrics,
   type LastRun,
   type SyncCoverage,
   type PendingAction,
+  type RunningJob,
 } from "@/lib/queries/dashboard";
 import type { Result } from "@/lib/types";
 
@@ -95,6 +97,23 @@ export async function cancelRun(
       ok: false,
       error: {
         code: "CANCEL_ERROR",
+        message: error instanceof Error ? error.message : "Unknown error",
+      },
+    };
+  }
+}
+
+export async function fetchRunningJobs(
+  operation: "ingest_email" | "ingest_invoice" | "reconcile"
+): Promise<Result<RunningJob[]>> {
+  try {
+    const jobs = getRunning(operation);
+    return { ok: true, data: jobs };
+  } catch (error) {
+    return {
+      ok: false,
+      error: {
+        code: "FETCH_ERROR",
         message: error instanceof Error ? error.message : "Unknown error",
       },
     };

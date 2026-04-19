@@ -16,11 +16,12 @@ import {
 } from "@/components/ui/table";
 import { getCurrentFY } from "@/lib/fiscal";
 import { formatCurrency, formatDateTime } from "@/lib/formatters";
-import type { DashboardMetrics, LastRun, SyncCoverage, PendingAction } from "@/lib/queries/dashboard";
-import { fetchDashboardMetrics, fetchLastRuns, fetchSyncCoverage, fetchPendingActions, cancelRun } from "@/lib/actions/dashboard";
+import type { DashboardMetrics, LastRun, SyncCoverage, PendingAction, RunningJob } from "@/lib/queries/dashboard";
+import { fetchDashboardMetrics, fetchLastRuns, fetchSyncCoverage, fetchPendingActions, cancelRun, fetchRunningJobs } from "@/lib/actions/dashboard";
 import type { PipelineCommand, PipelineOptions } from "@/lib/types";
 import { usePipelineStream } from "@/hooks/use-pipeline-stream";
 import { NeedsAttentionCard } from "./needs-attention-card";
+import { StaleRunModal } from "./stale-run-modal";
 
 const PIPELINE_COMMANDS: { key: PipelineCommand; label: string; description: string }[] = [
   { key: "syncEmails", label: "Sync emails", description: "Fetch new invoices from MS365" },
@@ -52,6 +53,19 @@ export function DashboardContent() {
     backfillFrom: "",
   });
 
+  // Modal state for stale run detection
+  const [staleRunModal, setStaleRunModal] = useState<{
+    open: boolean;
+    command: PipelineCommand | null;
+    runningJobs: RunningJob[];
+    operationLabel: string;
+  }>({
+    open: false,
+    command: null,
+    runningJobs: [],
+    operationLabel: "",
+  });
+
   const refreshAllData = useCallback(async () => {
     const [metricsResult, runsResult, coverageResult, actionsResult] = await Promise.all([
       fetchDashboardMetrics(fy),
@@ -81,7 +95,23 @@ export function DashboardContent() {
 
   const prevRunningRef = useRef(false);
 
-  const handleRunCommand = async (command: PipelineCommand) => {
+  const getOperationForCommand = (command: PipelineCommand): "ingest_email" | "ingest_invoice" | "reconcile" => {
+    return command === "syncEmails"
+      ? "ingest_email"
+      : command === "processInvoices"
+      ? "ingest_invoice"
+      : "reconcile";
+  };
+
+  const getLabelForCommand = (command: PipelineCommand): string => {
+    return command === "syncEmails"
+      ? "Sync emails"
+      : command === "processInvoices"
+      ? "Process invoices"
+      : "Reconciliation";
+  };
+
+  const startCommand = async (command: PipelineCommand) => {
     const options: PipelineOptions = { fiscalYear: fy };
     if (pipelineFilters.senderSearch) options.sender = pipelineFilters.senderSearch;
     if (pipelineFilters.dateFrom) options.dateFrom = pipelineFilters.dateFrom;
@@ -90,6 +120,45 @@ export function DashboardContent() {
     if (pipelineFilters.backfillFrom) options.backfillFrom = pipelineFilters.backfillFrom;
 
     await stream.run(command, options);
+  };
+
+  const handleRunCommand = async (command: PipelineCommand) => {
+    const operation = getOperationForCommand(command);
+
+    // Check for existing running jobs
+    const result = await fetchRunningJobs(operation);
+    if (result.ok && result.data.length > 0) {
+      // Show modal to ask user what to do
+      setStaleRunModal({
+        open: true,
+        command,
+        runningJobs: result.data,
+        operationLabel: getLabelForCommand(command),
+      });
+      return;
+    }
+
+    // No running jobs, start immediately
+    await startCommand(command);
+  };
+
+  const handleCancelAndStart = async () => {
+    if (!staleRunModal.command) return;
+
+    const operation = getOperationForCommand(staleRunModal.command);
+    const cancelResult = await cancelRun(operation);
+
+    if (cancelResult.ok) {
+      toast.success(`Cancelled ${cancelResult.data.cancelled} stale job(s)`);
+    }
+
+    setStaleRunModal({ open: false, command: null, runningJobs: [], operationLabel: "" });
+    await refreshAllData();
+    await startCommand(staleRunModal.command);
+  };
+
+  const handleKeepWaiting = () => {
+    setStaleRunModal({ open: false, command: null, runningJobs: [], operationLabel: "" });
   };
 
   // Handle stream completion - only react when isRunning transitions from true to false
@@ -559,6 +628,23 @@ export function DashboardContent() {
           </div>
         </CardContent>
       </Card>
+
+      <StaleRunModal
+        open={staleRunModal.open}
+        onOpenChange={(open) => {
+          if (!open) setStaleRunModal({ open: false, command: null, runningJobs: [], operationLabel: "" });
+        }}
+        staleRuns={staleRunModal.runningJobs.map((job) => ({
+          runId: job.runId,
+          operation: job.operation,
+          startedAt: job.startedAt,
+          runningFor: "",
+          statsJson: job.statsJson || undefined,
+        }))}
+        operationLabel={staleRunModal.operationLabel}
+        onCancelAndStart={handleCancelAndStart}
+        onKeepWaiting={handleKeepWaiting}
+      />
     </div>
   );
 }
