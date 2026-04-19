@@ -1,7 +1,7 @@
 ---
 title: "feat: UX improvements and automatic FX conversion"
 type: feat
-status: active
+status: completed
 date: 2026-04-19
 ---
 
