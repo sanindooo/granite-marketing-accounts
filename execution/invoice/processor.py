@@ -20,7 +20,9 @@ from __future__ import annotations
 
 import re
 import sqlite3
-from collections.abc import Iterator
+import threading
+from collections.abc import Callable, Iterator
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import date, datetime
 from decimal import Decimal
@@ -32,7 +34,9 @@ import pdfplumber
 from execution.invoice.category import resolve_category
 from execution.invoice.classifier import (
     EmailInput,
+    FeedbackExample,
     classify_email,
+    load_feedback_examples,
 )
 from execution.invoice.extractor import (
     ExtractorInput,
@@ -45,10 +49,11 @@ from execution.invoice.filer import (
     file_invoice,
 )
 from execution.invoice.pdf_fetcher import FetchOutcome, FetchStatus, fetch_invoice_pdf
-from execution.shared.claude_client import ClaudeClient
 from execution.shared.clock import now_utc
+from execution.shared.db import connect
 from execution.shared.errors import BudgetExceededError, PipelineError
 from execution.shared.http import SafeHttpClient
+from execution.shared.llm_client import LLMClient
 from execution.shared.prompts import LoadedPrompt
 
 if TYPE_CHECKING:  # pragma: no cover
@@ -63,7 +68,12 @@ if TYPE_CHECKING:  # pragma: no cover
 DEFAULT_BUDGET_GBP: Decimal = Decimal("2.00")
 BACKFILL_BUDGET_GBP: Decimal = Decimal("20.00")
 DEFAULT_BATCH_SIZE: int = 50
+DEFAULT_WORKERS: int = 1
+MAX_WORKERS: int = 20
 MAX_PDF_SIZE_BYTES: int = 20 * 1024 * 1024  # 20 MB
+
+# Thread-local storage for SQLite connections in parallel processing
+_thread_local = threading.local()
 
 _PDF_URL_PATTERNS: Final[tuple[re.Pattern[str], ...]] = tuple(
     re.compile(p, re.IGNORECASE)
@@ -72,6 +82,13 @@ _PDF_URL_PATTERNS: Final[tuple[re.Pattern[str], ...]] = tuple(
         r"https?://pay\.stripe\.com/[^\s<>\"']+",
         r"https?://invoice\.stripe\.com/[^\s<>\"']+",
         r"https?://[^\s<>\"']*paddle[^\s<>\"']+/invoice[^\s<>\"']*",
+        # Billing portal URLs (will return needs_manual_download via login-gated check)
+        r"https?://platform\.openai\.com/[^\s<>\"']*billing[^\s<>\"']*",
+        r"https?://[^\s<>\"']*\.zoom\.us/[^\s<>\"']*invoice[^\s<>\"']*",
+        r"https?://[^\s<>\"']*\.zoom\.us/[^\s<>\"']*billing[^\s<>\"']*",
+        r"https?://dashboard\.heroku\.com/[^\s<>\"']*invoice[^\s<>\"']*",
+        r"https?://vercel\.com/[^\s<>\"']*billing[^\s<>\"']*",
+        r"https?://railway\.app/[^\s<>\"']*billing[^\s<>\"']*",
     ]
 )
 
@@ -124,34 +141,112 @@ def process_pending_emails(
     conn: sqlite3.Connection,
     *,
     adapter: Ms365Adapter,
-    claude: ClaudeClient,
+    llm_client: LLMClient,
     google: GoogleClients,
     classifier_prompt: LoadedPrompt,
     extractor_prompt: LoadedPrompt,
     tmp_root: Path,
     batch_size: int = DEFAULT_BATCH_SIZE,
     limit: int | None = None,
+    on_progress: Callable[[int, int, str], None] | None = None,
+    workers: int = DEFAULT_WORKERS,
+    db_path: Path | str | None = None,
 ) -> ProcessStats:
     """Process all unprocessed emails and return stats.
 
     Commits each email individually so partial progress is preserved on crash.
+
+    Args:
+        on_progress: Optional callback(current, total, detail) called after each email.
+        workers: Number of concurrent workers (1-20). Default 1 for sequential processing.
+        db_path: Database path for creating thread-local connections when workers > 1.
     """
+    workers = max(1, min(workers, MAX_WORKERS))
+
+    if workers == 1:
+        return _process_sequential(
+            conn=conn,
+            adapter=adapter,
+            llm_client=llm_client,
+            google=google,
+            classifier_prompt=classifier_prompt,
+            extractor_prompt=extractor_prompt,
+            tmp_root=tmp_root,
+            batch_size=batch_size,
+            limit=limit,
+            on_progress=on_progress,
+        )
+
+    return _process_parallel(
+        main_conn=conn,
+        db_path=db_path,
+        adapter=adapter,
+        llm_client=llm_client,
+        google=google,
+        classifier_prompt=classifier_prompt,
+        extractor_prompt=extractor_prompt,
+        tmp_root=tmp_root,
+        batch_size=batch_size,
+        limit=limit,
+        on_progress=on_progress,
+        workers=workers,
+    )
+
+
+def _process_sequential(
+    *,
+    conn: sqlite3.Connection,
+    adapter: Ms365Adapter,
+    llm_client: LLMClient,
+    google: GoogleClients,
+    classifier_prompt: LoadedPrompt,
+    extractor_prompt: LoadedPrompt,
+    tmp_root: Path,
+    batch_size: int,
+    limit: int | None,
+    on_progress: Callable[[int, int, str], None] | None,
+) -> ProcessStats:
+    """Original sequential processing implementation."""
     stats = ProcessStats()
     http_client = SafeHttpClient()
+
+    # Load explicitly blocked domains
+    blocked_domains = _load_blocked_domains(conn)
+
+    # Load feedback examples for few-shot learning (once per run)
+    feedback_examples = load_feedback_examples(conn)
+
+    # Get total count for progress reporting
+    total = conn.execute(
+        "SELECT COUNT(*) FROM emails WHERE processed_at IS NULL"
+    ).fetchone()[0]
+    if limit and limit < total:
+        total = limit
 
     try:
         for email_row in _pending_emails(conn, batch_size=batch_size, limit=limit):
             try:
+                # Skip explicitly blocked domains
+                sender_domain = _extract_domain(email_row.from_addr)
+                if sender_domain and sender_domain in blocked_domains:
+                    _update_email_outcome(conn, email_row.msg_id, "neither")
+                    stats.processed += 1
+                    stats.classified_neither += 1
+                    if on_progress:
+                        on_progress(stats.processed, total, "Skipped: blocked domain")
+                    continue
+
                 outcome, invoice = _process_one(
                     conn=conn,
                     email_row=email_row,
                     adapter=adapter,
-                    claude=claude,
+                    llm_client=llm_client,
                     google=google,
                     classifier_prompt=classifier_prompt,
                     extractor_prompt=extractor_prompt,
                     http_client=http_client,
                     tmp_root=tmp_root,
+                    feedback_examples=feedback_examples,
                 )
                 _update_email_outcome(conn, email_row.msg_id, outcome)
                 stats.processed += 1
@@ -174,6 +269,10 @@ def process_pending_emails(
                 elif outcome == "needs_manual_download":
                     stats.needs_manual_download += 1
 
+                # Emit progress if callback provided
+                if on_progress:
+                    on_progress(stats.processed, total, f"Processed: {outcome}")
+
             except BudgetExceededError:
                 raise
             except PipelineError as err:
@@ -191,11 +290,156 @@ def process_pending_emails(
                 )
                 _update_email_outcome(conn, email_row.msg_id, "error", error_code="unexpected")
 
-        stats.cost_gbp = claude.budget.spent_gbp
+        stats.cost_gbp = llm_client.budget.spent_gbp
         return stats
 
     finally:
         http_client.close()
+
+
+def _get_thread_connection(db_path: Path | str | None) -> sqlite3.Connection:
+    """Get or create a SQLite connection for the current thread."""
+    if not hasattr(_thread_local, "conn"):
+        _thread_local.conn = connect(db_path)
+    conn: sqlite3.Connection = _thread_local.conn
+    return conn
+
+
+def _process_parallel(
+    *,
+    main_conn: sqlite3.Connection,
+    db_path: Path | str | None,
+    adapter: Ms365Adapter,
+    llm_client: LLMClient,
+    google: GoogleClients,
+    classifier_prompt: LoadedPrompt,
+    extractor_prompt: LoadedPrompt,
+    tmp_root: Path,
+    batch_size: int,
+    limit: int | None,
+    on_progress: Callable[[int, int, str], None] | None,
+    workers: int,
+) -> ProcessStats:
+    """Process pending emails using concurrent workers."""
+    # Query pending emails using main connection (single connection for reads)
+    emails = list(_pending_emails(main_conn, batch_size=batch_size, limit=limit))
+    total = len(emails)
+
+    # Load explicitly blocked domains (shared across workers)
+    blocked_domains = _load_blocked_domains(main_conn)
+
+    # Load feedback examples for few-shot learning (once per run, shared across workers)
+    feedback_examples = load_feedback_examples(main_conn)
+
+    # Thread-safe stats
+    stats_lock = threading.Lock()
+    stats = ProcessStats()
+    completed_count = [0]  # Mutable container for nonlocal access
+    budget_exceeded = [False]  # Flag to stop new submissions
+
+    def process_worker(email_row: EmailRow) -> tuple[Outcome, FiledInvoice | None, str]:
+        """Worker function — runs in thread pool.
+
+        Returns (outcome, invoice, msg_id) for stats aggregation.
+        """
+        # Skip explicitly blocked domains
+        sender_domain = _extract_domain(email_row.from_addr)
+        if sender_domain and sender_domain in blocked_domains:
+            conn = _get_thread_connection(db_path)
+            _update_email_outcome(conn, email_row.msg_id, "neither")
+            return "neither", None, email_row.msg_id
+
+        # Get thread-local connection
+        conn = _get_thread_connection(db_path)
+
+        # Each worker gets its own HTTP client
+        http_client = SafeHttpClient()
+        try:
+            outcome, invoice = _process_one(
+                conn=conn,
+                email_row=email_row,
+                adapter=adapter,
+                llm_client=llm_client,
+                google=google,
+                classifier_prompt=classifier_prompt,
+                extractor_prompt=extractor_prompt,
+                http_client=http_client,
+                tmp_root=tmp_root,
+                feedback_examples=feedback_examples,
+            )
+            _update_email_outcome(conn, email_row.msg_id, outcome)
+            return outcome, invoice, email_row.msg_id
+        finally:
+            http_client.close()
+
+    # Process with thread pool
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        future_to_email = {
+            executor.submit(process_worker, email): email for email in emails
+        }
+
+        for future in as_completed(future_to_email):
+            email = future_to_email[future]
+
+            # Check if budget was exceeded — stop processing new results
+            if budget_exceeded[0]:
+                continue
+
+            try:
+                outcome, invoice, _msg_id = future.result()
+
+                with stats_lock:
+                    stats.processed += 1
+                    completed_count[0] += 1
+
+                    if outcome == "invoice":
+                        stats.classified_invoice += 1
+                        if invoice:
+                            if invoice.outcome == FilerOutcome.DUPLICATE_RESEND:
+                                stats.duplicates += 1
+                            else:
+                                stats.filed += 1
+                    elif outcome == "receipt":
+                        stats.classified_receipt += 1
+                        if invoice:
+                            stats.filed += 1
+                    elif outcome == "statement":
+                        stats.classified_statement += 1
+                    elif outcome == "neither":
+                        stats.classified_neither += 1
+                    elif outcome == "needs_manual_download":
+                        stats.needs_manual_download += 1
+
+                    if on_progress:
+                        on_progress(completed_count[0], total, f"Processed: {outcome}")
+
+            except BudgetExceededError:
+                # Signal to stop processing
+                budget_exceeded[0] = True
+                # Cancel pending futures
+                for f in future_to_email:
+                    f.cancel()
+            except PipelineError as err:
+                with stats_lock:
+                    stats.errors += 1
+                    stats.error_details.append(
+                        {"msg_id": email.msg_id, "error": str(err)}
+                    )
+                conn = _get_thread_connection(db_path)
+                _update_email_outcome(
+                    conn, email.msg_id, "error", error_code=err.error_code
+                )
+            except Exception as err:
+                with stats_lock:
+                    stats.errors += 1
+                    stats.error_details.append(
+                        {"msg_id": email.msg_id, "error": str(err)}
+                    )
+                conn = _get_thread_connection(db_path)
+                _update_email_outcome(conn, email.msg_id, "error", error_code="unexpected")
+
+    stats.cost_gbp = llm_client.budget.spent_gbp
+    return stats
 
 
 def _process_one(
@@ -203,12 +447,13 @@ def _process_one(
     conn: sqlite3.Connection,
     email_row: EmailRow,
     adapter: Ms365Adapter,
-    claude: ClaudeClient,
+    llm_client: LLMClient,
     google: GoogleClients,
     classifier_prompt: LoadedPrompt,
     extractor_prompt: LoadedPrompt,
     http_client: SafeHttpClient,
     tmp_root: Path,
+    feedback_examples: list[FeedbackExample] | None = None,
 ) -> tuple[Outcome, FiledInvoice | None]:
     """Process a single email through the full pipeline."""
     # Fetch full body
@@ -220,7 +465,12 @@ def _process_one(
         sender=email_row.from_addr,
         body=body_text,
     )
-    result, _call = classify_email(claude, classifier_prompt, email_input)
+    result, _call = classify_email(
+        llm_client,
+        classifier_prompt,
+        email_input,
+        feedback_examples=feedback_examples,
+    )
 
     if result.classification not in ("invoice", "receipt"):
         return result.classification, None
@@ -260,7 +510,7 @@ def _process_one(
         source_text=source_text,
         email_received_date=received_date,
     )
-    extraction_outcome = extract_invoice(claude, extractor_prompt, extractor_input)
+    extraction_outcome = extract_invoice(llm_client, extractor_prompt, extractor_input)
     extraction = extraction_outcome.result
 
     # Assign category
@@ -383,6 +633,22 @@ def _extract_domain(email_addr: str) -> str | None:
     return email_addr.split("@")[-1].lower().strip()
 
 
+def _load_blocked_domains(conn: sqlite3.Connection) -> set[str]:
+    """Load explicitly blocked sender domains.
+
+    Returns domains the user has explicitly chosen to block.
+    These are always skipped without LLM classification.
+    """
+    try:
+        rows = conn.execute(
+            "SELECT domain FROM blocked_domains"
+        ).fetchall()
+        return {row[0] for row in rows if row[0]}
+    except Exception:
+        # Table might not exist yet - return empty set
+        return set()
+
+
 def _parse_received_date(received_at: str) -> date:
     """Parse ISO 8601 datetime string to date.
 
@@ -396,6 +662,8 @@ __all__ = [
     "BACKFILL_BUDGET_GBP",
     "DEFAULT_BATCH_SIZE",
     "DEFAULT_BUDGET_GBP",
+    "DEFAULT_WORKERS",
+    "MAX_WORKERS",
     "Outcome",
     "ProcessStats",
     "process_pending_emails",

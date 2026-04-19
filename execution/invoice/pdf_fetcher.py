@@ -52,6 +52,18 @@ LOGIN_GATED_HOSTS: Final[dict[str, str]] = {
     "console.aws.amazon.com": "AWS console login required",
     "github.com": "GitHub billing PDFs require account login",
     "portal.azure.com": "Azure portal login required",
+    "platform.openai.com": "OpenAI requires account login for billing history",
+    "openai.com": "OpenAI requires account login for billing history",
+    "billing.google.com": "Google Cloud billing requires login",
+    "console.cloud.google.com": "Google Cloud billing requires login",
+    "dashboard.heroku.com": "Heroku billing requires login",
+    "vercel.com": "Vercel billing requires login",
+    "railway.app": "Railway billing requires login",
+    "easyjet.com": "easyJet requires account login for booking confirmation",
+    "www.easyjet.com": "easyJet requires account login for booking confirmation",
+    "thetrainline.com": "Trainline requires account login for ticket PDF",
+    "www.thetrainline.com": "Trainline requires account login for ticket PDF",
+    "booking.thetrainline.com": "Trainline requires account login for ticket PDF",
 }
 
 # Providers whose URLs expire quickly — fetch on email receipt, not deferred.

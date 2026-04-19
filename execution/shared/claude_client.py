@@ -26,6 +26,8 @@ from typing import TYPE_CHECKING, Any, Final, Literal
 import anthropic
 
 from execution.shared import secrets
+from execution.shared.budget import LLMCall as GenericLLMCall
+from execution.shared.budget import SharedBudget, Stage as GenericStage
 from execution.shared.errors import BudgetExceededError, ConfigError
 
 if TYPE_CHECKING:  # pragma: no cover — anthropic ships types lazily
@@ -156,7 +158,9 @@ class ClaudeBudget:
 class ClaudeClient:
     """Thin wrapper over :class:`anthropic.Anthropic`.
 
-    Phase 1B exposes only ``smoke()``. Phase 2 adds ``classify`` / ``extract``.
+    Implements the LLMClient protocol for use in the invoice pipeline.
+    Supports both standalone usage (with internal ClaudeBudget) and
+    parallel processing (with shared SharedBudget).
     """
 
     def __init__(
@@ -164,11 +168,15 @@ class ClaudeClient:
         *,
         ttl: CacheTTL = "5m",
         budget_gbp: Decimal = Decimal("2.00"),
+        shared_budget: SharedBudget | None = None,
         api_key: str | None = None,
         client: anthropic.Anthropic | None = None,
     ) -> None:
         self.ttl: CacheTTL = ttl
-        self.budget = ClaudeBudget(ceiling_gbp=budget_gbp)
+        self._shared_budget = shared_budget
+        self._claude_budget: ClaudeBudget | None = None
+        if shared_budget is None:
+            self._claude_budget = ClaudeBudget(ceiling_gbp=budget_gbp)
         if client is not None:
             self._client = client
             return
@@ -180,6 +188,14 @@ class ClaudeClient:
             )
         key = api_key or secrets.require("claude", "api_key")
         self._client = anthropic.Anthropic(api_key=key)
+
+    @property
+    def budget(self) -> ClaudeBudget | SharedBudget:
+        """Access the budget tracker (ClaudeBudget or SharedBudget)."""
+        if self._shared_budget is not None:
+            return self._shared_budget
+        assert self._claude_budget is not None
+        return self._claude_budget
 
     def smoke(self) -> ClaudeCall:
         """Send the cheapest possible Haiku call and record it on the budget.
@@ -198,7 +214,7 @@ class ClaudeClient:
         call = ClaudeCall(
             model=HAIKU, stage="smoke", usage=usage, cost_gbp=cost, ttl=self.ttl
         )
-        self.budget.record(call)
+        self._record_call(call)
         return call
 
     def call_with_cached_prompt(
@@ -232,7 +248,7 @@ class ClaudeClient:
         if extra_system_suffix:
             system.append({"type": "text", "text": extra_system_suffix})
 
-        self.budget.reserve(self._reserve_estimate(max_tokens, model))
+        self._reserve(self._reserve_estimate(max_tokens, model))
         msg = self._client.messages.create(
             model=model,
             max_tokens=max_tokens,
@@ -245,8 +261,62 @@ class ClaudeClient:
         call = ClaudeCall(
             model=model, stage=stage, usage=usage, cost_gbp=cost, ttl=self.ttl
         )
-        self.budget.record(call)
+        self._record_call(call)
         return _extract_text(msg), call
+
+    def complete(
+        self,
+        *,
+        loaded_prompt: LoadedPrompt,
+        user_content: str,
+        max_tokens: int,
+        stage: GenericStage,
+    ) -> tuple[str, GenericLLMCall]:
+        """LLMClient protocol: Send completion and return text + generic call record.
+
+        This is a thin wrapper around call_with_cached_prompt that returns
+        a provider-agnostic LLMCall instead of a Claude-specific ClaudeCall.
+        """
+        text, claude_call = self.call_with_cached_prompt(
+            loaded_prompt=loaded_prompt,
+            user_content=user_content,
+            max_tokens=max_tokens,
+            stage=stage,
+            model=HAIKU,
+        )
+        generic_call = GenericLLMCall(
+            provider="claude",
+            model=claude_call.model,
+            stage=stage,
+            input_tokens=claude_call.usage.input_tokens,
+            output_tokens=claude_call.usage.output_tokens,
+            cost_gbp=claude_call.cost_gbp,
+        )
+        return text, generic_call
+
+    def _reserve(self, estimated_gbp: Decimal) -> None:
+        """Reserve budget using either ClaudeBudget or SharedBudget."""
+        if self._shared_budget is not None:
+            self._shared_budget.reserve(estimated_gbp)
+        else:
+            assert self._claude_budget is not None
+            self._claude_budget.reserve(estimated_gbp)
+
+    def _record_call(self, call: ClaudeCall) -> None:
+        """Record call using either ClaudeBudget or SharedBudget."""
+        if self._shared_budget is not None:
+            generic_call = GenericLLMCall(
+                provider="claude",
+                model=call.model,
+                stage=call.stage,
+                input_tokens=call.usage.input_tokens,
+                output_tokens=call.usage.output_tokens,
+                cost_gbp=call.cost_gbp,
+            )
+            self._shared_budget.record(generic_call)
+        else:
+            assert self._claude_budget is not None
+            self._claude_budget.record(call)
 
     @staticmethod
     def _reserve_estimate(max_tokens: int, model: Model) -> Decimal:

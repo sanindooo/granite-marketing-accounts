@@ -82,7 +82,7 @@ class TestMigrations:
     def test_current_version_records_latest(self) -> None:
         conn = _fresh_conn()
         db_mod.apply_migrations(conn)
-        assert db_mod.current_version(conn) == "001_init"
+        assert db_mod.current_version(conn) == "008_add_blocked_domains"
 
     def test_tampered_migration_rejected(self, tmp_path: Path) -> None:
         # Build a migrations dir with a single file, apply it, then mutate

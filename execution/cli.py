@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import sqlite3
 import sys
-from datetime import date
+from datetime import date, timedelta
 from decimal import Decimal
 from pathlib import Path
 from typing import TYPE_CHECKING, Annotated
@@ -29,7 +29,13 @@ if TYPE_CHECKING:  # pragma: no cover
 import typer
 
 from execution.shared import db as db_mod
-from execution.shared.errors import ConfigError, PipelineError, emit_error, emit_success
+from execution.shared.errors import (
+    ConfigError,
+    PipelineError,
+    emit_error,
+    emit_progress,
+    emit_success,
+)
 from execution.shared.fiscal import london_today_fy
 from execution.shared.secrets import ensure_backend, is_mock
 
@@ -454,53 +460,397 @@ def ingest_email_ms365(
             help="Ignore the saved watermark and start a fresh delta sync.",
         ),
     ] = False,
+    reset: Annotated[
+        bool,
+        typer.Option(
+            "--reset",
+            help="Clear all synced emails and watermark, then do a full inbox search (90 days back).",
+        ),
+    ] = False,
+    sender: Annotated[
+        str | None,
+        typer.Option(
+            "--sender",
+            help="Search for emails from a specific sender (e.g., 'uber', 'anthropic').",
+        ),
+    ] = None,
+    date_from: Annotated[
+        str | None,
+        typer.Option(
+            "--from",
+            help="Only fetch emails received on or after this date (YYYY-MM-DD).",
+        ),
+    ] = None,
+    date_to: Annotated[
+        str | None,
+        typer.Option(
+            "--to",
+            help="Only fetch emails received on or before this date (YYYY-MM-DD).",
+        ),
+    ] = None,
+    backfill_from: Annotated[
+        str | None,
+        typer.Option(
+            "--backfill-from",
+            help="Backfill historical emails from this date (YYYY-MM-DD), then set up delta sync for future runs.",
+        ),
+    ] = None,
+    rescan: Annotated[
+        bool,
+        typer.Option(
+            "--rescan",
+            help="Re-scan emails even if already in database. Updates existing records and clears processed status for re-processing.",
+        ),
+    ] = False,
 ) -> None:
     """Fetch new MS Graph inbox messages into the ``emails`` table.
 
     Classification + extraction + filing run in a later stage; this command
     only handles the ingest → email-row side so each concern stays
     separately runnable and observable.
+
+    Use --sender to search for emails from a specific company (e.g., --sender uber).
+    Use --from and --to to limit the date range.
+    Use --backfill-from to capture historical emails and set up incremental sync.
+    Use --rescan to re-fetch emails that are already in the database.
     """
     try:
+        from datetime import datetime, timedelta
+
         from execution.adapters.ms365 import SOURCE_ID, Ms365Adapter, Ms365Auth
 
         conn = db_mod.connect(db_path)
         db_mod.apply_migrations(conn)
 
-        watermark = None if initial else _load_watermark(conn, SOURCE_ID)
+        # Reset mode: clear everything and start fresh
+        if reset:
+            emit_progress("reset", 0, 0, "Clearing synced emails and watermark")
+            with conn:
+                # Delete in correct order due to foreign key constraints
+                conn.execute("DELETE FROM invoices")  # References emails, must go first
+                conn.execute("DELETE FROM emails WHERE source_adapter = 'ms365'")
+                conn.execute("DELETE FROM watermarks WHERE source = ?", (SOURCE_ID,))
+            # Set date_from to 90 days back for full resync
+            reset_from = (datetime.now() - timedelta(days=90)).strftime("%Y-%m-%d")
+            emit_progress("reset", 0, 0, f"Will search emails from {reset_from}")
+            date_from = reset_from
+
+        run_id = _begin_run(conn, kind="email", operation="ingest_email")
+
         auth = Ms365Auth.from_keychain()
         adapter = Ms365Adapter(auth=auth)
         try:
             batches = 0
             emails = 0
-            for batch in adapter.fetch_since(watermark):
-                batches += 1
-                emails += len(batch)
-                with conn:
-                    for email in batch:
-                        _upsert_email(conn, email.as_email_row())
-            _save_watermark(
-                conn, SOURCE_ID, watermark=adapter.next_watermark, emit_count=emails
-            )
+            skipped = 0
+            backfill_emails = 0
+
+            # Backfill mode: search historical + set up delta sync
+            if backfill_from:
+                # Phase 1: Backfill historical emails via search
+                rescan_msg = " (rescan mode)" if rescan else ""
+                emit_progress("backfill_search", 0, 0, f"Searching emails from {backfill_from}{rescan_msg}")
+                scanned = 0
+                updated = 0
+                for batch in adapter.search_inbox(date_from=backfill_from):
+                    batches += 1
+                    with conn:
+                        for email in batch:
+                            scanned += 1
+                            existing = conn.execute(
+                                "SELECT 1 FROM emails WHERE msg_id = ?",
+                                (email.msg_id,),
+                            ).fetchone()
+                            if existing:
+                                if rescan:
+                                    # Clear processed status so it gets re-processed
+                                    conn.execute(
+                                        """UPDATE emails SET
+                                            processed_at = NULL, outcome = NULL,
+                                            classifier_version = NULL, error_code = NULL
+                                        WHERE msg_id = ?""",
+                                        (email.msg_id,),
+                                    )
+                                    updated += 1
+                                else:
+                                    skipped += 1
+                                continue
+                            _upsert_email(conn, email.as_email_row())
+                            backfill_emails += 1
+                    if rescan:
+                        emit_progress("backfill_search", backfill_emails + updated, scanned, f"Scanned {scanned}: {backfill_emails} new, {updated} refreshed")
+                    else:
+                        emit_progress("backfill_search", backfill_emails, scanned, f"Scanned {scanned} emails: {backfill_emails} new, {skipped} already synced")
+                    _update_run_stats(conn, run_id=run_id, stats={"emails": backfill_emails, "skipped": skipped, "updated": updated, "scanned": scanned, "phase": "backfill"})
+                emails += backfill_emails + updated
+
+                # Phase 2: Run delta sync to establish watermark for future runs
+                # We just need the watermark - skip DB checks since we already captured emails
+                emit_progress("backfill_delta", 0, 0, "Setting up incremental sync (this may take a while for large inboxes)")
+                delta_pages = 0
+                for batch in adapter.fetch_since(None):
+                    delta_pages += 1
+                    # Skip processing - we already have these emails from the search
+                    # Just iterate to get the watermark at the end
+                    emit_progress("backfill_delta", delta_pages, 0, f"Setting up sync... (page {delta_pages})")
+                _save_watermark(
+                    conn, SOURCE_ID, watermark=adapter.next_watermark, emit_count=emails
+                )
+
+            # Search mode: use filters but don't set up delta sync
+            elif sender or date_from or date_to:
+                filter_desc = sender or date_from or "filtered"
+                rescan_msg = " (rescan mode)" if rescan else ""
+                emit_progress("search", 0, 0, f"Searching emails: {filter_desc}{rescan_msg}")
+                scanned = 0
+                updated = 0
+                for batch in adapter.search_inbox(
+                    sender=sender, date_from=date_from, date_to=date_to
+                ):
+                    batches += 1
+                    with conn:
+                        for email in batch:
+                            scanned += 1
+                            existing = conn.execute(
+                                "SELECT 1 FROM emails WHERE msg_id = ?",
+                                (email.msg_id,),
+                            ).fetchone()
+                            if existing:
+                                if rescan:
+                                    # Clear processed status so it gets re-processed
+                                    conn.execute(
+                                        """UPDATE emails SET
+                                            processed_at = NULL, outcome = NULL,
+                                            classifier_version = NULL, error_code = NULL
+                                        WHERE msg_id = ?""",
+                                        (email.msg_id,),
+                                    )
+                                    updated += 1
+                                else:
+                                    skipped += 1
+                                continue
+                            _upsert_email(conn, email.as_email_row())
+                            emails += 1
+                    _update_run_stats(conn, run_id=run_id, stats={"emails": emails, "skipped": skipped, "updated": updated, "scanned": scanned, "phase": "search"})
+                    if rescan:
+                        emit_progress("search", emails + updated, scanned, f"Scanned {scanned}: {emails} new, {updated} reset for re-processing")
+                    else:
+                        emit_progress("search", emails, scanned, f"Scanned {scanned} emails: {emails} new, {skipped} already synced")
+
+            # Standard delta sync
+            else:
+                watermark = None if initial else _load_watermark(conn, SOURCE_ID)
+
+                # First-run: do a full inbox scan, not delta sync
+                # Delta sync only returns emails that arrive AFTER initialization,
+                # so existing emails would be missed
+                if watermark is None:
+                    emit_progress("sync", 0, 0, "First run - scanning recent emails")
+                    scanned = 0
+                    for batch in adapter.search_inbox(max_pages=50):
+                        batches += 1
+                        with conn:
+                            for email in batch:
+                                scanned += 1
+                                existing = conn.execute(
+                                    "SELECT 1 FROM emails WHERE msg_id = ?",
+                                    (email.msg_id,),
+                                ).fetchone()
+                                if existing:
+                                    skipped += 1
+                                    continue
+                                _upsert_email(conn, email.as_email_row())
+                                emails += 1
+                        emit_progress("sync", emails, scanned, f"Scanned {scanned} emails: {emails} new, {skipped} already synced")
+                        _update_run_stats(conn, run_id=run_id, stats={"emails": emails, "skipped": skipped, "scanned": scanned, "phase": "scan"})
+                    # Now set up delta sync for future runs - just get the watermark
+                    emit_progress("sync", emails, scanned, "Setting up incremental sync...")
+                    delta_pages = 0
+                    for batch in adapter.fetch_since(None):
+                        delta_pages += 1
+                        emit_progress("sync", emails, scanned, f"Setting up sync... (page {delta_pages})")
+                    _save_watermark(
+                        conn, SOURCE_ID, watermark=adapter.next_watermark, emit_count=emails
+                    )
+                else:
+                    # Incremental sync with existing watermark
+                    emit_progress("sync", 0, 0, "Fetching new emails")
+                    for batch in adapter.fetch_since(watermark):
+                        batches += 1
+                        emails += len(batch)
+                        with conn:
+                            for email in batch:
+                                _upsert_email(conn, email.as_email_row())
+                        emit_progress("sync", emails, 0, f"Synced {emails} emails")
+                        _update_run_stats(conn, run_id=run_id, stats={"emails": emails, "phase": "incremental"})
+                    _save_watermark(
+                        conn, SOURCE_ID, watermark=adapter.next_watermark, emit_count=emails
+                    )
+
             _clear_reauth(conn, SOURCE_ID)
+            _complete_run(
+                conn,
+                run_id=run_id,
+                status="ok",
+                stats={"emails": emails, "batches": batches, "skipped": skipped},
+            )
+        except Exception:
+            _complete_run(conn, run_id=run_id, status="failed", stats={})
+            raise
         finally:
             adapter.close()
 
-        emit_success(
-            {
-                "source": SOURCE_ID,
-                "batches": batches,
-                "emails": emails,
-                "next_watermark_saved": adapter.next_watermark is not None,
-                "initial": initial,
-            }
-        )
+        result = {
+            "run_id": run_id,
+            "source": SOURCE_ID,
+            "batches": batches,
+            "emails": emails,
+        }
+        if backfill_from:
+            result["backfill_mode"] = True
+            result["backfill_from"] = backfill_from
+            result["backfill_emails"] = backfill_emails
+            result["skipped_duplicates"] = skipped
+            result["watermark_saved"] = adapter.next_watermark is not None
+        elif sender or date_from or date_to:
+            result["search_mode"] = True
+            result["skipped_duplicates"] = skipped
+            if sender:
+                result["sender_filter"] = sender
+            if date_from:
+                result["date_from"] = date_from
+            if date_to:
+                result["date_to"] = date_to
+        else:
+            result["next_watermark_saved"] = adapter.next_watermark is not None
+            result["initial"] = initial
+
+        emit_success(result)
     except PipelineError as err:
         if err.error_code == "needs_reauth":
             conn = db_mod.connect(db_path)
             db_mod.apply_migrations(conn)
             _record_reauth(conn, err.source, message=str(err))
         emit_error(err)
+    except Exception as err:
+        emit_error(err)
+
+
+@ingest_email_app.command("body")
+def ingest_email_body(
+    msg_id: Annotated[str, typer.Argument(help="The message ID to fetch body for.")],
+) -> None:
+    """Fetch and return the email body for a given message ID."""
+    try:
+        from execution.adapters.ms365 import Ms365Adapter, Ms365Auth
+
+        auth = Ms365Auth.from_keychain()
+        adapter = Ms365Adapter(auth=auth)
+        try:
+            body_html, body_text = adapter.fetch_message_body_both(msg_id)
+            emit_success({
+                "msg_id": msg_id,
+                "body_html": body_html,
+                "body_text": body_text,
+            })
+        finally:
+            adapter.close()
+    except PipelineError as err:
+        emit_error(err)
+    except Exception as err:
+        emit_error(err)
+
+
+@ingest_email_app.command("pending")
+def ingest_email_pending(
+    db_path: Annotated[Path | None, typer.Option("--db")] = None,
+    limit: Annotated[int, typer.Option("--limit", help="Max items to return.")] = 50,
+) -> None:
+    """List emails that need attention (manual download, errors, no attachment)."""
+    try:
+        from execution.shared import db as db_mod
+
+        conn = db_mod.connect(db_path)
+        db_mod.apply_migrations(conn)
+        rows = conn.execute(
+            """
+            SELECT msg_id, from_addr, subject, received_at, outcome
+            FROM emails
+            WHERE outcome IN ('needs_manual_download', 'error', 'no_attachment')
+              AND dismissed_at IS NULL
+            ORDER BY received_at DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+        emit_success({
+            "count": len(rows),
+            "items": [
+                {
+                    "msg_id": r[0],
+                    "from_addr": r[1],
+                    "subject": r[2],
+                    "received_at": r[3],
+                    "outcome": r[4],
+                }
+                for r in rows
+            ],
+        })
+    except Exception as err:
+        emit_error(err)
+
+
+@ingest_email_app.command("dismiss")
+def ingest_email_dismiss(
+    msg_id: Annotated[str, typer.Argument(help="The message ID to dismiss.")],
+    reason: Annotated[
+        str,
+        typer.Option("--reason", help="Reason: not_invoice, resolved, or duplicate."),
+    ] = "resolved",
+    db_path: Annotated[Path | None, typer.Option("--db")] = None,
+) -> None:
+    """Dismiss an email from the needs-attention queue."""
+    try:
+        from execution.shared import db as db_mod
+        from execution.shared.clock import now_utc
+
+        valid_reasons = ("not_invoice", "resolved", "duplicate")
+        if reason not in valid_reasons:
+            emit_error(ValueError(f"Invalid reason. Must be one of: {valid_reasons}"))
+            return
+
+        conn = db_mod.connect(db_path)
+        db_mod.apply_migrations(conn)
+
+        row = conn.execute(
+            "SELECT from_addr, subject FROM emails WHERE msg_id = ?", (msg_id,)
+        ).fetchone()
+        if not row:
+            emit_error(ValueError(f"Email not found: {msg_id}"))
+            return
+
+        from_addr, subject = row
+        domain = from_addr.split("@")[1] if "@" in from_addr else ""
+        now = now_utc()
+
+        conn.execute(
+            "UPDATE emails SET dismissed_at = ?, dismissed_reason = ? WHERE msg_id = ?",
+            (now, reason, msg_id),
+        )
+        conn.execute(
+            """
+            INSERT INTO email_feedback (msg_id, feedback_type, feedback_value, from_addr, subject, sender_domain, created_at)
+            VALUES (?, 'dismiss', ?, ?, ?, ?, ?)
+            """,
+            (msg_id, reason, from_addr, subject, domain, now),
+        )
+        conn.commit()
+
+        emit_success({
+            "msg_id": msg_id,
+            "reason": reason,
+            "domain": domain,
+        })
     except Exception as err:
         emit_error(err)
 
@@ -538,15 +888,25 @@ def ingest_invoice_process(
         Path | None,
         typer.Option("--tmp", help="Override temp directory (default: .tmp)."),
     ] = None,
+    workers: Annotated[
+        int,
+        typer.Option("--workers", help="Number of concurrent workers (1-20)."),
+    ] = 5,
+    model: Annotated[
+        str,
+        typer.Option("--model", help="LLM provider: claude or openai."),
+    ] = "openai",
 ) -> None:
     """Classify, extract, and file pending emails as invoices.
 
     Processes all emails with ``processed_at IS NULL``. Each email is:
-    1. Classified via Haiku 4.5 (invoice | receipt | statement | neither).
-    2. If invoice/receipt: PDF extracted, data extracted via Claude.
+    1. Classified via GPT-4o-mini or Claude Haiku (invoice | receipt | statement | neither).
+    2. If invoice/receipt: PDF extracted, data extracted via LLM.
     3. Filed to Google Drive and written to the ``invoices`` table.
 
     Use ``--backfill`` for initial bulk processing (higher budget, longer cache).
+    Use ``--workers N`` to process N emails in parallel (default: 5).
+    Use ``--model claude`` for Claude Haiku (more accurate, higher cost).
     """
     try:
         from execution.adapters.ms365 import Ms365Adapter, Ms365Auth
@@ -554,8 +914,8 @@ def ingest_invoice_process(
             BACKFILL_BUDGET_GBP,
             process_pending_emails,
         )
-        from execution.shared.claude_client import ClaudeClient
-        from execution.shared.claude_client import HAIKU
+        from execution.shared.budget import SharedBudget
+        from execution.shared.claude_client import HAIKU, ClaudeClient
         from execution.shared.prompts import (
             CLASSIFIER_WEIGHTS,
             EXTRACTOR_WEIGHTS,
@@ -563,17 +923,31 @@ def ingest_invoice_process(
         )
         from execution.shared.sheet import GoogleClients
 
+        # Validate model parameter
+        if model not in ("claude", "openai"):
+            emit_error(f"Invalid model: {model}. Must be 'claude' or 'openai'.")
+            raise typer.Exit(1)
+
         conn = db_mod.connect(db_path)
         db_mod.apply_migrations(conn)
+        run_id = _begin_run(conn, kind="invoice", operation="ingest_invoice")
 
-        # Setup Claude client with budget
+        # Setup budget and LLM client with thread-safe SharedBudget
         budget_gbp = BACKFILL_BUDGET_GBP if backfill else Decimal(budget)
-        ttl = "1h" if backfill else "5m"
-        claude = ClaudeClient(budget_gbp=budget_gbp, ttl=ttl)
+        shared_budget = SharedBudget(ceiling_gbp=budget_gbp)
 
-        # Load prompts
-        classifier_prompt = load_prompt("classifier", model_id=HAIKU, weights=CLASSIFIER_WEIGHTS)
-        extractor_prompt = load_prompt("extractor", model_id=HAIKU, weights=EXTRACTOR_WEIGHTS)
+        if model == "openai":
+            from execution.shared.openai_client import OpenAIClient
+            llm_client = OpenAIClient(budget=shared_budget)
+            model_id = "gpt-4o-mini"
+        else:
+            ttl = "1h" if backfill else "5m"
+            llm_client = ClaudeClient(shared_budget=shared_budget, ttl=ttl)
+            model_id = HAIKU
+
+        # Load prompts (model_id used for token estimation)
+        classifier_prompt = load_prompt("classifier", model_id=model_id, weights=CLASSIFIER_WEIGHTS)
+        extractor_prompt = load_prompt("extractor", model_id=model_id, weights=EXTRACTOR_WEIGHTS)
 
         # Setup adapters
         auth = Ms365Auth.from_keychain()
@@ -584,19 +958,40 @@ def ingest_invoice_process(
         resolved_tmp = tmp_root or Path(".tmp")
         resolved_tmp.mkdir(parents=True, exist_ok=True)
 
+        def progress_callback(current: int, total: int, detail: str) -> None:
+            emit_progress("process", current, total, detail)
+            # Update stats incrementally so interrupted runs show partial progress
+            _update_run_stats(conn, run_id=run_id, stats={"processed": current, "total": total, "detail": detail})
+
+        emit_progress("process", 0, 0, f"Starting invoice processing with {workers} worker(s)")
         try:
             stats = process_pending_emails(
                 conn,
                 adapter=adapter,
-                claude=claude,
+                llm_client=llm_client,
                 google=google,
                 classifier_prompt=classifier_prompt,
                 extractor_prompt=extractor_prompt,
                 tmp_root=resolved_tmp,
                 limit=limit,
+                on_progress=progress_callback,
+                workers=workers,
+                db_path=db_path,
+            )
+            _complete_run(
+                conn,
+                run_id=run_id,
+                status="ok",
+                stats={
+                    "processed": stats.processed,
+                    "filed": stats.filed,
+                    "errors": stats.errors,
+                    "cost_gbp": str(stats.cost_gbp),
+                },
             )
             emit_success(
                 {
+                    "run_id": run_id,
                     "processed": stats.processed,
                     "classified_invoice": stats.classified_invoice,
                     "classified_receipt": stats.classified_receipt,
@@ -611,8 +1006,139 @@ def ingest_invoice_process(
                     "backfill": backfill,
                 }
             )
+        except Exception:
+            _complete_run(conn, run_id=run_id, status="failed", stats={})
+            raise
         finally:
             adapter.close()
+
+    except PipelineError as err:
+        emit_error(err)
+    except Exception as err:
+        emit_error(err)
+
+
+@ingest_invoice_app.command("upload-pdf")
+def ingest_invoice_upload_pdf(
+    msg_id: Annotated[str, typer.Argument(help="The message ID to attach the PDF to.")],
+    pdf_path: Annotated[Path, typer.Argument(help="Path to the PDF file.")],
+    db_path: Annotated[Path | None, typer.Option("--db")] = None,
+    tmp_root: Annotated[
+        Path | None,
+        typer.Option("--tmp", help="Override temp directory (default: .tmp)."),
+    ] = None,
+) -> None:
+    """Upload a manually downloaded PDF for a flagged invoice.
+
+    Use this when the invoice PDF couldn't be auto-fetched (login-gated vendors,
+    expired URLs). The PDF will be extracted and filed to Google Drive.
+    """
+    try:
+        from datetime import date as date_type
+
+        from execution.invoice.category import resolve_category
+        from execution.invoice.extractor import ExtractorInput, extract_invoice
+        from execution.invoice.filer import FilerInput, file_invoice
+        from execution.shared.claude_client import HAIKU, ClaudeClient
+        from execution.shared.clock import now_utc
+        from execution.shared.prompts import EXTRACTOR_WEIGHTS, load_prompt
+        from execution.shared.sheet import GoogleClients
+
+        if not pdf_path.exists():
+            emit_error(FileNotFoundError(f"PDF not found: {pdf_path}"))
+            return
+
+        if pdf_path.suffix.lower() != ".pdf":
+            emit_error(ValueError("File must be a PDF"))
+            return
+
+        conn = db_mod.connect(db_path)
+        db_mod.apply_migrations(conn)
+
+        email = conn.execute(
+            "SELECT from_addr, subject, received_at, outcome FROM emails WHERE msg_id = ?",
+            (msg_id,),
+        ).fetchone()
+        if not email:
+            emit_error(ValueError(f"Email not found: {msg_id}"))
+            return
+
+        from_addr, subject, received_at, outcome = email
+        if outcome not in ("needs_manual_download", "error", "no_attachment"):
+            emit_error(ValueError(f"Email doesn't need manual upload (outcome: {outcome})"))
+            return
+
+        sender_domain = from_addr.split("@")[1] if "@" in from_addr else None
+        pdf_bytes = pdf_path.read_bytes()
+
+        # Extract text from PDF
+        import io
+
+        import pdfplumber
+
+        text_parts: list[str] = []
+        with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+            for page in pdf.pages:
+                text = page.extract_text()
+                if text:
+                    text_parts.append(text)
+        source_text = "\n\n".join(text_parts) if text_parts else ""
+
+        # Parse received date
+        received_date = date_type.fromisoformat(received_at[:10])
+
+        claude = ClaudeClient(budget_gbp=Decimal("1.00"), ttl="5m")
+        extractor_prompt = load_prompt("extractor", model_id=HAIKU, weights=EXTRACTOR_WEIGHTS)
+        google = GoogleClients.connect()
+
+        resolved_tmp = tmp_root or Path(".tmp")
+        resolved_tmp.mkdir(parents=True, exist_ok=True)
+
+        # Build extractor input
+        extractor_input = ExtractorInput(
+            subject=subject,
+            sender=from_addr,
+            source_text=source_text,
+            email_received_date=received_date,
+        )
+
+        # Run extraction
+        extraction_outcome = extract_invoice(claude, extractor_prompt, extractor_input)
+        extraction = extraction_outcome.result
+
+        # Resolve category
+        category_decision = resolve_category(
+            vendor_name=extraction.supplier_name,
+            sender_domain=sender_domain,
+        )
+
+        filer_input = FilerInput(
+            source_msg_id=msg_id,
+            attachment_index=0,
+            pdf_bytes=pdf_bytes,
+            extraction=extraction,
+            extractor_version=extractor_prompt.version,
+            invoice_number_confidence=extraction.field_confidence.invoice_number,
+            category=category_decision.category,
+            sender_domain=sender_domain,
+            tmp_root=resolved_tmp,
+        )
+
+        filed = file_invoice(google, conn, filer_input)
+
+        conn.execute(
+            "UPDATE emails SET processed_at = ?, outcome = ? WHERE msg_id = ?",
+            (now_utc(), "invoice", msg_id),
+        )
+        conn.commit()
+
+        emit_success({
+            "msg_id": msg_id,
+            "invoice_id": filed.invoice_id,
+            "outcome": filed.outcome.value,
+            "drive_file_id": filed.drive_file_id,
+            "vendor_id": filed.vendor_id,
+        })
 
     except PipelineError as err:
         emit_error(err)
@@ -956,7 +1482,7 @@ def reconcile_match(
 
         conn = db_mod.connect(db_path)
         db_mod.apply_migrations(conn)
-        run_id = _begin_run(conn, kind="match")
+        run_id = _begin_run(conn, kind="match", operation="reconcile")
         try:
             stats = run_matcher(conn, run_id=run_id, fiscal_year=fiscal_year)
             _complete_run(conn, run_id=run_id, status="ok", stats=_stats_dict(stats))
@@ -1021,12 +1547,16 @@ def reconcile_run(
     try:
         conn = db_mod.connect(db_path)
         db_mod.apply_migrations(conn)
-        run_id = _begin_run(conn, kind="pipeline")
+        run_id = _begin_run(conn, kind="pipeline", operation="reconcile")
         outcomes: dict[str, str] = {}
         warnings: list[str] = []
         requested = {a.strip() for a in adapters.split(",") if a.strip()}
 
+        total_phases = 4 if not skip_sheet else 3
+        phase = 0
+
         if not skip_ingest:
+            emit_progress("reconcile", phase, total_phases, "Ingesting transactions")
             if "ms365" in requested:
                 outcomes["ms365"] = _safe_run_adapter(conn, "ms365")
             if "amex_csv" in requested:
@@ -1037,8 +1567,10 @@ def reconcile_run(
                 outcomes["monzo"] = _safe_run_adapter(conn, "monzo")
         else:
             warnings.append("ingest skipped via --skip-ingest")
+        phase += 1
 
         # Ledger post-processing — refund linking.
+        emit_progress("reconcile", phase, total_phases, "Linking refunds")
         try:
             from execution.reconcile.ledger import link_refunds
 
@@ -1046,15 +1578,19 @@ def reconcile_run(
         except PipelineError as err:
             warnings.append(f"link_refunds: {err.user_message}")
             refunds_linked = 0
+        phase += 1
 
         # Matcher.
+        emit_progress("reconcile", phase, total_phases, "Matching invoices to transactions")
         from execution.reconcile.run import run_matcher
 
         match_stats = run_matcher(conn, run_id=run_id, fiscal_year=fiscal_year)
+        phase += 1
 
         # Sheet writer (optional).
         sheet_outcome = "skipped"
         if not skip_sheet:
+            emit_progress("reconcile", phase, total_phases, "Writing to Google Sheet")
             sheet_outcome = _safe_write_sheet(
                 conn,
                 fiscal_year=fiscal_year or london_today_fy(),
@@ -1114,22 +1650,68 @@ def _stats_dict(stats: object) -> dict[str, object]:
     return {}
 
 
-def _begin_run(conn: sqlite3.Connection, *, kind: str) -> str:
-    """Insert a ``runs`` record and return the generated ``run_id``."""
+def _cleanup_stale_runs(conn: sqlite3.Connection, *, operation: str) -> int:
+    """Mark runs stuck in 'running' for >1 hour as 'interrupted'.
+
+    Returns the number of runs cleaned up.
+    """
+    from execution.shared.clock import now_utc
+
+    one_hour_ago = (now_utc() - timedelta(hours=1)).isoformat()
+    with conn:
+        cursor = conn.execute(
+            """
+            UPDATE runs
+               SET status = 'interrupted',
+                   ended_at = datetime('now'),
+                   completed_at = datetime('now')
+             WHERE operation = ?
+               AND status = 'running'
+               AND started_at < ?
+            """,
+            (operation, one_hour_ago),
+        )
+        return cursor.rowcount
+
+
+def _begin_run(conn: sqlite3.Connection, *, kind: str, operation: str) -> str:
+    """Insert a ``runs`` record and return the generated ``run_id``.
+
+    Also cleans up any stale 'running' records for this operation that are
+    more than 1 hour old, marking them as 'interrupted'.
+    """
     import secrets as _rnd
 
     from execution.shared.clock import now_utc
+
+    # Cleanup stale runs first
+    cleaned = _cleanup_stale_runs(conn, operation=operation)
+    if cleaned > 0:
+        emit_progress("cleanup", cleaned, cleaned, f"Cleaned up {cleaned} stale run(s)")
 
     run_id = f"{kind}-{now_utc().strftime('%Y%m%dT%H%M%S')}-{_rnd.token_hex(4)}"
     with conn:
         conn.execute(
             """
-            INSERT INTO runs (run_id, started_at, status, stats_json, cost_gbp)
-            VALUES (?, ?, 'running', '{}', '0.00')
+            INSERT INTO runs (run_id, operation, started_at, status, stats_json, cost_gbp)
+            VALUES (?, ?, ?, 'running', '{}', '0.00')
             """,
-            (run_id, now_utc().isoformat()),
+            (run_id, operation, now_utc().isoformat()),
         )
     return run_id
+
+
+def _update_run_stats(conn: sqlite3.Connection, *, run_id: str, stats: dict[str, object]) -> None:
+    """Update stats_json for a running job (for incremental progress tracking)."""
+    import json as _json
+
+    with conn:
+        conn.execute(
+            """
+            UPDATE runs SET stats_json = ? WHERE run_id = ?
+            """,
+            (_json.dumps(stats, default=str), run_id),
+        )
 
 
 def _complete_run(
@@ -1143,14 +1725,15 @@ def _complete_run(
 
     from execution.shared.clock import now_utc
 
+    completed_at = now_utc().isoformat()
     with conn:
         conn.execute(
             """
             UPDATE runs
-               SET ended_at = ?, status = ?, stats_json = ?
+               SET ended_at = ?, completed_at = ?, status = ?, stats_json = ?
              WHERE run_id = ?
             """,
-            (now_utc().isoformat(), status, _json.dumps(stats, default=str), run_id),
+            (completed_at, completed_at, status, _json.dumps(stats, default=str), run_id),
         )
 
 
@@ -1560,6 +2143,182 @@ def vendors_list(
     sys.stdout.write(_json.dumps(payload, default=str))
     sys.stdout.write("\n")
     sys.stdout.flush()
+
+
+# ---------------------------------------------------------------------------
+# runs subcommands (run management for agent-native parity)
+# ---------------------------------------------------------------------------
+
+
+runs_app = typer.Typer(name="runs", help="Manage pipeline runs.", no_args_is_help=True)
+app.add_typer(runs_app)
+
+
+@runs_app.command("list")
+def runs_list(
+    db_path: Annotated[Path | None, typer.Option("--db")] = None,
+    running: Annotated[
+        bool,
+        typer.Option("--running", "-r", help="Show only currently running jobs."),
+    ] = False,
+    limit: Annotated[
+        int,
+        typer.Option("--limit", "-n", help="Maximum number of runs to show."),
+    ] = 10,
+) -> None:
+    """List recent pipeline runs."""
+    import json as _json
+
+    conn = db_mod.connect(db_path)
+    db_mod.apply_migrations(conn)
+
+    if running:
+        rows = conn.execute(
+            """
+            SELECT run_id, operation, started_at, completed_at, status, stats_json
+            FROM runs
+            WHERE status = 'running'
+            ORDER BY started_at DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            """
+            SELECT run_id, operation, started_at, completed_at, status, stats_json
+            FROM runs
+            ORDER BY started_at DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+
+    conn.close()
+
+    runs = []
+    for row in rows:
+        stats = None
+        if row[5]:
+            try:
+                stats = _json.loads(row[5])
+            except _json.JSONDecodeError:
+                stats = None
+        runs.append({
+            "run_id": row[0],
+            "operation": row[1],
+            "started_at": row[2],
+            "completed_at": row[3],
+            "status": row[4],
+            "stats": stats,
+        })
+
+    emit_success({"count": len(runs), "runs": runs})
+
+
+@runs_app.command("cancel")
+def runs_cancel(
+    operation: Annotated[
+        str,
+        typer.Argument(help="Operation to cancel (ingest_email, ingest_invoice, reconcile)."),
+    ],
+    db_path: Annotated[Path | None, typer.Option("--db")] = None,
+) -> None:
+    """Cancel running jobs for an operation."""
+    valid_ops = {"ingest_email", "ingest_invoice", "reconcile"}
+    if operation not in valid_ops:
+        emit_error(ValueError(f"Invalid operation: {operation}. Must be one of: {', '.join(valid_ops)}"))
+        return
+
+    conn = db_mod.connect(db_path)
+    db_mod.apply_migrations(conn)
+
+    from execution.shared.clock import now_utc
+
+    with conn:
+        cursor = conn.execute(
+            """
+            UPDATE runs
+            SET status = 'cancelled', completed_at = ?
+            WHERE operation = ? AND status = 'running'
+            """,
+            (now_utc().isoformat(), operation),
+        )
+        cancelled = cursor.rowcount
+
+    conn.close()
+    emit_success({"cancelled": cancelled, "operation": operation})
+
+
+@runs_app.command("status")
+def runs_status(
+    run_id: Annotated[str, typer.Argument(help="The run ID to check.")],
+    db_path: Annotated[Path | None, typer.Option("--db")] = None,
+) -> None:
+    """Get detailed status of a specific run."""
+    import json as _json
+
+    conn = db_mod.connect(db_path)
+    db_mod.apply_migrations(conn)
+
+    row = conn.execute(
+        """
+        SELECT run_id, operation, started_at, completed_at, status, stats_json, cost_gbp
+        FROM runs
+        WHERE run_id = ?
+        """,
+        (run_id,),
+    ).fetchone()
+
+    conn.close()
+
+    if not row:
+        emit_error(ValueError(f"Run not found: {run_id}"))
+        return
+
+    stats = None
+    if row[5]:
+        try:
+            stats = _json.loads(row[5])
+        except _json.JSONDecodeError:
+            stats = None
+
+    emit_success({
+        "run_id": row[0],
+        "operation": row[1],
+        "started_at": row[2],
+        "completed_at": row[3],
+        "status": row[4],
+        "stats": stats,
+        "cost_gbp": row[6],
+    })
+
+
+@runs_app.command("cleanup")
+def runs_cleanup(
+    db_path: Annotated[Path | None, typer.Option("--db")] = None,
+) -> None:
+    """Clean up stale runs (running >1 hour) across all operations."""
+    conn = db_mod.connect(db_path)
+    db_mod.apply_migrations(conn)
+
+    from execution.shared.clock import now_utc
+
+    one_hour_ago = (now_utc() - timedelta(hours=1)).isoformat()
+
+    with conn:
+        cursor = conn.execute(
+            """
+            UPDATE runs
+            SET status = 'interrupted', completed_at = datetime('now')
+            WHERE status = 'running' AND started_at < ?
+            """,
+            (one_hour_ago,),
+        )
+        cleaned = cursor.rowcount
+
+    conn.close()
+    emit_success({"cleaned": cleaned})
 
 
 if __name__ == "__main__":

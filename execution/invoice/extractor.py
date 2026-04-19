@@ -33,8 +33,10 @@ from typing import TYPE_CHECKING, Any, Final
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from execution.invoice.classifier import UNTRUSTED_CLOSE, UNTRUSTED_OPEN
-from execution.shared.claude_client import HAIKU, SONNET, ClaudeCall, ClaudeClient, Model
+from execution.shared.budget import LLMCall
+from execution.shared.claude_client import ClaudeClient
 from execution.shared.errors import SchemaViolationError
+from execution.shared.llm_client import LLMClient
 
 if TYPE_CHECKING:  # pragma: no cover
     from execution.shared.prompts import LoadedPrompt
@@ -207,7 +209,7 @@ def build_user_content(inp: ExtractorInput, *, max_body_chars: int = 12_000) -> 
 
 
 def extract_invoice(
-    client: ClaudeClient,
+    client: LLMClient,
     prompt: LoadedPrompt,
     inp: ExtractorInput,
     *,
@@ -216,40 +218,50 @@ def extract_invoice(
     critical_field_floor: float = DEFAULT_CRITICAL_FIELD_FLOOR,
     date_window_days: int = DEFAULT_DATE_WINDOW_DAYS,
 ) -> ExtractionOutcome:
-    """Run Haiku extraction, sanitise, and escalate to Sonnet when gated."""
-    haiku_raw, haiku_call = _one_call(
+    """Run extraction, sanitise, and escalate to Sonnet when gated (Claude only)."""
+    # Initial extraction using the client's default model
+    initial_raw, initial_call = _one_call(
         client=client,
         prompt=prompt,
         inp=inp,
-        model=HAIKU,
         max_tokens=max_tokens,
     )
-    haiku_sanitised = sanitise_result(haiku_raw, inp)
-    haiku_reasons = escalation_reasons(
-        haiku_sanitised,
+    initial_sanitised = sanitise_result(initial_raw, inp)
+    initial_reasons = escalation_reasons(
+        initial_sanitised,
         inp,
         overall_confidence_floor=overall_confidence_floor,
         critical_field_floor=critical_field_floor,
         date_window_days=date_window_days,
     )
 
-    if not haiku_reasons:
+    if not initial_reasons:
         return ExtractionOutcome(
-            result=haiku_sanitised,
-            calls=(haiku_call,),
+            result=initial_sanitised,
+            calls=(initial_call,),
             escalated=False,
             needs_manual_review=False,
             escalation_reasons=(),
         )
 
-    # Terminal escalation. If Sonnet also fails, we ship the better of the
-    # two results with ``needs_manual_review=True`` — caller routes to the
-    # Exceptions tab.
-    sonnet_raw, sonnet_call = _one_call(
+    # Escalation is only available for Claude (Haiku → Sonnet)
+    # For OpenAI, flag for manual review without escalation
+    if not isinstance(client, ClaudeClient):
+        return ExtractionOutcome(
+            result=initial_sanitised,
+            calls=(initial_call,),
+            escalated=False,
+            needs_manual_review=True,
+            escalation_reasons=initial_reasons,
+        )
+
+    # Claude escalation: retry with Sonnet
+    from execution.shared.claude_client import SONNET
+
+    sonnet_raw, sonnet_call = _one_call_claude_escalate(
         client=client,
         prompt=prompt,
         inp=inp,
-        model=SONNET,
         max_tokens=max_tokens,
     )
     sonnet_sanitised = sanitise_result(sonnet_raw, inp)
@@ -263,33 +275,60 @@ def extract_invoice(
 
     best = (
         sonnet_sanitised
-        if sonnet_sanitised.overall_confidence >= haiku_sanitised.overall_confidence
-        else haiku_sanitised
+        if sonnet_sanitised.overall_confidence >= initial_sanitised.overall_confidence
+        else initial_sanitised
     )
     return ExtractionOutcome(
         result=best,
-        calls=(haiku_call, sonnet_call),
+        calls=(initial_call, sonnet_call),
         escalated=True,
         needs_manual_review=bool(sonnet_reasons),
-        escalation_reasons=haiku_reasons,
+        escalation_reasons=initial_reasons,
     )
 
 
 def _one_call(
     *,
-    client: ClaudeClient,
+    client: LLMClient,
     prompt: LoadedPrompt,
     inp: ExtractorInput,
-    model: Model,
     max_tokens: int,
-) -> tuple[ExtractorResult, ClaudeCall]:
-    """One round-trip: build content, call model, parse + validate."""
-    text, call = client.call_with_cached_prompt(
+) -> tuple[ExtractorResult, LLMCall]:
+    """One round-trip using the LLMClient protocol."""
+    text, call = client.complete(
         loaded_prompt=prompt,
         user_content=build_user_content(inp),
         max_tokens=max_tokens,
         stage="extract",
-        model=model,
+    )
+    return _parse_response(text), call
+
+
+def _one_call_claude_escalate(
+    *,
+    client: ClaudeClient,
+    prompt: LoadedPrompt,
+    inp: ExtractorInput,
+    max_tokens: int,
+) -> tuple[ExtractorResult, LLMCall]:
+    """Claude-specific escalation call using Sonnet."""
+    from execution.shared.claude_client import SONNET
+
+    text, claude_call = client.call_with_cached_prompt(
+        loaded_prompt=prompt,
+        user_content=build_user_content(inp),
+        max_tokens=max_tokens,
+        stage="extract",
+        model=SONNET,
+    )
+    # Convert ClaudeCall to LLMCall for consistent return type
+    call = LLMCall(
+        provider="claude",
+        model=claude_call.model,
+        stage=claude_call.stage,
+        input_tokens=claude_call.usage.input_tokens,
+        output_tokens=claude_call.usage.output_tokens,
+        cost_gbp=claude_call.cost_gbp,
     )
     return _parse_response(text), call
 
