@@ -92,3 +92,16 @@ export type ReconciliationState =
   | "pending"
   | "ignored"
   | "split";
+
+export type PipelineCommand = "syncEmails" | "processInvoices" | "runReconciliation";
+
+export interface PipelineOptions {
+  fiscalYear?: string;
+  limit?: number;
+  sender?: string;
+  dateFrom?: string;
+  dateTo?: string;
+  backfillFrom?: string;
+  reset?: boolean;
+  rescan?: boolean;
+}

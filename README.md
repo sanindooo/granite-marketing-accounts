@@ -50,6 +50,41 @@ granite reconcile run --adapters ms365,amex_csv,wise,monzo
 |---------|-------------|
 | `granite ingest email ms365` | Fetch new emails from MS365 inbox |
 | `granite ingest email ms365 --initial` | Ignore watermark, fetch all recent |
+| `granite ingest email ms365 --backfill-from 2026-01-01` | Fetch all emails from date + set up delta sync |
+
+#### How Email Sync Works
+
+There are three ways to sync emails. They work differently:
+
+**1. Default Sync (Delta Sync)**
+- Asks MS Graph: "What's new since I last checked?"
+- Only returns emails that arrived AFTER your last sync
+- Fast and efficient for daily use
+- The "Delta sync: X new emails" message shows how many genuinely new emails arrived
+
+**2. Backfill (recommended for historical catch-up)**
+- Searches ALL emails from the specified date to now
+- Then runs a delta sync to establish a new checkpoint
+- Use this when: you want to capture old invoices you missed
+- Example: Backfill from Jan 1 will find all emails from Jan 1 onwards, skip duplicates already in the database, and set up delta sync for future runs
+
+**3. Date Range (one-off search)**
+- Searches emails within the specified date range
+- Does NOT set up or affect delta sync
+- Use this when: you want to re-scan a specific period without changing your sync state
+- Good for: re-processing emails that might have been missed or incorrectly classified
+
+**Why do I see "Delta sync" during backfill?**
+Backfill runs in two phases:
+1. First, it searches all emails from your specified date (you'll see "Fetched X emails")
+2. Then, it runs a delta sync to establish a checkpoint for future incremental syncs
+
+The "Delta sync: 0 new emails" message during backfill is normal — it means no NEW emails arrived between your search and setting up the checkpoint. Your historical emails were already captured in phase 1.
+
+**In the web UI:**
+- Backfill and Date Range are mutually exclusive (you can't use both at once)
+- Backfill = historical catch-up + sets up incremental sync
+- Date Range = one-off search, doesn't touch sync state
 
 ### Invoice Processing
 

@@ -24,17 +24,41 @@ granite ingest invoice process
 ### Fetch Emails
 
 ```bash
-granite ingest email ms365 [--initial] [--sender NAME] [--from DATE] [--to DATE]
+granite ingest email ms365 [OPTIONS]
 ```
 
-- Fetches new messages from MS365 inbox using delta queries
-- Stores email metadata in `emails` table
-- `--initial`: Ignore saved watermark, fetch all recent messages
+**Options:**
+- `--initial`: Ignore saved watermark, fetch all recent messages (does NOT set up delta sync)
+- `--reset`: Clear all synced emails and watermark, then do a full inbox search (90 days back)
+- `--backfill-from DATE`: Fetch all emails from DATE onwards AND set up delta sync for future incremental fetches
 - `--sender NAME`: Search for emails from a specific sender (e.g., `--sender uber`)
 - `--from DATE`: Only fetch emails received on or after this date (YYYY-MM-DD)
 - `--to DATE`: Only fetch emails received on or before this date (YYYY-MM-DD)
+- `--rescan`: Re-fetch emails even if already in database. Updates existing records and clears their processed status so they get re-classified and re-extracted.
 
-When using `--sender`, `--from`, or `--to`, the command uses search mode instead of delta sync:
+#### Sync Modes Explained
+
+**1. Default (Delta Sync)** — `granite ingest email ms365`
+- Asks MS Graph: "What's new since I last checked?"
+- Only returns emails that arrived AFTER your last sync
+- Fast and efficient for daily use
+
+**2. Backfill** — `granite ingest email ms365 --backfill-from 2026-01-01`
+- Searches ALL emails from the specified date to now
+- Then runs a delta sync to establish a checkpoint for future incremental syncs
+- Best for: capturing historical invoices you missed
+
+**3. Date Range (One-off search)** — `granite ingest email ms365 --from 2026-01-01 --to 2026-03-31`
+- Searches emails within the specified date range
+- Does NOT set up or affect delta sync
+- Best for: re-scanning a specific period without changing sync state
+
+**4. Initial** — `granite ingest email ms365 --initial`
+- Fetches recent emails ignoring the watermark
+- Does NOT update the watermark (unlike backfill)
+- Use carefully — prefer `--backfill-from` for most historical catch-up needs
+
+When using `--sender`, `--from`, or `--to` (without `--backfill-from`), the command uses search mode:
 - Searches your inbox for matching emails
 - Automatically skips emails already in the database (deduplication)
 - Does not update the watermark
@@ -42,6 +66,11 @@ When using `--sender`, `--from`, or `--to`, the command uses search mode instead
 **Standard sync (delta mode):**
 ```json
 {"source": "ms365", "batches": 2, "emails": 47, "next_watermark_saved": true}
+```
+
+**Backfill mode:**
+```json
+{"source": "ms365", "backfill_mode": true, "backfill_from": "2026-01-01", "backfill_emails": 150, "watermark_saved": true}
 ```
 
 **Search mode:**
@@ -81,6 +110,92 @@ Output:
 }
 ```
 
+### View Pending Emails
+
+```bash
+granite ingest email pending [--limit N]
+```
+
+Lists emails that need attention (manual download required, errors, no attachment found). These are emails that couldn't be fully processed automatically.
+
+Output:
+```json
+{
+  "count": 3,
+  "items": [
+    {"msg_id": "AAM...", "from_addr": "noreply@zoom.us", "subject": "Your invoice", "outcome": "needs_manual_download"},
+    {"msg_id": "BBN...", "from_addr": "billing@vendor.com", "subject": "Receipt", "outcome": "no_attachment"}
+  ]
+}
+```
+
+### View Email Body
+
+```bash
+granite ingest email body <MSG_ID>
+```
+
+Fetches and returns the full email body for inspection. Useful for debugging classification issues or checking email content before dismissing.
+
+Output:
+```json
+{
+  "msg_id": "AAM...",
+  "body_html": "<html>...",
+  "body_text": "Plain text version..."
+}
+```
+
+### Dismiss Email
+
+```bash
+granite ingest email dismiss <MSG_ID> --reason <REASON>
+```
+
+Dismisses a pending email with a reason. This removes it from the "needs attention" list and records feedback to help train future classification.
+
+**Reasons:**
+- `not_invoice`: Email is not an invoice (marketing, notification, etc.)
+- `resolved`: Issue was resolved manually (e.g., PDF uploaded by hand)
+- `duplicate`: Duplicate of another email already processed
+
+The dismissal is recorded in the `email_feedback` table for future learning.
+
+## Re-scanning Emails
+
+If emails were processed when the system had bugs, or you want to re-process them with improved classifiers:
+
+```bash
+# Re-scan all emails from Anthropic
+granite ingest email ms365 --sender anthropic --rescan
+
+# Re-scan all emails from November 2025 onwards
+granite ingest email ms365 --from 2025-11-01 --rescan
+
+# Re-scan emails from a specific date range
+granite ingest email ms365 --from 2025-11-01 --to 2026-01-31 --rescan
+
+# Then re-process them
+granite ingest invoice process
+```
+
+**What `--rescan` does:**
+1. Fetches emails from your inbox (matching your filters)
+2. Updates existing records in the database with fresh data
+3. Clears their `processed_at` status so they appear as "pending" again
+4. The next `process invoices` run will re-classify and re-extract them
+
+**When to use rescan:**
+- After fixing bugs in the email sync or processing pipeline
+- When you suspect emails were incorrectly classified
+- To re-run extraction with improved prompts or models
+- When you want to ensure nothing was missed
+
+**Natural language examples:**
+- "Re-scan all emails from Anthropic" → `--sender anthropic --rescan`
+- "Re-process everything from November" → `--from 2025-11-01 --rescan`
+- "Re-scan emails from Uber between January and March" → `--sender uber --from 2026-01-01 --to 2026-03-31 --rescan`
+
 ## Search for Specific Vendor
 
 To find and process invoices from a specific company:
@@ -109,14 +224,19 @@ This is useful when:
 For initial bulk processing of historical emails:
 
 ```bash
-# Fetch all emails (ignoring watermark)
-granite ingest email ms365 --initial
+# Recommended: Fetch all emails from a date AND set up delta sync
+granite ingest email ms365 --backfill-from 2026-01-01
 
 # Process with higher budget and longer cache
 granite ingest invoice process --backfill
 ```
 
-Backfill mode:
+**Why use `--backfill-from` instead of `--initial`?**
+- `--backfill-from` fetches historical emails AND sets up delta sync for future runs
+- `--initial` fetches emails but does NOT update the watermark (you'll re-fetch them next time)
+- For historical catch-up, `--backfill-from` is almost always what you want
+
+Invoice processing backfill mode:
 - £20 budget ceiling (vs £2 default)
 - 1-hour prompt cache TTL (vs 5 minutes)
 - ~88% token savings through cache reuse
@@ -202,6 +322,38 @@ Extracted values are validated against source text:
 
 Fields that fail validation are nulled with confidence=0.
 
+## Web UI
+
+The system includes a web dashboard at `http://localhost:3000/dashboard` for visual operation:
+
+**Pipeline Controls:**
+- Run sync, process, and reconciliation with one click
+- Live progress indicators while jobs are running
+- Cancel stuck/stale runs (jobs running >1 hour)
+- Automatic 15-second polling when runs are active
+
+**Filters:**
+- Search by vendor/sender
+- Date range (one-off search, doesn't affect delta sync)
+- Backfill from date (historical catch-up + sets up delta sync)
+- Process limit
+
+**Needs Attention Card:**
+- Shows emails that need manual action (no PDF, login-gated, errors)
+- View email body content
+- Dismiss with feedback (not_invoice, resolved, duplicate) to train the system
+- Upload PDF manually for login-gated vendors
+
+**Invoices Page:**
+- Search and filter invoices
+- View invoice details
+- Mark as deleted (soft delete)
+
+To start the web UI:
+```bash
+cd web && npm run dev
+```
+
 ## Monitoring
 
 Check processing status:
@@ -209,11 +361,20 @@ Check processing status:
 # Recent runs
 sqlite3 .state/pipeline.db "SELECT run_id, started_at, status FROM runs ORDER BY started_at DESC LIMIT 5"
 
+# Running jobs (check for stuck processes)
+sqlite3 .state/pipeline.db "SELECT run_id, operation, started_at, stats_json FROM runs WHERE status = 'running'"
+
 # Unprocessed emails
 sqlite3 .state/pipeline.db "SELECT COUNT(*) FROM emails WHERE processed_at IS NULL"
 
+# Pending attention (needs manual action)
+granite ingest email pending
+
 # Error breakdown
 sqlite3 .state/pipeline.db "SELECT outcome, COUNT(*) FROM emails GROUP BY outcome"
+
+# Dismiss history (feedback for learning)
+sqlite3 .state/pipeline.db "SELECT sender_domain, feedback_value, COUNT(*) FROM email_feedback GROUP BY sender_domain, feedback_value"
 ```
 
 ## Vendors

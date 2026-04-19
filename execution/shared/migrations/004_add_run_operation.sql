@@ -1,6 +1,9 @@
 -- Add operation tracking for pipeline runs
 -- Supports SSE reconnection and last-run queries
--- Note: Uses safe column addition pattern for idempotency
+
+-- Add new columns for operation tracking
+ALTER TABLE runs ADD COLUMN operation TEXT;
+ALTER TABLE runs ADD COLUMN completed_at TEXT;
 
 -- Backfill operation from run_id prefix pattern (e.g., "email-20260418..." -> "ingest_email")
 -- This UPDATE is safe to run even if backfill already happened (WHERE operation IS NULL)
@@ -24,3 +27,8 @@ WHERE completed_at IS NULL AND ended_at IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_runs_active
 ON runs(operation, status)
 WHERE status = 'running';
+
+-- Index for dashboard last-runs queries (moved from 003)
+-- Used by getLastRuns to quickly find most recent run per operation
+CREATE INDEX IF NOT EXISTS idx_runs_op_started
+ON runs(operation, started_at DESC);

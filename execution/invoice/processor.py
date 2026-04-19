@@ -72,6 +72,13 @@ _PDF_URL_PATTERNS: Final[tuple[re.Pattern[str], ...]] = tuple(
         r"https?://pay\.stripe\.com/[^\s<>\"']+",
         r"https?://invoice\.stripe\.com/[^\s<>\"']+",
         r"https?://[^\s<>\"']*paddle[^\s<>\"']+/invoice[^\s<>\"']*",
+        # Billing portal URLs (will return needs_manual_download via login-gated check)
+        r"https?://platform\.openai\.com/[^\s<>\"']*billing[^\s<>\"']*",
+        r"https?://[^\s<>\"']*\.zoom\.us/[^\s<>\"']*invoice[^\s<>\"']*",
+        r"https?://[^\s<>\"']*\.zoom\.us/[^\s<>\"']*billing[^\s<>\"']*",
+        r"https?://dashboard\.heroku\.com/[^\s<>\"']*invoice[^\s<>\"']*",
+        r"https?://vercel\.com/[^\s<>\"']*billing[^\s<>\"']*",
+        r"https?://railway\.app/[^\s<>\"']*billing[^\s<>\"']*",
     ]
 )
 
@@ -143,6 +150,9 @@ def process_pending_emails(
     stats = ProcessStats()
     http_client = SafeHttpClient()
 
+    # Load dismissed sender domains for auto-skip (learning from user feedback)
+    dismissed_domains = _load_dismissed_domains(conn)
+
     # Get total count for progress reporting
     total = conn.execute(
         "SELECT COUNT(*) FROM emails WHERE processed_at IS NULL"
@@ -153,6 +163,16 @@ def process_pending_emails(
     try:
         for email_row in _pending_emails(conn, batch_size=batch_size, limit=limit):
             try:
+                # Check if sender domain has been frequently dismissed as "not_invoice"
+                sender_domain = _extract_domain(email_row.from_addr)
+                if sender_domain and sender_domain in dismissed_domains:
+                    _update_email_outcome(conn, email_row.msg_id, "neither")
+                    stats.processed += 1
+                    stats.classified_neither += 1
+                    if on_progress:
+                        on_progress(stats.processed, total, "Processed: neither (learned)")
+                    continue
+
                 outcome, invoice = _process_one(
                     conn=conn,
                     email_row=email_row,
@@ -396,6 +416,29 @@ def _extract_domain(email_addr: str) -> str | None:
     if "@" not in email_addr:
         return None
     return email_addr.split("@")[-1].lower().strip()
+
+
+def _load_dismissed_domains(conn: sqlite3.Connection, threshold: int = 2) -> set[str]:
+    """Load sender domains that have been dismissed multiple times.
+
+    Returns domains where the user has marked emails as "not_invoice" at least
+    `threshold` times. This enables learning from user feedback.
+    """
+    try:
+        rows = conn.execute(
+            """
+            SELECT sender_domain, COUNT(*) as dismiss_count
+            FROM email_feedback
+            WHERE feedback_type = 'dismiss' AND feedback_value = 'not_invoice'
+            GROUP BY sender_domain
+            HAVING dismiss_count >= ?
+            """,
+            (threshold,),
+        ).fetchall()
+        return {row[0] for row in rows if row[0]}
+    except Exception:
+        # Table might not exist yet or other error - return empty set
+        return set()
 
 
 def _parse_received_date(received_at: str) -> date:

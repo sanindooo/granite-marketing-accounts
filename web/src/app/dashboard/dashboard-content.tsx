@@ -29,6 +29,41 @@ const PIPELINE_COMMANDS: { key: PipelineCommand; label: string; description: str
   { key: "runReconciliation", label: "Run reconciliation", description: "Match invoices to transactions" },
 ];
 
+function formatRunningStats(statsJson: string | null, operation: string): string | null {
+  if (!statsJson) return null;
+  try {
+    const stats = JSON.parse(statsJson);
+    if (operation === "ingest_email") {
+      const phase = stats.phase || "sync";
+      const emails = stats.emails || 0;
+      const skipped = stats.skipped || 0;
+      const scanned = stats.scanned || 0;
+      if (phase === "backfill" || phase === "search" || phase === "scan") {
+        if (scanned > 0) {
+          return `Scanned ${scanned}: ${emails} new, ${skipped} already synced`;
+        }
+        return `Found ${emails} new emails`;
+      } else if (phase === "backfill_delta" || phase === "delta_setup") {
+        return `Setting up incremental sync...`;
+      } else if (phase === "incremental") {
+        return `Synced ${emails} new emails`;
+      } else {
+        return `Processing... (${emails} emails)`;
+      }
+    } else if (operation === "ingest_invoice") {
+      const processed = stats.processed || 0;
+      const total = stats.total || 0;
+      return total > 0 ? `Processing ${processed}/${total}` : `Processed ${processed}`;
+    } else if (operation === "reconcile") {
+      const matched = stats.matched || 0;
+      return `Matched ${matched} transactions`;
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
 export function DashboardContent() {
   const [fy] = useQueryState("fy", parseAsString.withDefault(getCurrentFY()));
   const [metrics, setMetrics] = useState<DashboardMetrics | null>(null);
@@ -45,12 +80,14 @@ export function DashboardContent() {
     senderSearch: string;
     limit?: number;
     backfillFrom: string;
+    rescan: boolean;
   }>({
     dateFrom: "",
     dateTo: "",
     senderSearch: "",
     limit: undefined,
     backfillFrom: "",
+    rescan: false,
   });
 
   // Modal state for stale run detection
@@ -118,6 +155,7 @@ export function DashboardContent() {
     if (pipelineFilters.dateTo) options.dateTo = pipelineFilters.dateTo;
     if (pipelineFilters.limit) options.limit = pipelineFilters.limit;
     if (pipelineFilters.backfillFrom) options.backfillFrom = pipelineFilters.backfillFrom;
+    if (pipelineFilters.rescan) options.rescan = pipelineFilters.rescan;
 
     await stream.run(command, options);
   };
@@ -427,77 +465,125 @@ export function DashboardContent() {
                   </p>
                 </div>
 
-                <div className="space-y-2">
-                  <p className="text-xs text-muted-foreground">
-                    Set a date range to search your inbox for emails in that period. Without filters, sync only fetches emails that arrived since the last sync.
-                  </p>
-                </div>
+                {!pipelineFilters.backfillFrom ? (
+                  <>
+                    <div className="space-y-2">
+                      <p className="text-xs text-muted-foreground">
+                        Set a date range to search your inbox for emails in that period. Without filters, sync only fetches emails that arrived since the last sync.
+                      </p>
+                    </div>
 
-                <div className="grid gap-4 sm:grid-cols-3">
-                  <div className="space-y-2">
-                    <label className="text-sm font-medium">From date</label>
-                    <Input
-                      type="date"
-                      value={pipelineFilters.dateFrom}
-                      onChange={(e) =>
-                        setPipelineFilters((f) => ({ ...f, dateFrom: e.target.value }))
-                      }
-                    />
+                    <div className="grid gap-4 sm:grid-cols-3">
+                      <div className="space-y-2">
+                        <label className="text-sm font-medium">From date</label>
+                        <Input
+                          type="date"
+                          value={pipelineFilters.dateFrom}
+                          onChange={(e) =>
+                            setPipelineFilters((f) => ({
+                              ...f,
+                              dateFrom: e.target.value,
+                              backfillFrom: "",
+                            }))
+                          }
+                        />
+                      </div>
+                      <div className="space-y-2">
+                        <label className="text-sm font-medium">To date</label>
+                        <Input
+                          type="date"
+                          value={pipelineFilters.dateTo}
+                          onChange={(e) =>
+                            setPipelineFilters((f) => ({
+                              ...f,
+                              dateTo: e.target.value,
+                              backfillFrom: "",
+                            }))
+                          }
+                        />
+                      </div>
+                      <div className="space-y-2">
+                        <label className="text-sm font-medium">Process limit</label>
+                        <Input
+                          type="number"
+                          placeholder="All"
+                          min={1}
+                          max={100}
+                          value={pipelineFilters.limit || ""}
+                          onChange={(e) =>
+                            setPipelineFilters((f) => ({
+                              ...f,
+                              limit: e.target.value ? parseInt(e.target.value, 10) : undefined,
+                            }))
+                          }
+                        />
+                      </div>
+                    </div>
+                  </>
+                ) : (
+                  <div className="rounded-md border border-amber-200 bg-amber-50 p-3">
+                    <p className="text-sm text-amber-800">
+                      Date range filters are hidden because backfill is active. Backfill fetches all emails from the specified date and sets up delta sync for future incremental fetches. Clear the backfill date below to use date range instead.
+                    </p>
                   </div>
-                  <div className="space-y-2">
-                    <label className="text-sm font-medium">To date</label>
-                    <Input
-                      type="date"
-                      value={pipelineFilters.dateTo}
-                      onChange={(e) =>
-                        setPipelineFilters((f) => ({ ...f, dateTo: e.target.value }))
-                      }
-                    />
-                  </div>
-                  <div className="space-y-2">
-                    <label className="text-sm font-medium">Process limit</label>
-                    <Input
-                      type="number"
-                      placeholder="All"
-                      min={1}
-                      max={100}
-                      value={pipelineFilters.limit || ""}
-                      onChange={(e) =>
-                        setPipelineFilters((f) => ({
-                          ...f,
-                          limit: e.target.value ? parseInt(e.target.value, 10) : undefined,
-                        }))
-                      }
-                    />
-                  </div>
+                )}
+
+                <div className="border-t pt-4">
+                  {pipelineFilters.backfillFrom || !(pipelineFilters.dateFrom || pipelineFilters.dateTo) ? (
+                    <div className="space-y-2">
+                      <label className="text-sm font-medium">Backfill historical emails</label>
+                      <div className="flex gap-2 items-end">
+                        <Input
+                          type="date"
+                          value={pipelineFilters.backfillFrom}
+                          onChange={(e) =>
+                            setPipelineFilters((f) => ({
+                              ...f,
+                              backfillFrom: e.target.value,
+                              dateFrom: "",
+                              dateTo: "",
+                            }))
+                          }
+                          className="max-w-xs"
+                        />
+                        {pipelineFilters.backfillFrom && (
+                          <span className="text-sm text-muted-foreground pb-2">
+                            Will fetch all emails from {pipelineFilters.backfillFrom} and set up incremental sync
+                          </span>
+                        )}
+                      </div>
+                      <p className="text-xs text-muted-foreground">
+                        Use this to capture historical invoices that were missed by initial sync
+                      </p>
+                    </div>
+                  ) : (
+                    <div className="rounded-md border border-blue-200 bg-blue-50 p-3">
+                      <p className="text-sm text-blue-800">
+                        Backfill is hidden because date range is active. Date range performs a one-off search without setting up delta sync. Clear the date range above to use backfill instead.
+                      </p>
+                    </div>
+                  )}
                 </div>
 
                 <div className="border-t pt-4">
-                  <div className="space-y-2">
-                    <label className="text-sm font-medium">Backfill historical emails</label>
-                    <div className="flex gap-2 items-end">
-                      <Input
-                        type="date"
-                        value={pipelineFilters.backfillFrom}
-                        onChange={(e) =>
-                          setPipelineFilters((f) => ({ ...f, backfillFrom: e.target.value }))
-                        }
-                        className="max-w-xs"
-                      />
-                      {pipelineFilters.backfillFrom && (
-                        <span className="text-sm text-muted-foreground pb-2">
-                          Will fetch all emails from {pipelineFilters.backfillFrom} and set up incremental sync
-                        </span>
-                      )}
-                    </div>
-                    <p className="text-xs text-muted-foreground">
-                      Use this to capture historical invoices that were missed by initial sync
-                    </p>
-                  </div>
+                  <label className="flex items-center gap-2 cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={pipelineFilters.rescan}
+                      onChange={(e) =>
+                        setPipelineFilters((f) => ({ ...f, rescan: e.target.checked }))
+                      }
+                      className="h-4 w-4 rounded border-gray-300"
+                    />
+                    <span className="text-sm font-medium">Re-scan already synced emails</span>
+                  </label>
+                  <p className="text-xs text-muted-foreground mt-1 ml-6">
+                    Re-fetch emails even if already in the database. Clears their processing status so they get re-classified and re-extracted.
+                  </p>
                 </div>
               </div>
 
-              {(pipelineFilters.senderSearch || pipelineFilters.dateFrom || pipelineFilters.dateTo || pipelineFilters.limit || pipelineFilters.backfillFrom) && (
+              {(pipelineFilters.senderSearch || pipelineFilters.dateFrom || pipelineFilters.dateTo || pipelineFilters.limit || pipelineFilters.backfillFrom || pipelineFilters.rescan) && (
                 <div className="flex items-center justify-between border-t pt-3">
                   <p className="text-sm text-muted-foreground">
                     {pipelineFilters.backfillFrom && (
@@ -505,18 +591,19 @@ export function DashboardContent() {
                     )}
                     {pipelineFilters.backfillFrom && pipelineFilters.senderSearch && " • "}
                     {pipelineFilters.senderSearch && `Searching for "${pipelineFilters.senderSearch}"`}
-                    {pipelineFilters.senderSearch && (pipelineFilters.dateFrom || pipelineFilters.dateTo) && " • "}
-                    {pipelineFilters.dateFrom && `From ${pipelineFilters.dateFrom}`}
-                    {pipelineFilters.dateFrom && pipelineFilters.dateTo && " to "}
-                    {pipelineFilters.dateTo && !pipelineFilters.dateFrom && `Until ${pipelineFilters.dateTo}`}
-                    {pipelineFilters.dateTo && pipelineFilters.dateFrom && pipelineFilters.dateTo}
+                    {!pipelineFilters.backfillFrom && pipelineFilters.senderSearch && (pipelineFilters.dateFrom || pipelineFilters.dateTo) && " • "}
+                    {!pipelineFilters.backfillFrom && pipelineFilters.dateFrom && `From ${pipelineFilters.dateFrom}`}
+                    {!pipelineFilters.backfillFrom && pipelineFilters.dateFrom && pipelineFilters.dateTo && " to "}
+                    {!pipelineFilters.backfillFrom && pipelineFilters.dateTo && !pipelineFilters.dateFrom && `Until ${pipelineFilters.dateTo}`}
+                    {!pipelineFilters.backfillFrom && pipelineFilters.dateTo && pipelineFilters.dateFrom && pipelineFilters.dateTo}
                     {pipelineFilters.limit && ` • Limit: ${pipelineFilters.limit}`}
+                    {pipelineFilters.rescan && <span className="text-purple-600 font-medium"> • Re-scan mode</span>}
                   </p>
                   <Button
                     variant="ghost"
                     size="sm"
                     onClick={() =>
-                      setPipelineFilters({ dateFrom: "", dateTo: "", senderSearch: "", limit: undefined, backfillFrom: "" })
+                      setPipelineFilters({ dateFrom: "", dateTo: "", senderSearch: "", limit: undefined, backfillFrom: "", rescan: false })
                     }
                   >
                     Clear
@@ -584,6 +671,18 @@ export function DashboardContent() {
                           </div>
                         )}
                       </div>
+                    ) : lastRun?.status === "running" ? (
+                      <div className="mt-1">
+                        <div className="flex items-center gap-2 text-sm">
+                          <div className="h-2 w-2 animate-pulse rounded-full bg-amber-500" />
+                          <span className="text-amber-600">
+                            {formatRunningStats(lastRun.statsJson, dbOperation) || "Running..."}
+                          </span>
+                        </div>
+                        <p className="text-xs text-muted-foreground mt-1">
+                          Started: {formatDateTime(lastRun.startedAt)}
+                        </p>
+                      </div>
                     ) : (
                       <p className="text-xs text-muted-foreground">
                         Last run: {formatDateTime(lastRun?.completedAt || null)}
@@ -592,8 +691,6 @@ export function DashboardContent() {
                             className={
                               lastRun.status === "success" || lastRun.status === "ok"
                                 ? "ml-2 text-green-600"
-                                : lastRun.status === "running"
-                                ? "ml-2 text-amber-600"
                                 : "ml-2 text-red-600"
                             }
                           >

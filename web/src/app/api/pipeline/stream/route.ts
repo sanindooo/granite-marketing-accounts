@@ -18,6 +18,8 @@ const commandSchema = z.object({
   dateTo: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
   backfillFrom: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
   limit: z.number().int().min(1).max(100).optional(),
+  reset: z.boolean().optional(),
+  rescan: z.boolean().optional(),
 });
 
 type PipelineCommand = keyof typeof COMMANDS;
@@ -43,6 +45,14 @@ function buildArgs(command: PipelineCommand, options: z.infer<typeof commandSche
 
   if (options.backfillFrom && command === "syncEmails") {
     args.push("--backfill-from", options.backfillFrom);
+  }
+
+  if (options.reset && command === "syncEmails") {
+    args.push("--reset");
+  }
+
+  if (options.rescan && command === "syncEmails") {
+    args.push("--rescan");
   }
 
   if (options.limit && command === "processInvoices") {

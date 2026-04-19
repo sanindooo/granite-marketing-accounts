@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useRef, useState } from "react";
-import type { PipelineCommand, PipelineOptions } from "@/lib/actions/pipeline";
+import type { PipelineCommand, PipelineOptions } from "@/lib/types";
 
 export interface ProgressEvent {
   event: "progress";
