@@ -93,7 +93,7 @@ export type ReconciliationState =
   | "ignored"
   | "split";
 
-export type PipelineCommand = "syncEmails" | "processInvoices" | "runReconciliation";
+export type PipelineCommand = "syncEmails" | "processInvoices" | "runReconciliation" | "backfillFx";
 
 export interface PipelineOptions {
   fiscalYear?: string;
@@ -106,4 +106,5 @@ export interface PipelineOptions {
   rescan?: boolean;
   workers?: number;
   model?: "claude" | "openai";
+  force?: boolean;
 }

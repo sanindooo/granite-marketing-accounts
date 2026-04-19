@@ -1,15 +1,57 @@
 "use client";
 
+import { useEffect, useRef } from "react";
+import { useRouter } from "next/navigation";
 import Link from "next/link";
+import { toast } from "sonner";
+import { RefreshCw } from "lucide-react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import type { FxError } from "@/lib/queries/dashboard";
+import { usePipelineStream } from "@/hooks/use-pipeline-stream";
 
 interface FxErrorsCardProps {
   fxErrors: FxError[];
 }
 
 export function FxErrorsCard({ fxErrors }: FxErrorsCardProps) {
+  const router = useRouter();
+  const { isRunning, activeCommand, result, error, run } = usePipelineStream();
+  const isBackfillRunning = isRunning && activeCommand === "backfillFx";
+  const handledResultRef = useRef<Record<string, unknown> | null>(null);
+  const handledErrorRef = useRef<{ message: string } | null>(null);
+
+  const handleRetry = async () => {
+    handledResultRef.current = null;
+    handledErrorRef.current = null;
+    await run("backfillFx", { force: true });
+  };
+
+  useEffect(() => {
+    if (result && !isRunning && result !== handledResultRef.current) {
+      handledResultRef.current = result;
+      const processed = (result.processed as number) ?? 0;
+      const errors = (result.errors as number) ?? 0;
+      if (processed > 0 && errors === 0) {
+        toast.success(`Successfully converted ${processed} invoice${processed !== 1 ? "s" : ""} to GBP`);
+      } else if (processed > 0 && errors > 0) {
+        toast.warning(`Converted ${processed} invoice${processed !== 1 ? "s" : ""}, ${errors} still have errors`);
+      } else if (errors > 0) {
+        toast.error(`Failed to convert ${errors} invoice${errors !== 1 ? "s" : ""}`);
+      } else {
+        toast.info("No invoices needed conversion");
+      }
+      router.refresh();
+    }
+  }, [result, isRunning, router]);
+
+  useEffect(() => {
+    if (error && !isRunning && error !== handledErrorRef.current) {
+      handledErrorRef.current = error;
+      toast.error(error.user_message ?? error.message ?? "FX conversion failed");
+    }
+  }, [error, isRunning]);
+
   if (fxErrors.length === 0) return null;
 
   const uniqueCurrencies = [...new Set(fxErrors.map((e) => e.currency))];
@@ -42,14 +84,14 @@ export function FxErrorsCard({ fxErrors }: FxErrorsCardProps) {
               </tr>
             </thead>
             <tbody>
-              {fxErrors.slice(0, 5).map((error) => (
-                <tr key={error.invoiceId} className="border-t border-orange-100">
-                  <td className="max-w-24 truncate px-2 py-1">{error.vendorName}</td>
+              {fxErrors.slice(0, 5).map((fxErr) => (
+                <tr key={fxErr.invoiceId} className="border-t border-orange-100">
+                  <td className="max-w-24 truncate px-2 py-1">{fxErr.vendorName}</td>
                   <td className="px-2 py-1 whitespace-nowrap">
-                    {error.amountGross} {error.currency}
+                    {fxErr.amountGross} {fxErr.currency}
                   </td>
-                  <td className="px-2 py-1 whitespace-nowrap">{error.invoiceDate}</td>
-                  <td className="max-w-32 truncate px-2 py-1 text-red-600">{error.fxError}</td>
+                  <td className="px-2 py-1 whitespace-nowrap">{fxErr.invoiceDate}</td>
+                  <td className="max-w-32 truncate px-2 py-1 text-red-600">{fxErr.fxError}</td>
                 </tr>
               ))}
             </tbody>
@@ -66,9 +108,25 @@ export function FxErrorsCard({ fxErrors }: FxErrorsCardProps) {
               View All
             </Button>
           </Link>
-          <p className="text-xs text-muted-foreground">
-            Run <code className="rounded bg-gray-100 px-1">granite db backfill-fx --force</code> to retry
-          </p>
+          <Button
+            variant="default"
+            size="sm"
+            onClick={handleRetry}
+            disabled={isBackfillRunning}
+            className="bg-orange-600 hover:bg-orange-700"
+          >
+            {isBackfillRunning ? (
+              <>
+                <RefreshCw className="mr-1.5 h-3.5 w-3.5 animate-spin" />
+                Converting...
+              </>
+            ) : (
+              <>
+                <RefreshCw className="mr-1.5 h-3.5 w-3.5" />
+                Retry Conversion
+              </>
+            )}
+          </Button>
         </div>
       </CardContent>
     </Card>

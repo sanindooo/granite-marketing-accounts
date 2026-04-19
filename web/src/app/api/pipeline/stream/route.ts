@@ -8,10 +8,11 @@ const COMMANDS = {
   syncEmails: ["ingest", "email", "ms365"],
   processInvoices: ["ingest", "invoice", "process"],
   runReconciliation: ["reconcile", "run"],
+  backfillFx: ["db", "backfill-fx"],
 } as const;
 
 const commandSchema = z.object({
-  command: z.enum(["syncEmails", "processInvoices", "runReconciliation"]),
+  command: z.enum(["syncEmails", "processInvoices", "runReconciliation", "backfillFx"]),
   fiscalYear: z.string().regex(/^FY-\d{4}-\d{2}$/).optional(),
   sender: z.string().min(1).max(100).optional(),
   dateFrom: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
@@ -22,6 +23,7 @@ const commandSchema = z.object({
   rescan: z.boolean().optional(),
   workers: z.number().int().min(1).max(20).optional(),
   model: z.enum(["claude", "openai"]).optional(),
+  force: z.boolean().optional(),
 });
 
 type PipelineCommand = keyof typeof COMMANDS;
@@ -71,6 +73,10 @@ function buildArgs(command: PipelineCommand, options: z.infer<typeof commandSche
 
   if (options.model && command === "processInvoices") {
     args.push("--model", options.model);
+  }
+
+  if (options.force && command === "backfillFx") {
+    args.push("--force");
   }
 
   return args;

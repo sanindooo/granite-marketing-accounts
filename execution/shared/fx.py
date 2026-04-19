@@ -131,7 +131,7 @@ def _fetch_rate(d: date, from_ccy: str, to_ccy: str) -> Decimal:
         iso_date=d.isoformat(), from_ccy=from_ccy, to_ccy=to_ccy
     )
     try:
-        response = httpx.get(url, timeout=10.0)
+        response = httpx.get(url, timeout=10.0, follow_redirects=True)
         response.raise_for_status()
     except httpx.HTTPStatusError as err:
         raise DataQualityError(

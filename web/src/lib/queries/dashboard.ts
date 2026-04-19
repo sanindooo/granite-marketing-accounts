@@ -53,6 +53,7 @@ export function getDashboardMetrics(fy: string): DashboardMetrics {
       SELECT COUNT(*) as count
       FROM emails
       WHERE processed_at IS NULL
+        AND DATE(received_at) BETWEEN ? AND ?
     )
     SELECT
       (SELECT count FROM invoice_totals) as invoice_count,
@@ -63,7 +64,7 @@ export function getDashboardMetrics(fy: string): DashboardMetrics {
       (SELECT count FROM pending_emails) as pending_emails
   `
     )
-    .get(start, end, fyParam, start, end, start, end) as {
+    .get(start, end, fyParam, start, end, start, end, start, end) as {
     invoice_count: number;
     total_spend: number;
     recon_json: string;
