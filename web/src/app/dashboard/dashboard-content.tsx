@@ -52,7 +52,7 @@ function formatRunningStats(statsJson: string | null, operation: string): string
       } else if (phase === "incremental") {
         return `Synced ${emails} new emails`;
       } else {
-        return emails > 0 ? `Processing ${emails} emails` : "Connecting...";
+        return emails > 0 ? `Processing ${emails} emails` : "Connecting to Microsoft 365...";
       }
     } else if (operation === "ingest_invoice") {
       const processed = stats.processed || 0;
@@ -61,6 +61,98 @@ function formatRunningStats(statsJson: string | null, operation: string): string
     } else if (operation === "reconcile") {
       const matched = stats.matched || 0;
       return `Matched ${matched} transactions`;
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+function formatElapsedTime(startedAt: string | null): string {
+  if (!startedAt) return "";
+  const start = new Date(startedAt);
+  const now = new Date();
+  const diffMs = now.getTime() - start.getTime();
+  const diffMins = Math.floor(diffMs / 60000);
+  const diffSecs = Math.floor((diffMs % 60000) / 1000);
+
+  if (diffMins > 60) {
+    const hours = Math.floor(diffMins / 60);
+    const mins = diffMins % 60;
+    return `${hours}h ${mins}m`;
+  } else if (diffMins > 0) {
+    return `${diffMins}m ${diffSecs}s`;
+  }
+  return `${diffSecs}s`;
+}
+
+function isRunStale(startedAt: string | null, statsJson: string | null): boolean {
+  if (!startedAt) return false;
+  const start = new Date(startedAt);
+  const now = new Date();
+  const diffMins = (now.getTime() - start.getTime()) / 60000;
+
+  // Consider stale if running > 5 minutes with no stats updates
+  // or > 15 minutes regardless of stats
+  try {
+    const stats = statsJson ? JSON.parse(statsJson) : {};
+    const hasProgress = Object.keys(stats).length > 0;
+    return diffMins > 15 || (diffMins > 5 && !hasProgress);
+  } catch {
+    return diffMins > 5;
+  }
+}
+
+function getStaleRunGuidance(operation: string): string {
+  switch (operation) {
+    case "ingest_email":
+      return "The sync may have lost connection to Microsoft 365. Try cancelling and running again. If this keeps happening, you may need to re-authenticate (run 'granite ops reauth ms365' in terminal).";
+    case "ingest_invoice":
+      return "Processing may have stalled due to an API error. Try cancelling and running again with a smaller batch (set Process limit to 10).";
+    case "reconcile":
+      return "Reconciliation may be stuck. Try cancelling and running again.";
+    default:
+      return "This job appears to be stuck. Try cancelling and running again.";
+  }
+}
+
+function formatCompletedStats(statsJson: string | null, operation: string): string | null {
+  if (!statsJson) return null;
+  try {
+    const stats = JSON.parse(statsJson);
+    if (Object.keys(stats).length === 0) return null;
+
+    if (operation === "ingest_email") {
+      const emails = stats.emails || 0;
+      const skipped = stats.skipped || 0;
+      if (emails > 0 && skipped > 0) {
+        return `Synced ${emails} new emails (${skipped} already in database)`;
+      } else if (emails > 0) {
+        return `Synced ${emails} new emails`;
+      } else if (skipped > 0) {
+        return `No new emails (${skipped} already synced)`;
+      }
+      return "Completed";
+    } else if (operation === "ingest_invoice") {
+      const processed = stats.processed || 0;
+      const filed = stats.filed || 0;
+      const errors = stats.errors || 0;
+      const duplicates = stats.duplicates || 0;
+      const parts: string[] = [];
+      if (filed > 0) parts.push(`${filed} filed`);
+      if (duplicates > 0) parts.push(`${duplicates} duplicates`);
+      if (errors > 0) parts.push(`${errors} errors`);
+      if (parts.length > 0) {
+        return `Processed ${processed}: ${parts.join(", ")}`;
+      }
+      return `Processed ${processed} emails`;
+    } else if (operation === "reconcile") {
+      const matched = stats.matched || 0;
+      const unmatched = stats.unmatched || 0;
+      if (matched > 0 || unmatched > 0) {
+        return `${matched} matched, ${unmatched} unmatched`;
+      }
+      return "Completed";
     }
     return null;
   } catch {
@@ -707,7 +799,9 @@ export function DashboardContent() {
                 : cmd.key === "processInvoices"
                 ? "ingest_invoice"
                 : "reconcile";
-              const isStaleRunning = lastRun?.status === "running" && !isThisRunning;
+              const isDbRunning = lastRun?.status === "running" && !isThisRunning;
+              const isStale = isDbRunning && isRunStale(lastRun?.startedAt || null, lastRun?.statsJson || null);
+              const elapsedTime = isDbRunning ? formatElapsedTime(lastRun?.startedAt || null) : "";
 
               return (
                 <div
@@ -746,42 +840,71 @@ export function DashboardContent() {
                           </div>
                         )}
                       </div>
-                    ) : lastRun?.status === "running" ? (
-                      <div className="mt-1">
+                    ) : isDbRunning ? (
+                      <div className="mt-2 space-y-2">
                         <div className="flex items-center gap-2 text-sm">
-                          <div className="h-2 w-2 animate-pulse rounded-full bg-amber-500" />
-                          <span className="text-amber-600">
+                          <div className={`h-2 w-2 rounded-full ${isStale ? "bg-red-500" : "bg-amber-500 animate-pulse"}`} />
+                          <span className={isStale ? "text-red-600" : "text-amber-600"}>
                             {formatRunningStats(lastRun.statsJson, dbOperation) || "Running..."}
                           </span>
+                          {elapsedTime && (
+                            <span className="text-xs text-muted-foreground">({elapsedTime})</span>
+                          )}
                         </div>
-                        <p className="text-xs text-muted-foreground mt-1">
-                          Started: {formatDateTime(lastRun.startedAt)}
-                        </p>
+                        {isStale && (
+                          <div className="rounded-md border border-red-200 bg-red-50 p-3">
+                            <p className="text-sm font-medium text-red-800">
+                              This job appears to be stuck
+                            </p>
+                            <p className="mt-1 text-xs text-red-700">
+                              {getStaleRunGuidance(dbOperation)}
+                            </p>
+                          </div>
+                        )}
+                        {!isStale && (
+                          <p className="text-xs text-muted-foreground">
+                            Started: {formatDateTime(lastRun.startedAt)}
+                          </p>
+                        )}
                       </div>
                     ) : (
-                      <p className="text-xs text-muted-foreground">
-                        Last run: {formatDateTime(lastRun?.completedAt || null)}
-                        {lastRun?.status && lastRun.status !== "never" && (
-                          <span
-                            className={
-                              lastRun.status === "success" || lastRun.status === "ok"
-                                ? "ml-2 text-green-600"
-                                : "ml-2 text-red-600"
-                            }
-                          >
-                            ({lastRun.status})
-                          </span>
+                      <div className="mt-1">
+                        <p className="text-xs text-muted-foreground">
+                          Last run: {formatDateTime(lastRun?.completedAt || null)}
+                          {lastRun?.status && lastRun.status !== "never" && (
+                            <span
+                              className={
+                                lastRun.status === "success" || lastRun.status === "ok"
+                                  ? "ml-2 text-green-600"
+                                  : lastRun.status === "cancelled"
+                                  ? "ml-2 text-amber-600"
+                                  : "ml-2 text-red-600"
+                              }
+                            >
+                              ({lastRun.status})
+                            </span>
+                          )}
+                        </p>
+                        {lastRun?.status === "ok" && lastRun.statsJson && (
+                          <p className="text-xs text-green-600 mt-0.5">
+                            {formatCompletedStats(lastRun.statsJson, dbOperation)}
+                          </p>
                         )}
-                      </p>
+                        {lastRun?.status === "error" && (
+                          <p className="text-xs text-red-600 mt-0.5">
+                            Something went wrong. Check the filters and try again.
+                          </p>
+                        )}
+                      </div>
                     )}
                   </div>
                   <div className="flex gap-2">
-                    {isStaleRunning && (
+                    {isDbRunning && (
                       <Button
                         onClick={() => handleCancelRun(dbOperation as "ingest_email" | "ingest_invoice" | "reconcile")}
                         variant="outline"
                         size="sm"
-                        className="text-red-600 hover:text-red-700 hover:bg-red-50"
+                        className={isStale ? "text-red-600 hover:text-red-700 hover:bg-red-50" : ""}
                       >
                         Cancel
                       </Button>
