@@ -20,6 +20,8 @@ const commandSchema = z.object({
   limit: z.number().int().min(1).max(100).optional(),
   reset: z.boolean().optional(),
   rescan: z.boolean().optional(),
+  workers: z.number().int().min(1).max(20).optional(),
+  model: z.enum(["claude", "openai"]).optional(),
 });
 
 type PipelineCommand = keyof typeof COMMANDS;
@@ -57,6 +59,14 @@ function buildArgs(command: PipelineCommand, options: z.infer<typeof commandSche
 
   if (options.limit && command === "processInvoices") {
     args.push("--limit", String(options.limit));
+  }
+
+  if (options.workers && command === "processInvoices") {
+    args.push("--workers", String(options.workers));
+  }
+
+  if (options.model && command === "processInvoices") {
+    args.push("--model", options.model);
   }
 
   return args;

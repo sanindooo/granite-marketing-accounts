@@ -104,4 +104,6 @@ export interface PipelineOptions {
   backfillFrom?: string;
   reset?: boolean;
   rescan?: boolean;
+  workers?: number;
+  model?: "claude" | "openai";
 }

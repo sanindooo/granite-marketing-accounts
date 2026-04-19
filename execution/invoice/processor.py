@@ -20,7 +20,9 @@ from __future__ import annotations
 
 import re
 import sqlite3
-from collections.abc import Iterator
+import threading
+from collections.abc import Callable, Iterator
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import date, datetime
 from decimal import Decimal
@@ -47,6 +49,7 @@ from execution.invoice.filer import (
 from execution.invoice.pdf_fetcher import FetchOutcome, FetchStatus, fetch_invoice_pdf
 from execution.shared.claude_client import ClaudeClient
 from execution.shared.clock import now_utc
+from execution.shared.db import connect
 from execution.shared.errors import BudgetExceededError, PipelineError
 from execution.shared.http import SafeHttpClient
 from execution.shared.prompts import LoadedPrompt
@@ -63,7 +66,12 @@ if TYPE_CHECKING:  # pragma: no cover
 DEFAULT_BUDGET_GBP: Decimal = Decimal("2.00")
 BACKFILL_BUDGET_GBP: Decimal = Decimal("20.00")
 DEFAULT_BATCH_SIZE: int = 50
+DEFAULT_WORKERS: int = 1
+MAX_WORKERS: int = 20
 MAX_PDF_SIZE_BYTES: int = 20 * 1024 * 1024  # 20 MB
+
+# Thread-local storage for SQLite connections in parallel processing
+_thread_local = threading.local()
 
 _PDF_URL_PATTERNS: Final[tuple[re.Pattern[str], ...]] = tuple(
     re.compile(p, re.IGNORECASE)
@@ -138,7 +146,9 @@ def process_pending_emails(
     tmp_root: Path,
     batch_size: int = DEFAULT_BATCH_SIZE,
     limit: int | None = None,
-    on_progress: Any | None = None,
+    on_progress: Callable[[int, int, str], None] | None = None,
+    workers: int = DEFAULT_WORKERS,
+    db_path: Path | str | None = None,
 ) -> ProcessStats:
     """Process all unprocessed emails and return stats.
 
@@ -146,7 +156,55 @@ def process_pending_emails(
 
     Args:
         on_progress: Optional callback(current, total, detail) called after each email.
+        workers: Number of concurrent workers (1-20). Default 1 for sequential processing.
+        db_path: Database path for creating thread-local connections when workers > 1.
     """
+    workers = max(1, min(workers, MAX_WORKERS))
+
+    if workers == 1:
+        return _process_sequential(
+            conn=conn,
+            adapter=adapter,
+            claude=claude,
+            google=google,
+            classifier_prompt=classifier_prompt,
+            extractor_prompt=extractor_prompt,
+            tmp_root=tmp_root,
+            batch_size=batch_size,
+            limit=limit,
+            on_progress=on_progress,
+        )
+
+    return _process_parallel(
+        main_conn=conn,
+        db_path=db_path,
+        adapter=adapter,
+        claude=claude,
+        google=google,
+        classifier_prompt=classifier_prompt,
+        extractor_prompt=extractor_prompt,
+        tmp_root=tmp_root,
+        batch_size=batch_size,
+        limit=limit,
+        on_progress=on_progress,
+        workers=workers,
+    )
+
+
+def _process_sequential(
+    *,
+    conn: sqlite3.Connection,
+    adapter: Ms365Adapter,
+    claude: ClaudeClient,
+    google: GoogleClients,
+    classifier_prompt: LoadedPrompt,
+    extractor_prompt: LoadedPrompt,
+    tmp_root: Path,
+    batch_size: int,
+    limit: int | None,
+    on_progress: Callable[[int, int, str], None] | None,
+) -> ProcessStats:
+    """Original sequential processing implementation."""
     stats = ProcessStats()
     http_client = SafeHttpClient()
 
@@ -231,6 +289,147 @@ def process_pending_emails(
 
     finally:
         http_client.close()
+
+
+def _get_thread_connection(db_path: Path | str | None) -> sqlite3.Connection:
+    """Get or create a SQLite connection for the current thread."""
+    if not hasattr(_thread_local, "conn"):
+        _thread_local.conn = connect(db_path)
+    conn: sqlite3.Connection = _thread_local.conn
+    return conn
+
+
+def _process_parallel(
+    *,
+    main_conn: sqlite3.Connection,
+    db_path: Path | str | None,
+    adapter: Ms365Adapter,
+    claude: ClaudeClient,
+    google: GoogleClients,
+    classifier_prompt: LoadedPrompt,
+    extractor_prompt: LoadedPrompt,
+    tmp_root: Path,
+    batch_size: int,
+    limit: int | None,
+    on_progress: Callable[[int, int, str], None] | None,
+    workers: int,
+) -> ProcessStats:
+    """Process pending emails using concurrent workers."""
+    # Query pending emails using main connection (single connection for reads)
+    emails = list(_pending_emails(main_conn, batch_size=batch_size, limit=limit))
+    total = len(emails)
+
+    # Load dismissed domains once (shared across workers)
+    dismissed_domains = _load_dismissed_domains(main_conn)
+
+    # Thread-safe stats
+    stats_lock = threading.Lock()
+    stats = ProcessStats()
+    completed_count = [0]  # Mutable container for nonlocal access
+    budget_exceeded = [False]  # Flag to stop new submissions
+
+    def process_worker(email_row: EmailRow) -> tuple[Outcome, FiledInvoice | None, str]:
+        """Worker function — runs in thread pool.
+
+        Returns (outcome, invoice, msg_id) for stats aggregation.
+        """
+        # Check if sender domain has been frequently dismissed
+        sender_domain = _extract_domain(email_row.from_addr)
+        if sender_domain and sender_domain in dismissed_domains:
+            conn = _get_thread_connection(db_path)
+            _update_email_outcome(conn, email_row.msg_id, "neither")
+            return "neither", None, email_row.msg_id
+
+        # Get thread-local connection
+        conn = _get_thread_connection(db_path)
+
+        # Each worker gets its own HTTP client
+        http_client = SafeHttpClient()
+        try:
+            outcome, invoice = _process_one(
+                conn=conn,
+                email_row=email_row,
+                adapter=adapter,
+                claude=claude,
+                google=google,
+                classifier_prompt=classifier_prompt,
+                extractor_prompt=extractor_prompt,
+                http_client=http_client,
+                tmp_root=tmp_root,
+            )
+            _update_email_outcome(conn, email_row.msg_id, outcome)
+            return outcome, invoice, email_row.msg_id
+        finally:
+            http_client.close()
+
+    # Process with thread pool
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        future_to_email = {
+            executor.submit(process_worker, email): email for email in emails
+        }
+
+        for future in as_completed(future_to_email):
+            email = future_to_email[future]
+
+            # Check if budget was exceeded — stop processing new results
+            if budget_exceeded[0]:
+                continue
+
+            try:
+                outcome, invoice, _msg_id = future.result()
+
+                with stats_lock:
+                    stats.processed += 1
+                    completed_count[0] += 1
+
+                    if outcome == "invoice":
+                        stats.classified_invoice += 1
+                        if invoice:
+                            if invoice.outcome == FilerOutcome.DUPLICATE_RESEND:
+                                stats.duplicates += 1
+                            else:
+                                stats.filed += 1
+                    elif outcome == "receipt":
+                        stats.classified_receipt += 1
+                        if invoice:
+                            stats.filed += 1
+                    elif outcome == "statement":
+                        stats.classified_statement += 1
+                    elif outcome == "neither":
+                        stats.classified_neither += 1
+                    elif outcome == "needs_manual_download":
+                        stats.needs_manual_download += 1
+
+                    if on_progress:
+                        on_progress(completed_count[0], total, f"Processed: {outcome}")
+
+            except BudgetExceededError:
+                # Signal to stop processing
+                budget_exceeded[0] = True
+                # Cancel pending futures
+                for f in future_to_email:
+                    f.cancel()
+            except PipelineError as err:
+                with stats_lock:
+                    stats.errors += 1
+                    stats.error_details.append(
+                        {"msg_id": email.msg_id, "error": str(err)}
+                    )
+                conn = _get_thread_connection(db_path)
+                _update_email_outcome(
+                    conn, email.msg_id, "error", error_code=err.error_code
+                )
+            except Exception as err:
+                with stats_lock:
+                    stats.errors += 1
+                    stats.error_details.append(
+                        {"msg_id": email.msg_id, "error": str(err)}
+                    )
+                conn = _get_thread_connection(db_path)
+                _update_email_outcome(conn, email.msg_id, "error", error_code="unexpected")
+
+    stats.cost_gbp = claude.budget.spent_gbp
+    return stats
 
 
 def _process_one(
@@ -454,6 +653,8 @@ __all__ = [
     "BACKFILL_BUDGET_GBP",
     "DEFAULT_BATCH_SIZE",
     "DEFAULT_BUDGET_GBP",
+    "DEFAULT_WORKERS",
+    "MAX_WORKERS",
     "Outcome",
     "ProcessStats",
     "process_pending_emails",

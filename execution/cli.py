@@ -747,6 +747,14 @@ def ingest_invoice_process(
         Path | None,
         typer.Option("--tmp", help="Override temp directory (default: .tmp)."),
     ] = None,
+    workers: Annotated[
+        int,
+        typer.Option("--workers", help="Number of concurrent workers (1-20)."),
+    ] = 5,
+    model: Annotated[
+        str,
+        typer.Option("--model", help="LLM provider: claude or openai."),
+    ] = "claude",
 ) -> None:
     """Classify, extract, and file pending emails as invoices.
 
@@ -756,6 +764,8 @@ def ingest_invoice_process(
     3. Filed to Google Drive and written to the ``invoices`` table.
 
     Use ``--backfill`` for initial bulk processing (higher budget, longer cache).
+    Use ``--workers N`` to process N emails in parallel (default: 5).
+    Use ``--model openai`` for cheaper bulk processing (GPT-4o-mini).
     """
     try:
         from execution.adapters.ms365 import Ms365Adapter, Ms365Auth
@@ -763,6 +773,7 @@ def ingest_invoice_process(
             BACKFILL_BUDGET_GBP,
             process_pending_emails,
         )
+        from execution.shared.budget import SharedBudget
         from execution.shared.claude_client import HAIKU, ClaudeClient
         from execution.shared.prompts import (
             CLASSIFIER_WEIGHTS,
@@ -771,14 +782,25 @@ def ingest_invoice_process(
         )
         from execution.shared.sheet import GoogleClients
 
+        # Validate model parameter
+        if model not in ("claude", "openai"):
+            emit_error(f"Invalid model: {model}. Must be 'claude' or 'openai'.")
+            raise typer.Exit(1)
+
+        if model == "openai":
+            # OpenAI support requires classifier/extractor updates - coming soon
+            emit_error("OpenAI model support is not yet implemented. Using Claude for now.")
+            # Fall through to use Claude
+
         conn = db_mod.connect(db_path)
         db_mod.apply_migrations(conn)
         run_id = _begin_run(conn, kind="invoice", operation="ingest_invoice")
 
-        # Setup Claude client with budget
+        # Setup budget and LLM client with thread-safe SharedBudget
         budget_gbp = BACKFILL_BUDGET_GBP if backfill else Decimal(budget)
+        shared_budget = SharedBudget(ceiling_gbp=budget_gbp)
         ttl = "1h" if backfill else "5m"
-        claude = ClaudeClient(budget_gbp=budget_gbp, ttl=ttl)
+        claude = ClaudeClient(shared_budget=shared_budget, ttl=ttl)
 
         # Load prompts
         classifier_prompt = load_prompt("classifier", model_id=HAIKU, weights=CLASSIFIER_WEIGHTS)
@@ -798,7 +820,7 @@ def ingest_invoice_process(
             # Update stats incrementally so interrupted runs show partial progress
             _update_run_stats(conn, run_id=run_id, stats={"processed": current, "total": total, "detail": detail})
 
-        emit_progress("process", 0, 0, "Starting invoice processing")
+        emit_progress("process", 0, 0, f"Starting invoice processing with {workers} worker(s)")
         try:
             stats = process_pending_emails(
                 conn,
@@ -810,6 +832,8 @@ def ingest_invoice_process(
                 tmp_root=resolved_tmp,
                 limit=limit,
                 on_progress=progress_callback,
+                workers=workers,
+                db_path=db_path,
             )
             _complete_run(
                 conn,

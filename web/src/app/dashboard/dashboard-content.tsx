@@ -81,6 +81,8 @@ export function DashboardContent() {
     limit?: number;
     backfillFrom: string;
     rescan: boolean;
+    workers: number;
+    model: "claude" | "openai";
   }>({
     dateFrom: "",
     dateTo: "",
@@ -88,6 +90,8 @@ export function DashboardContent() {
     limit: undefined,
     backfillFrom: "",
     rescan: false,
+    workers: 5,
+    model: "claude",
   });
 
   // Modal state for stale run detection
@@ -156,6 +160,11 @@ export function DashboardContent() {
     if (pipelineFilters.limit) options.limit = pipelineFilters.limit;
     if (pipelineFilters.backfillFrom) options.backfillFrom = pipelineFilters.backfillFrom;
     if (pipelineFilters.rescan) options.rescan = pipelineFilters.rescan;
+    // Only pass workers and model for processInvoices command
+    if (command === "processInvoices") {
+      options.workers = pipelineFilters.workers;
+      options.model = pipelineFilters.model;
+    }
 
     await stream.run(command, options);
   };
@@ -581,6 +590,49 @@ export function DashboardContent() {
                     Re-fetch emails even if already in the database. Clears their processing status so they get re-classified and re-extracted.
                   </p>
                 </div>
+
+                <div className="border-t pt-4">
+                  <h4 className="text-sm font-medium mb-3">Processing Settings</h4>
+                  <div className="grid gap-4 sm:grid-cols-2">
+                    <div className="space-y-2">
+                      <label className="text-sm font-medium">Concurrent workers</label>
+                      <div className="flex items-center gap-3">
+                        <input
+                          type="range"
+                          min={1}
+                          max={20}
+                          value={pipelineFilters.workers}
+                          onChange={(e) =>
+                            setPipelineFilters((f) => ({ ...f, workers: parseInt(e.target.value, 10) }))
+                          }
+                          className="flex-1 h-2 bg-muted rounded-lg appearance-none cursor-pointer"
+                        />
+                        <span className="text-sm font-mono tabular-nums w-6 text-right">
+                          {pipelineFilters.workers}
+                        </span>
+                      </div>
+                      <p className="text-xs text-muted-foreground">
+                        Process multiple emails in parallel. Higher = faster but uses more API quota.
+                      </p>
+                    </div>
+                    <div className="space-y-2">
+                      <label className="text-sm font-medium">LLM provider</label>
+                      <select
+                        value={pipelineFilters.model}
+                        onChange={(e) =>
+                          setPipelineFilters((f) => ({ ...f, model: e.target.value as "claude" | "openai" }))
+                        }
+                        className="w-full h-9 px-3 rounded-md border border-input bg-background text-sm"
+                      >
+                        <option value="claude">Claude (Haiku 4.5)</option>
+                        <option value="openai">OpenAI (GPT-4o-mini) — coming soon</option>
+                      </select>
+                      <p className="text-xs text-muted-foreground">
+                        Claude is more accurate. OpenAI is ~6x cheaper for bulk processing.
+                      </p>
+                    </div>
+                  </div>
+                </div>
               </div>
 
               {(pipelineFilters.senderSearch || pipelineFilters.dateFrom || pipelineFilters.dateTo || pipelineFilters.limit || pipelineFilters.backfillFrom || pipelineFilters.rescan) && (
@@ -603,7 +655,7 @@ export function DashboardContent() {
                     variant="ghost"
                     size="sm"
                     onClick={() =>
-                      setPipelineFilters({ dateFrom: "", dateTo: "", senderSearch: "", limit: undefined, backfillFrom: "", rescan: false })
+                      setPipelineFilters({ dateFrom: "", dateTo: "", senderSearch: "", limit: undefined, backfillFrom: "", rescan: false, workers: 5, model: "claude" })
                     }
                   >
                     Clear
