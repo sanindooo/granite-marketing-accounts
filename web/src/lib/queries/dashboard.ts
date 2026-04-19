@@ -239,15 +239,16 @@ export function getPendingActions(): PendingAction[] {
 
 export function dismissEmail(
   msgId: string,
-  reason: "not_invoice" | "resolved" | "duplicate"
-): void {
+  reason: "not_invoice" | "resolved" | "duplicate",
+  shouldBlockDomain?: boolean
+): string | null {
   const email = db
     .prepare("SELECT from_addr, subject FROM emails WHERE msg_id = ?")
     .get(msgId) as { from_addr: string; subject: string } | undefined;
 
-  if (!email) return;
+  if (!email) return null;
 
-  const domain = email.from_addr.split("@")[1] || "";
+  const domain = email.from_addr.split("@")[1]?.toLowerCase() || "";
 
   db.prepare(
     `UPDATE emails SET dismissed_at = datetime('now'), dismissed_reason = ? WHERE msg_id = ?`
@@ -257,4 +258,17 @@ export function dismissEmail(
     `INSERT INTO email_feedback (msg_id, feedback_type, feedback_value, from_addr, subject, sender_domain)
      VALUES (?, 'dismiss', ?, ?, ?, ?)`
   ).run(msgId, reason, email.from_addr, email.subject, domain);
+
+  if (shouldBlockDomain && domain) {
+    blockDomain(domain);
+    return domain;
+  }
+
+  return null;
+}
+
+export function blockDomain(domain: string): void {
+  db.prepare(
+    `INSERT OR REPLACE INTO blocked_domains (domain, blocked_at) VALUES (?, datetime('now'))`
+  ).run(domain.toLowerCase());
 }

@@ -5,6 +5,15 @@ import DOMPurify from "dompurify";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { Checkbox } from "@/components/ui/checkbox";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
 import {
   Table,
   TableBody,
@@ -22,8 +31,13 @@ interface EmailBody {
 
 interface NeedsAttentionCardProps {
   pendingActions: PendingAction[];
-  onDismiss: (msgId: string, reason: "not_invoice" | "resolved") => Promise<void>;
+  onDismiss: (msgId: string, reason: "not_invoice" | "resolved", blockDomain?: boolean) => Promise<void>;
   onUploadPdf: (msgId: string, file: File) => Promise<void>;
+}
+
+function extractDomain(email: string): string | null {
+  const match = email.match(/@([^@]+)$/);
+  return match ? match[1].toLowerCase() : null;
 }
 
 export function NeedsAttentionCard({ pendingActions, onDismiss, onUploadPdf }: NeedsAttentionCardProps) {
@@ -32,6 +46,23 @@ export function NeedsAttentionCard({ pendingActions, onDismiss, onUploadPdf }: N
   const [loadingBody, setLoadingBody] = useState(false);
   const [uploadingId, setUploadingId] = useState<string | null>(null);
   const fileInputRefs = useRef<Map<string, HTMLInputElement>>(new Map());
+
+  // Dismiss dialog state
+  const [dismissDialog, setDismissDialog] = useState<{
+    open: boolean;
+    msgId: string;
+    fromAddr: string;
+    blockDomain: boolean;
+  }>({ open: false, msgId: "", fromAddr: "", blockDomain: false });
+
+  const handleNotInvoiceClick = (msgId: string, fromAddr: string) => {
+    setDismissDialog({ open: true, msgId, fromAddr, blockDomain: false });
+  };
+
+  const handleConfirmDismiss = async () => {
+    await onDismiss(dismissDialog.msgId, "not_invoice", dismissDialog.blockDomain);
+    setDismissDialog({ open: false, msgId: "", fromAddr: "", blockDomain: false });
+  };
 
   const handleFileSelect = async (msgId: string, file: File | undefined) => {
     if (!file || !file.name.toLowerCase().endsWith(".pdf")) return;
@@ -163,7 +194,7 @@ export function NeedsAttentionCard({ pendingActions, onDismiss, onUploadPdf }: N
                         variant="ghost"
                         size="sm"
                         className="h-7 px-2 text-xs text-muted-foreground hover:text-foreground"
-                        onClick={() => onDismiss(action.msgId, "not_invoice")}
+                        onClick={() => handleNotInvoiceClick(action.msgId, action.fromAddr)}
                       >
                         Not Invoice
                       </Button>
@@ -213,6 +244,49 @@ export function NeedsAttentionCard({ pendingActions, onDismiss, onUploadPdf }: N
           Click + to view email content. Mark as &quot;Not Invoice&quot; to train the system, or &quot;Resolved&quot; if handled manually.
         </p>
       </CardContent>
+
+      <Dialog open={dismissDialog.open} onOpenChange={(open) => {
+        if (!open) setDismissDialog({ open: false, msgId: "", fromAddr: "", blockDomain: false });
+      }}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Mark as Not Invoice</DialogTitle>
+            <DialogDescription>
+              This email will be marked as not an invoice and removed from the attention list.
+            </DialogDescription>
+          </DialogHeader>
+          <div className="py-4">
+            <label className="flex items-start gap-3 cursor-pointer">
+              <Checkbox
+                checked={dismissDialog.blockDomain}
+                onCheckedChange={(checked) =>
+                  setDismissDialog((d) => ({ ...d, blockDomain: checked === true }))
+                }
+                className="mt-0.5"
+              />
+              <div>
+                <span className="text-sm font-medium">
+                  Block all emails from {extractDomain(dismissDialog.fromAddr)}
+                </span>
+                <p className="text-xs text-muted-foreground mt-1">
+                  Future emails from this domain will be automatically skipped during processing.
+                </p>
+              </div>
+            </label>
+          </div>
+          <DialogFooter>
+            <Button
+              variant="outline"
+              onClick={() => setDismissDialog({ open: false, msgId: "", fromAddr: "", blockDomain: false })}
+            >
+              Cancel
+            </Button>
+            <Button onClick={handleConfirmDismiss}>
+              Confirm
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </Card>
   );
 }

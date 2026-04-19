@@ -386,15 +386,20 @@ export function DashboardContent() {
       {pendingActions.length > 0 && (
         <NeedsAttentionCard
           pendingActions={pendingActions}
-          onDismiss={async (msgId, reason) => {
+          onDismiss={async (msgId, reason, blockDomain) => {
             await fetch("/api/emails/dismiss", {
               method: "POST",
               headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({ msgId, reason }),
+              body: JSON.stringify({ msgId, reason, blockDomain }),
             });
             const result = await fetchPendingActions();
             if (result.ok) setPendingActions(result.data);
-            toast.success(reason === "not_invoice" ? "Marked as not an invoice" : "Marked as resolved");
+            const message = blockDomain
+              ? "Marked as not an invoice and domain blocked"
+              : reason === "not_invoice"
+              ? "Marked as not an invoice"
+              : "Marked as resolved";
+            toast.success(message);
           }}
           onUploadPdf={async (msgId, file) => {
             const formData = new FormData();

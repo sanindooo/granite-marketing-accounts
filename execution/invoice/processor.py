@@ -47,11 +47,11 @@ from execution.invoice.filer import (
     file_invoice,
 )
 from execution.invoice.pdf_fetcher import FetchOutcome, FetchStatus, fetch_invoice_pdf
-from execution.shared.llm_client import LLMClient
 from execution.shared.clock import now_utc
 from execution.shared.db import connect
 from execution.shared.errors import BudgetExceededError, PipelineError
 from execution.shared.http import SafeHttpClient
+from execution.shared.llm_client import LLMClient
 from execution.shared.prompts import LoadedPrompt
 
 if TYPE_CHECKING:  # pragma: no cover
@@ -208,8 +208,8 @@ def _process_sequential(
     stats = ProcessStats()
     http_client = SafeHttpClient()
 
-    # Load dismissed sender domains for auto-skip (learning from user feedback)
-    dismissed_domains = _load_dismissed_domains(conn)
+    # Load explicitly blocked domains
+    blocked_domains = _load_blocked_domains(conn)
 
     # Get total count for progress reporting
     total = conn.execute(
@@ -221,14 +221,14 @@ def _process_sequential(
     try:
         for email_row in _pending_emails(conn, batch_size=batch_size, limit=limit):
             try:
-                # Check if sender domain has been frequently dismissed as "not_invoice"
+                # Skip explicitly blocked domains
                 sender_domain = _extract_domain(email_row.from_addr)
-                if sender_domain and sender_domain in dismissed_domains:
+                if sender_domain and sender_domain in blocked_domains:
                     _update_email_outcome(conn, email_row.msg_id, "neither")
                     stats.processed += 1
                     stats.classified_neither += 1
                     if on_progress:
-                        on_progress(stats.processed, total, "Processed: neither (learned)")
+                        on_progress(stats.processed, total, "Skipped: blocked domain")
                     continue
 
                 outcome, invoice = _process_one(
@@ -319,8 +319,8 @@ def _process_parallel(
     emails = list(_pending_emails(main_conn, batch_size=batch_size, limit=limit))
     total = len(emails)
 
-    # Load dismissed domains once (shared across workers)
-    dismissed_domains = _load_dismissed_domains(main_conn)
+    # Load explicitly blocked domains (shared across workers)
+    blocked_domains = _load_blocked_domains(main_conn)
 
     # Thread-safe stats
     stats_lock = threading.Lock()
@@ -333,9 +333,9 @@ def _process_parallel(
 
         Returns (outcome, invoice, msg_id) for stats aggregation.
         """
-        # Check if sender domain has been frequently dismissed
+        # Skip explicitly blocked domains
         sender_domain = _extract_domain(email_row.from_addr)
-        if sender_domain and sender_domain in dismissed_domains:
+        if sender_domain and sender_domain in blocked_domains:
             conn = _get_thread_connection(db_path)
             _update_email_outcome(conn, email_row.msg_id, "neither")
             return "neither", None, email_row.msg_id
@@ -617,26 +617,19 @@ def _extract_domain(email_addr: str) -> str | None:
     return email_addr.split("@")[-1].lower().strip()
 
 
-def _load_dismissed_domains(conn: sqlite3.Connection, threshold: int = 2) -> set[str]:
-    """Load sender domains that have been dismissed multiple times.
+def _load_blocked_domains(conn: sqlite3.Connection) -> set[str]:
+    """Load explicitly blocked sender domains.
 
-    Returns domains where the user has marked emails as "not_invoice" at least
-    `threshold` times. This enables learning from user feedback.
+    Returns domains the user has explicitly chosen to block.
+    These are always skipped without LLM classification.
     """
     try:
         rows = conn.execute(
-            """
-            SELECT sender_domain, COUNT(*) as dismiss_count
-            FROM email_feedback
-            WHERE feedback_type = 'dismiss' AND feedback_value = 'not_invoice'
-            GROUP BY sender_domain
-            HAVING dismiss_count >= ?
-            """,
-            (threshold,),
+            "SELECT domain FROM blocked_domains"
         ).fetchall()
         return {row[0] for row in rows if row[0]}
     except Exception:
-        # Table might not exist yet or other error - return empty set
+        # Table might not exist yet - return empty set
         return set()
 
 
