@@ -34,7 +34,9 @@ import pdfplumber
 from execution.invoice.category import resolve_category
 from execution.invoice.classifier import (
     EmailInput,
+    FeedbackExample,
     classify_email,
+    load_feedback_examples,
 )
 from execution.invoice.extractor import (
     ExtractorInput,
@@ -211,6 +213,9 @@ def _process_sequential(
     # Load explicitly blocked domains
     blocked_domains = _load_blocked_domains(conn)
 
+    # Load feedback examples for few-shot learning (once per run)
+    feedback_examples = load_feedback_examples(conn)
+
     # Get total count for progress reporting
     total = conn.execute(
         "SELECT COUNT(*) FROM emails WHERE processed_at IS NULL"
@@ -241,6 +246,7 @@ def _process_sequential(
                     extractor_prompt=extractor_prompt,
                     http_client=http_client,
                     tmp_root=tmp_root,
+                    feedback_examples=feedback_examples,
                 )
                 _update_email_outcome(conn, email_row.msg_id, outcome)
                 stats.processed += 1
@@ -322,6 +328,9 @@ def _process_parallel(
     # Load explicitly blocked domains (shared across workers)
     blocked_domains = _load_blocked_domains(main_conn)
 
+    # Load feedback examples for few-shot learning (once per run, shared across workers)
+    feedback_examples = load_feedback_examples(main_conn)
+
     # Thread-safe stats
     stats_lock = threading.Lock()
     stats = ProcessStats()
@@ -356,6 +365,7 @@ def _process_parallel(
                 extractor_prompt=extractor_prompt,
                 http_client=http_client,
                 tmp_root=tmp_root,
+                feedback_examples=feedback_examples,
             )
             _update_email_outcome(conn, email_row.msg_id, outcome)
             return outcome, invoice, email_row.msg_id
@@ -443,6 +453,7 @@ def _process_one(
     extractor_prompt: LoadedPrompt,
     http_client: SafeHttpClient,
     tmp_root: Path,
+    feedback_examples: list[FeedbackExample] | None = None,
 ) -> tuple[Outcome, FiledInvoice | None]:
     """Process a single email through the full pipeline."""
     # Fetch full body
@@ -454,7 +465,12 @@ def _process_one(
         sender=email_row.from_addr,
         body=body_text,
     )
-    result, _call = classify_email(llm_client, classifier_prompt, email_input)
+    result, _call = classify_email(
+        llm_client,
+        classifier_prompt,
+        email_input,
+        feedback_examples=feedback_examples,
+    )
 
     if result.classification not in ("invoice", "receipt"):
         return result.classification, None
