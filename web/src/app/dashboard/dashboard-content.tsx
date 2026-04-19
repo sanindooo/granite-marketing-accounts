@@ -33,6 +33,10 @@ function formatRunningStats(statsJson: string | null, operation: string): string
   if (!statsJson) return null;
   try {
     const stats = JSON.parse(statsJson);
+    // Empty stats means the job just started
+    if (Object.keys(stats).length === 0) {
+      return "Starting...";
+    }
     if (operation === "ingest_email") {
       const phase = stats.phase || "sync";
       const emails = stats.emails || 0;
@@ -42,13 +46,13 @@ function formatRunningStats(statsJson: string | null, operation: string): string
         if (scanned > 0) {
           return `Scanned ${scanned}: ${emails} new, ${skipped} already synced`;
         }
-        return `Found ${emails} new emails`;
+        return emails > 0 ? `Found ${emails} new emails` : "Searching inbox...";
       } else if (phase === "backfill_delta" || phase === "delta_setup") {
         return `Setting up incremental sync...`;
       } else if (phase === "incremental") {
         return `Synced ${emails} new emails`;
       } else {
-        return `Processing... (${emails} emails)`;
+        return emails > 0 ? `Processing ${emails} emails` : "Connecting...";
       }
     } else if (operation === "ingest_invoice") {
       const processed = stats.processed || 0;
@@ -644,7 +648,7 @@ export function DashboardContent() {
                         className="w-full h-9 px-3 rounded-md border border-input bg-background text-sm"
                       >
                         <option value="claude">Claude (Haiku 4.5)</option>
-                        <option value="openai">OpenAI (GPT-4o-mini) — coming soon</option>
+                        <option value="openai">OpenAI (GPT-4o-mini)</option>
                       </select>
                       <p className="text-xs text-muted-foreground">
                         Claude is more accurate. OpenAI is ~6x cheaper for bulk processing.
