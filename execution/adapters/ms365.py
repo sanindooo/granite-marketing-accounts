@@ -30,6 +30,7 @@ only when the classifier + extractor ask for it.
 
 from __future__ import annotations
 
+import threading
 from collections.abc import Iterator
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -238,7 +239,11 @@ class Ms365Auth:
 
 
 class Ms365Adapter:
-    """MS Graph inbox adapter."""
+    """MS Graph inbox adapter.
+
+    Thread-safe: each thread gets its own httpx.Client via thread-local storage.
+    This prevents SSL memory corruption when used with ThreadPoolExecutor.
+    """
 
     source_id: str = SOURCE_ID
 
@@ -251,22 +256,37 @@ class Ms365Adapter:
         page_size: int = DEFAULT_PAGE_SIZE,
     ) -> None:
         self._auth = auth
-        self._http = http
+        self._injected_http = http
         self._batch_size = batch_size
         self._page_size = page_size
+        self._local = threading.local()
+        self._clients_lock = threading.Lock()
+        self._thread_clients: list[httpx.Client] = []
 
     def _client(self) -> httpx.Client:
-        if self._http is not None:
-            return self._http
+        if self._injected_http is not None:
+            return self._injected_http
+
+        client = getattr(self._local, "client", None)
+        if client is not None:
+            return client
+
         import httpx
 
-        self._http = httpx.Client(timeout=httpx.Timeout(60.0, connect=10.0, read=120.0))
-        return self._http
+        client = httpx.Client(timeout=httpx.Timeout(60.0, connect=10.0, read=120.0))
+        self._local.client = client
+        with self._clients_lock:
+            self._thread_clients.append(client)
+        return client
 
     def close(self) -> None:
-        if self._http is not None:
-            self._http.close()
-            self._http = None
+        if self._injected_http is not None:
+            self._injected_http.close()
+            self._injected_http = None
+        with self._clients_lock:
+            for client in self._thread_clients:
+                client.close()
+            self._thread_clients.clear()
 
     def fetch_since(self, watermark: str | None) -> Iterator[list[RawEmail]]:
         """Yield batches of :class:`RawEmail` from the inbox delta query.
