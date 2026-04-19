@@ -6,11 +6,14 @@ import {
   getSyncCoverage as getCoverage,
   getPendingActions as getPending,
   getRunningJobs as getRunning,
+  getFxErrors as getFx,
+  getFxErrorCount as getFxCount,
   type DashboardMetrics,
   type LastRun,
   type SyncCoverage,
   type PendingAction,
   type RunningJob,
+  type FxError,
 } from "@/lib/queries/dashboard";
 import type { Result } from "@/lib/types";
 
@@ -100,6 +103,36 @@ export async function fetchRunningJobs(
   try {
     const jobs = getRunning(operation);
     return { ok: true, data: jobs };
+  } catch (error) {
+    return {
+      ok: false,
+      error: {
+        code: "FETCH_ERROR",
+        message: error instanceof Error ? error.message : "Unknown error",
+      },
+    };
+  }
+}
+
+export async function fetchFxErrors(): Promise<Result<FxError[]>> {
+  try {
+    const errors = getFx();
+    return { ok: true, data: errors };
+  } catch (error) {
+    return {
+      ok: false,
+      error: {
+        code: "FETCH_ERROR",
+        message: error instanceof Error ? error.message : "Unknown error",
+      },
+    };
+  }
+}
+
+export async function fetchFxErrorCount(): Promise<Result<number>> {
+  try {
+    const count = getFxCount();
+    return { ok: true, data: count };
   } catch (error) {
     return {
       ok: false,

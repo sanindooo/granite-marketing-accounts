@@ -16,17 +16,18 @@ import {
 } from "@/components/ui/table";
 import { getCurrentFY } from "@/lib/fiscal";
 import { formatCurrency, formatDateTime } from "@/lib/formatters";
-import type { DashboardMetrics, LastRun, SyncCoverage, PendingAction, RunningJob } from "@/lib/queries/dashboard";
-import { fetchDashboardMetrics, fetchLastRuns, fetchSyncCoverage, fetchPendingActions, cancelRun, fetchRunningJobs } from "@/lib/actions/dashboard";
+import type { DashboardMetrics, LastRun, SyncCoverage, PendingAction, RunningJob, FxError } from "@/lib/queries/dashboard";
+import { fetchDashboardMetrics, fetchLastRuns, fetchSyncCoverage, fetchPendingActions, cancelRun, fetchRunningJobs, fetchFxErrors } from "@/lib/actions/dashboard";
 import type { PipelineCommand, PipelineOptions } from "@/lib/types";
 import { usePipelineStream } from "@/hooks/use-pipeline-stream";
 import { NeedsAttentionCard } from "./needs-attention-card";
+import { FxErrorsCard } from "./fx-errors-card";
 import { StaleRunModal } from "./stale-run-modal";
 
 const PIPELINE_COMMANDS: { key: PipelineCommand; label: string; description: string }[] = [
   { key: "syncEmails", label: "Sync emails", description: "Fetch new invoices from MS365" },
   { key: "processInvoices", label: "Process invoices", description: "Classify and file invoices" },
-  { key: "runReconciliation", label: "Run reconciliation", description: "Match invoices to transactions" },
+  // Reconciliation hidden until real bank statement matching is implemented
 ];
 
 function formatRunningStats(statsJson: string | null, operation: string): string | null {
@@ -166,6 +167,7 @@ export function DashboardContent() {
   const [lastRuns, setLastRuns] = useState<LastRun[]>([]);
   const [syncCoverage, setSyncCoverage] = useState<SyncCoverage | null>(null);
   const [pendingActions, setPendingActions] = useState<PendingAction[]>([]);
+  const [fxErrors, setFxErrors] = useState<FxError[]>([]);
   const [loading, setLoading] = useState(true);
   const stream = usePipelineStream();
 
@@ -204,16 +206,18 @@ export function DashboardContent() {
   });
 
   const refreshAllData = useCallback(async () => {
-    const [metricsResult, runsResult, coverageResult, actionsResult] = await Promise.all([
+    const [metricsResult, runsResult, coverageResult, actionsResult, fxErrorsResult] = await Promise.all([
       fetchDashboardMetrics(fy),
       fetchLastRuns(),
       fetchSyncCoverage(),
       fetchPendingActions(),
+      fetchFxErrors(),
     ]);
     if (metricsResult.ok) setMetrics(metricsResult.data);
     if (runsResult.ok) setLastRuns(runsResult.data);
     if (coverageResult.ok) setSyncCoverage(coverageResult.data);
     if (actionsResult.ok) setPendingActions(actionsResult.data);
+    if (fxErrorsResult.ok) setFxErrors(fxErrorsResult.data);
   }, [fy]);
 
   useEffect(() => {
@@ -529,6 +533,8 @@ export function DashboardContent() {
           }}
         />
       )}
+
+      <FxErrorsCard fxErrors={fxErrors} />
 
       <Card>
         <CardHeader className="flex flex-row items-center justify-between">

@@ -301,3 +301,51 @@ export function bulkDismissEmails(
 
   return msgIds.length;
 }
+
+export interface FxError {
+  invoiceId: string;
+  vendorName: string;
+  currency: string;
+  amountGross: string;
+  invoiceDate: string;
+  fxError: string;
+}
+
+export function getFxErrors(): FxError[] {
+  const rows = db
+    .prepare(
+      `
+      SELECT invoice_id, vendor_name_raw, currency, amount_gross, invoice_date, fx_error
+      FROM invoices
+      WHERE fx_error IS NOT NULL AND deleted_at IS NULL
+      ORDER BY invoice_date DESC
+      LIMIT 50
+    `
+    )
+    .all() as {
+    invoice_id: string;
+    vendor_name_raw: string;
+    currency: string;
+    amount_gross: string;
+    invoice_date: string;
+    fx_error: string;
+  }[];
+
+  return rows.map((row) => ({
+    invoiceId: row.invoice_id,
+    vendorName: row.vendor_name_raw,
+    currency: row.currency,
+    amountGross: row.amount_gross,
+    invoiceDate: row.invoice_date,
+    fxError: row.fx_error,
+  }));
+}
+
+export function getFxErrorCount(): number {
+  const row = db
+    .prepare(
+      `SELECT COUNT(*) as count FROM invoices WHERE fx_error IS NOT NULL AND deleted_at IS NULL`
+    )
+    .get() as { count: number };
+  return row.count;
+}
