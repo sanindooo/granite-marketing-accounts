@@ -64,9 +64,9 @@ export async function fetchSyncCoverage(): Promise<Result<SyncCoverage>> {
   }
 }
 
-export async function fetchPendingActions(): Promise<Result<PendingAction[]>> {
+export async function fetchPendingActions(fy?: string): Promise<Result<PendingAction[]>> {
   try {
-    const actions = getPending();
+    const actions = getPending(fy);
     return { ok: true, data: actions };
   } catch (error) {
     return {

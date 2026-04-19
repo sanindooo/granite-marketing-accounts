@@ -1,5 +1,5 @@
 import { db } from "../db";
-import { fyBounds } from "../fiscal";
+import { fyBounds, fyBoundsOrAll } from "../fiscal";
 
 export interface DashboardMetrics {
   invoiceCount: number;
@@ -11,7 +11,12 @@ export interface DashboardMetrics {
 }
 
 export function getDashboardMetrics(fy: string): DashboardMetrics {
-  const { start, end } = fyBounds(fy);
+  const bounds = fyBoundsOrAll(fy);
+
+  // For "all" mode, use a very wide date range
+  const start = bounds?.start ?? "1900-01-01";
+  const end = bounds?.end ?? "2100-12-31";
+  const fyParam = fy === "all" ? "%" : fy;  // wildcard for recon status
 
   const result = db
     .prepare(
@@ -25,7 +30,7 @@ export function getDashboardMetrics(fy: string): DashboardMetrics {
     recon_status AS (
       SELECT state, COUNT(*) as count
       FROM reconciliation_rows
-      WHERE fiscal_year = ?
+      WHERE fiscal_year LIKE ?
       GROUP BY state
     ),
     category_breakdown AS (
@@ -58,7 +63,7 @@ export function getDashboardMetrics(fy: string): DashboardMetrics {
       (SELECT count FROM pending_emails) as pending_emails
   `
     )
-    .get(start, end, fy, start, end, start, end) as {
+    .get(start, end, fyParam, start, end, start, end) as {
     invoice_count: number;
     total_spend: number;
     recon_json: string;
@@ -208,19 +213,25 @@ export interface PendingAction {
   outcome: string;
 }
 
-export function getPendingActions(): PendingAction[] {
-  const rows = db
-    .prepare(
-      `
-      SELECT msg_id, from_addr, subject, received_at, outcome
-      FROM emails
-      WHERE outcome IN ('needs_manual_download', 'error', 'no_attachment')
-        AND dismissed_at IS NULL
-      ORDER BY received_at DESC
-      LIMIT 50
-    `
-    )
-    .all() as {
+export function getPendingActions(fy?: string): PendingAction[] {
+  const bounds = fy ? fyBoundsOrAll(fy) : null;
+
+  let query = `
+    SELECT msg_id, from_addr, subject, received_at, outcome
+    FROM emails
+    WHERE outcome IN ('needs_manual_download', 'error', 'no_attachment')
+      AND dismissed_at IS NULL
+  `;
+
+  const params: string[] = [];
+  if (bounds) {
+    query += " AND DATE(received_at) BETWEEN ? AND ?";
+    params.push(bounds.start, bounds.end);
+  }
+
+  query += " ORDER BY received_at DESC LIMIT 50";
+
+  const rows = db.prepare(query).all(...params) as {
     msg_id: string;
     from_addr: string;
     subject: string;

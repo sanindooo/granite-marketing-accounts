@@ -148,6 +148,7 @@ def process_pending_emails(
     tmp_root: Path,
     batch_size: int = DEFAULT_BATCH_SIZE,
     limit: int | None = None,
+    fy_filter: str | None = None,
     on_progress: Callable[[int, int, str], None] | None = None,
     workers: int = DEFAULT_WORKERS,
     db_path: Path | str | None = None,
@@ -160,6 +161,8 @@ def process_pending_emails(
         on_progress: Optional callback(current, total, detail) called after each email.
         workers: Number of concurrent workers (1-20). Default 1 for sequential processing.
         db_path: Database path for creating thread-local connections when workers > 1.
+        fy_filter: Optional fiscal year label (e.g., "FY-2025-26") to restrict processing
+            to emails received within that fiscal year.
     """
     workers = max(1, min(workers, MAX_WORKERS))
 
@@ -174,6 +177,7 @@ def process_pending_emails(
             tmp_root=tmp_root,
             batch_size=batch_size,
             limit=limit,
+            fy_filter=fy_filter,
             on_progress=on_progress,
         )
 
@@ -188,6 +192,7 @@ def process_pending_emails(
         tmp_root=tmp_root,
         batch_size=batch_size,
         limit=limit,
+        fy_filter=fy_filter,
         on_progress=on_progress,
         workers=workers,
     )
@@ -204,6 +209,7 @@ def _process_sequential(
     tmp_root: Path,
     batch_size: int,
     limit: int | None,
+    fy_filter: str | None,
     on_progress: Callable[[int, int, str], None] | None,
 ) -> ProcessStats:
     """Original sequential processing implementation."""
@@ -216,15 +222,13 @@ def _process_sequential(
     # Load feedback examples for few-shot learning (once per run)
     feedback_examples = load_feedback_examples(conn)
 
-    # Get total count for progress reporting
-    total = conn.execute(
-        "SELECT COUNT(*) FROM emails WHERE processed_at IS NULL"
-    ).fetchone()[0]
+    # Get total count for progress reporting (respecting FY filter)
+    total = _count_pending_emails(conn, fy_filter=fy_filter)
     if limit and limit < total:
         total = limit
 
     try:
-        for email_row in _pending_emails(conn, batch_size=batch_size, limit=limit):
+        for email_row in _pending_emails(conn, batch_size=batch_size, limit=limit, fy_filter=fy_filter):
             try:
                 # Skip explicitly blocked domains
                 sender_domain = _extract_domain(email_row.from_addr)
@@ -317,12 +321,13 @@ def _process_parallel(
     tmp_root: Path,
     batch_size: int,
     limit: int | None,
+    fy_filter: str | None,
     on_progress: Callable[[int, int, str], None] | None,
     workers: int,
 ) -> ProcessStats:
     """Process pending emails using concurrent workers."""
     # Query pending emails using main connection (single connection for reads)
-    emails = list(_pending_emails(main_conn, batch_size=batch_size, limit=limit))
+    emails = list(_pending_emails(main_conn, batch_size=batch_size, limit=limit, fy_filter=fy_filter))
     total = len(emails)
 
     # Load explicitly blocked domains (shared across workers)
@@ -546,18 +551,37 @@ def _pending_emails(
     *,
     batch_size: int = DEFAULT_BATCH_SIZE,
     limit: int | None = None,
+    fy_filter: str | None = None,
 ) -> Iterator[EmailRow]:
-    """Yield unprocessed email rows."""
-    query = """
+    """Yield unprocessed email rows.
+
+    Args:
+        conn: Database connection.
+        batch_size: Number of rows to fetch per batch.
+        limit: Maximum total emails to yield.
+        fy_filter: Optional fiscal year label (e.g., "FY-2025-26") to filter by received_at.
+    """
+    from execution.shared.fiscal import fy_bounds
+
+    params: list[str | int] = []
+    where_clauses = ["processed_at IS NULL"]
+
+    if fy_filter:
+        start, end = fy_bounds(fy_filter)
+        where_clauses.append("DATE(received_at) >= ? AND DATE(received_at) <= ?")
+        params.extend([start.isoformat(), end.isoformat()])
+
+    where_sql = " AND ".join(where_clauses)
+    query = f"""
         SELECT msg_id, source_adapter, from_addr, subject, received_at
         FROM emails
-        WHERE processed_at IS NULL
+        WHERE {where_sql}
         ORDER BY received_at ASC
     """
-    params: tuple[int, ...] = ()
+
     if limit:
         query += " LIMIT ?"
-        params = (limit,)
+        params.append(limit)
 
     cursor = conn.execute(query, params)
     while True:
@@ -572,6 +596,28 @@ def _pending_emails(
                 subject=row[3],
                 received_at=row[4],
             )
+
+
+def _count_pending_emails(
+    conn: sqlite3.Connection,
+    *,
+    fy_filter: str | None = None,
+) -> int:
+    """Count unprocessed emails, optionally filtered by fiscal year."""
+    from execution.shared.fiscal import fy_bounds
+
+    params: list[str] = []
+    where_clauses = ["processed_at IS NULL"]
+
+    if fy_filter:
+        start, end = fy_bounds(fy_filter)
+        where_clauses.append("DATE(received_at) >= ? AND DATE(received_at) <= ?")
+        params.extend([start.isoformat(), end.isoformat()])
+
+    where_sql = " AND ".join(where_clauses)
+    query = f"SELECT COUNT(*) FROM emails WHERE {where_sql}"
+
+    return conn.execute(query, params).fetchone()[0]
 
 
 def _update_email_outcome(

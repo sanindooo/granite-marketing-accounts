@@ -45,7 +45,7 @@ export function InvoiceFilters({ vendors, categories }: InvoiceFiltersProps) {
     setFilters({ search: value || null });
   }, 300);
 
-  const fys = getAvailableFYs();
+  const fys = getAvailableFYs(true); // include "all" option
 
   const clearFilters = () => {
     setLocalSearch("");
@@ -78,12 +78,14 @@ export function InvoiceFilters({ vendors, categories }: InvoiceFiltersProps) {
           onValueChange={(value) => setFilters({ fy: value })}
         >
           <SelectTrigger className="w-36">
-            <SelectValue placeholder="Fiscal Year" />
+            <SelectValue placeholder="Fiscal Year">
+              {filters.fy === "all" ? "All Years" : filters.fy}
+            </SelectValue>
           </SelectTrigger>
           <SelectContent>
             {fys.map((fy) => (
               <SelectItem key={fy} value={fy}>
-                {fy}
+                {fy === "all" ? "All Years" : fy}
               </SelectItem>
             ))}
           </SelectContent>

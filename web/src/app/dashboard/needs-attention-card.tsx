@@ -29,6 +29,7 @@ interface NeedsAttentionCardProps {
 }
 
 export function NeedsAttentionCard({ pendingActions, onDismiss, onBulkDismiss, onUploadPdf }: NeedsAttentionCardProps) {
+  const [isCollapsed, setIsCollapsed] = useState(true);
   const [expandedId, setExpandedId] = useState<string | null>(null);
   const [emailBody, setEmailBody] = useState<EmailBody | null>(null);
   const [loadingBody, setLoadingBody] = useState(false);
@@ -127,14 +128,20 @@ export function NeedsAttentionCard({ pendingActions, onDismiss, onBulkDismiss, o
 
   return (
     <Card className="border-amber-200 bg-amber-50/50">
-      <CardHeader>
+      <CardHeader
+        className="cursor-pointer select-none"
+        onClick={() => setIsCollapsed(!isCollapsed)}
+      >
         <div className="flex items-center justify-between">
           <CardTitle className="flex items-center gap-2 text-amber-800">
             <span className="inline-flex h-2 w-2 rounded-full bg-amber-500" />
             Needs Attention ({pendingActions.length})
+            <span className="ml-1 text-sm font-normal text-amber-600">
+              {isCollapsed ? "▸" : "▾"}
+            </span>
           </CardTitle>
-          {hasSelection && (
-            <div className="flex items-center gap-2">
+          {!isCollapsed && hasSelection && (
+            <div className="flex items-center gap-2" onClick={(e) => e.stopPropagation()}>
               <span className="text-sm text-muted-foreground">
                 {selectedIds.size} selected
               </span>
@@ -168,7 +175,7 @@ export function NeedsAttentionCard({ pendingActions, onDismiss, onBulkDismiss, o
           )}
         </div>
       </CardHeader>
-      <CardContent>
+      {!isCollapsed && <CardContent>
         <Table>
           <TableHeader>
             <TableRow>
@@ -342,7 +349,7 @@ export function NeedsAttentionCard({ pendingActions, onDismiss, onBulkDismiss, o
         <p className="mt-3 text-xs text-muted-foreground">
           Use checkboxes to select multiple emails for bulk actions. Click + to view email content.
         </p>
-      </CardContent>
+      </CardContent>}
     </Card>
   );
 }

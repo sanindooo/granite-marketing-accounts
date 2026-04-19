@@ -20,15 +20,20 @@ export function fyBounds(fy: string): { start: string; end: string } {
   };
 }
 
-export function getAvailableFYs(): string[] {
+export function getAvailableFYs(includeAll = false): string[] {
   const current = getCurrentFY();
   const match = current.match(/^FY-(\d{4})-(\d{2})$/);
-  if (!match) return [current];
+  if (!match) return includeAll ? ["all", current] : [current];
 
   const endYear = parseInt(match[1], 10);
-  const fys: string[] = [];
+  const fys: string[] = includeAll ? ["all"] : [];
   for (let y = endYear; y >= endYear - 3; y--) {
     fys.push(`FY-${y}-${(y + 1).toString().slice(-2)}`);
   }
   return fys;
+}
+
+export function fyBoundsOrAll(fy: string): { start: string; end: string } | null {
+  if (fy === "all") return null;
+  return fyBounds(fy);
 }

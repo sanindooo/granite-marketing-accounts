@@ -79,6 +79,7 @@ export function usePipelineStream() {
 
         const decoder = new TextDecoder();
         let buffer = "";
+        let receivedFinalEvent = false;
 
         while (true) {
           const { done, value } = await reader.read();
@@ -97,6 +98,7 @@ export function usePipelineStream() {
               if (event.event === "progress") {
                 setState((prev) => ({ ...prev, progress: event }));
               } else if (event.event === "complete") {
+                receivedFinalEvent = true;
                 setState({
                   isRunning: false,
                   activeCommand: null,
@@ -105,6 +107,7 @@ export function usePipelineStream() {
                   error: null,
                 });
               } else if (event.event === "error") {
+                receivedFinalEvent = true;
                 setState({
                   isRunning: false,
                   activeCommand: null,
@@ -117,6 +120,21 @@ export function usePipelineStream() {
               // Ignore parse errors
             }
           }
+        }
+
+        // Stream ended without a complete/error event - connection dropped unexpectedly
+        if (!receivedFinalEvent) {
+          setState({
+            isRunning: false,
+            activeCommand: null,
+            progress: null,
+            result: null,
+            error: {
+              event: "error",
+              message: "Connection lost. The job may still be running - check status after refresh.",
+              error_code: "stream_disconnected",
+            },
+          });
         }
       } catch (err) {
         if (err instanceof Error && err.name === "AbortError") {

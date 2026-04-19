@@ -48,8 +48,10 @@ function formatRunningStats(statsJson: string | null, operation: string): string
           return `Scanned ${scanned}: ${emails} new, ${skipped} already synced`;
         }
         return emails > 0 ? `Found ${emails} new emails` : "Searching inbox...";
-      } else if (phase === "backfill_delta" || phase === "delta_setup") {
-        return `Setting up incremental sync...`;
+      } else if (phase === "delta_setup") {
+        return `Sync done. Establishing checkpoint for future runs...`;
+      } else if (phase === "backfill_delta") {
+        return `Sync done. Establishing checkpoint (takes a few minutes for large inboxes)...`;
       } else if (phase === "incremental") {
         return `Synced ${emails} new emails`;
       } else {
@@ -93,14 +95,14 @@ function isRunStale(startedAt: string | null, statsJson: string | null): boolean
   const now = new Date();
   const diffMins = (now.getTime() - start.getTime()) / 60000;
 
-  // Consider stale if running > 5 minutes with no stats updates
-  // or > 15 minutes regardless of stats
+  // Consider stale if running > 2 minutes with no stats updates
+  // or > 10 minutes regardless of stats (long-running jobs should still update periodically)
   try {
     const stats = statsJson ? JSON.parse(statsJson) : {};
     const hasProgress = Object.keys(stats).length > 0;
-    return diffMins > 15 || (diffMins > 5 && !hasProgress);
+    return diffMins > 10 || (diffMins > 2 && !hasProgress);
   } catch {
-    return diffMins > 5;
+    return diffMins > 2;
   }
 }
 
@@ -181,6 +183,7 @@ export function DashboardContent() {
     rescan: boolean;
     workers: number;
     model: "claude" | "openai";
+    processFy: string;
   }>({
     dateFrom: "",
     dateTo: "",
@@ -190,6 +193,7 @@ export function DashboardContent() {
     rescan: false,
     workers: 5,
     model: "openai",
+    processFy: "",
   });
 
   // Modal state for stale run detection
@@ -210,7 +214,7 @@ export function DashboardContent() {
       fetchDashboardMetrics(fy),
       fetchLastRuns(),
       fetchSyncCoverage(),
-      fetchPendingActions(),
+fetchPendingActions(fy === "all" ? undefined : fy),
       fetchFxErrors(),
     ]);
     if (metricsResult.ok) setMetrics(metricsResult.data);
@@ -260,10 +264,13 @@ export function DashboardContent() {
     if (pipelineFilters.limit) options.limit = pipelineFilters.limit;
     if (pipelineFilters.backfillFrom) options.backfillFrom = pipelineFilters.backfillFrom;
     if (pipelineFilters.rescan) options.rescan = pipelineFilters.rescan;
-    // Only pass workers and model for processInvoices command
+    // Only pass workers, model, and processFy for processInvoices command
     if (command === "processInvoices") {
       options.workers = pipelineFilters.workers;
       options.model = pipelineFilters.model;
+      if (pipelineFilters.processFy) {
+        options.fiscalYear = pipelineFilters.processFy;
+      }
     }
 
     await stream.run(command, options);
@@ -338,7 +345,7 @@ export function DashboardContent() {
 
     const interval = setInterval(() => {
       refreshAllData();
-    }, 15000); // Poll every 15 seconds
+    }, 5000); // Poll every 5 seconds for responsive feedback
 
     return () => clearInterval(interval);
   }, [stream.isRunning, hasRunningInDb, refreshAllData]);
@@ -714,7 +721,25 @@ export function DashboardContent() {
 
                 <div className="border-t pt-4">
                   <h4 className="text-sm font-medium mb-3">Processing Settings</h4>
-                  <div className="grid gap-4 sm:grid-cols-2">
+                  <div className="grid gap-4 sm:grid-cols-3">
+                    <div className="space-y-2">
+                      <label className="text-sm font-medium">Fiscal year filter</label>
+                      <select
+                        value={pipelineFilters.processFy}
+                        onChange={(e) =>
+                          setPipelineFilters((f) => ({ ...f, processFy: e.target.value }))
+                        }
+                        className="w-full h-9 px-3 rounded-md border border-input bg-background text-sm"
+                      >
+                        <option value="">All pending emails</option>
+                        <option value="FY-2025-26">FY-2025-26 (Mar 2025 - Feb 2026)</option>
+                        <option value="FY-2024-25">FY-2024-25 (Mar 2024 - Feb 2025)</option>
+                        <option value="FY-2023-24">FY-2023-24 (Mar 2023 - Feb 2024)</option>
+                      </select>
+                      <p className="text-xs text-muted-foreground">
+                        Only process emails received in this fiscal year. Great for finding missing invoices.
+                      </p>
+                    </div>
                     <div className="space-y-2">
                       <label className="text-sm font-medium">Concurrent workers</label>
                       <div className="flex items-center gap-3">
@@ -756,7 +781,7 @@ export function DashboardContent() {
                 </div>
               </div>
 
-              {(pipelineFilters.senderSearch || pipelineFilters.dateFrom || pipelineFilters.dateTo || pipelineFilters.limit || pipelineFilters.backfillFrom || pipelineFilters.rescan) && (
+              {(pipelineFilters.senderSearch || pipelineFilters.dateFrom || pipelineFilters.dateTo || pipelineFilters.limit || pipelineFilters.backfillFrom || pipelineFilters.rescan || pipelineFilters.processFy) && (
                 <div className="flex items-center justify-between border-t pt-3">
                   <p className="text-sm text-muted-foreground">
                     {pipelineFilters.backfillFrom && (
@@ -771,12 +796,13 @@ export function DashboardContent() {
                     {!pipelineFilters.backfillFrom && pipelineFilters.dateTo && pipelineFilters.dateFrom && pipelineFilters.dateTo}
                     {pipelineFilters.limit && ` • Limit: ${pipelineFilters.limit}`}
                     {pipelineFilters.rescan && <span className="text-purple-600 font-medium"> • Re-scan mode</span>}
+                    {pipelineFilters.processFy && <span className="text-blue-600 font-medium"> • Process: {pipelineFilters.processFy}</span>}
                   </p>
                   <Button
                     variant="ghost"
                     size="sm"
                     onClick={() =>
-                      setPipelineFilters({ dateFrom: "", dateTo: "", senderSearch: "", limit: undefined, backfillFrom: "", rescan: false, workers: 5, model: "claude" })
+                      setPipelineFilters({ dateFrom: "", dateTo: "", senderSearch: "", limit: undefined, backfillFrom: "", rescan: false, workers: 5, model: "openai", processFy: "" })
                     }
                   >
                     Clear
@@ -859,12 +885,28 @@ export function DashboardContent() {
                         </div>
                         {isStale && (
                           <div className="rounded-md border border-red-200 bg-red-50 p-3">
-                            <p className="text-sm font-medium text-red-800">
-                              This job appears to be stuck
-                            </p>
-                            <p className="mt-1 text-xs text-red-700">
-                              {getStaleRunGuidance(dbOperation)}
-                            </p>
+                            <div className="flex items-start justify-between gap-4">
+                              <div>
+                                <p className="text-sm font-medium text-red-800">
+                                  This job appears to be stuck
+                                </p>
+                                <p className="mt-1 text-xs text-red-700">
+                                  {getStaleRunGuidance(dbOperation)}
+                                </p>
+                              </div>
+                              <Button
+                                variant="outline"
+                                size="sm"
+                                className="shrink-0 text-xs border-red-300 text-red-700 hover:bg-red-100"
+                                onClick={async () => {
+                                  await handleCancelRun(dbOperation as "ingest_email" | "ingest_invoice" | "reconcile");
+                                  await startCommand(cmd.key);
+                                }}
+                                disabled={stream.isRunning}
+                              >
+                                Cancel & Retry
+                              </Button>
+                            </div>
                           </div>
                         )}
                         {!isStale && (
@@ -897,17 +939,33 @@ export function DashboardContent() {
                           </p>
                         )}
                         {lastRun?.status === "error" && (
-                          <p className="text-xs text-red-600 mt-0.5">
-                            Something went wrong. Check the filters and try again.
-                          </p>
+                          <div className="flex items-center gap-2 mt-0.5">
+                            <p className="text-xs text-red-600">
+                              Something went wrong.
+                            </p>
+                            <Button
+                              variant="link"
+                              size="sm"
+                              className="h-auto p-0 text-xs text-red-600 hover:text-red-700"
+                              onClick={() => startCommand(cmd.key)}
+                              disabled={stream.isRunning}
+                            >
+                              Retry →
+                            </Button>
+                          </div>
                         )}
                       </div>
                     )}
                   </div>
                   <div className="flex gap-2">
-                    {isDbRunning && (
+                    {(isDbRunning || isThisRunning) && (
                       <Button
-                        onClick={() => handleCancelRun(dbOperation as "ingest_email" | "ingest_invoice" | "reconcile")}
+                        onClick={() => {
+                          if (isThisRunning) {
+                            stream.cancel();
+                          }
+                          handleCancelRun(dbOperation as "ingest_email" | "ingest_invoice" | "reconcile");
+                        }}
                         variant="outline"
                         size="sm"
                         className={isStale ? "text-red-600 hover:text-red-700 hover:bg-red-50" : ""}
@@ -917,10 +975,10 @@ export function DashboardContent() {
                     )}
                     <Button
                       onClick={() => handleRunCommand(cmd.key)}
-                      disabled={stream.isRunning}
+                      disabled={stream.isRunning || isDbRunning}
                       variant={isThisRunning ? "secondary" : "default"}
                     >
-                      {isThisRunning ? "Running..." : "Run"}
+                      {isThisRunning || isDbRunning ? "Running..." : "Run"}
                     </Button>
                   </div>
                 </div>

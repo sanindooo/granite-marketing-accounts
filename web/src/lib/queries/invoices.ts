@@ -1,6 +1,6 @@
 import { db } from "../db";
 import type { InvoiceRow, VendorRow } from "../types";
-import { fyBounds } from "../fiscal";
+import { fyBoundsOrAll } from "../fiscal";
 
 function escapeLike(input: string): string {
   return input.replace(/\\/g, "\\\\").replace(/%/g, "\\%").replace(/_/g, "\\_");
@@ -22,9 +22,12 @@ export function getInvoices(filters: InvoiceFilters = {}): InvoiceRow[] {
   const params: (string | number | null)[] = [];
 
   if (filters.fy) {
-    const { start, end } = fyBounds(filters.fy);
-    conditions.push("i.invoice_date BETWEEN ? AND ?");
-    params.push(start, end);
+    const bounds = fyBoundsOrAll(filters.fy);
+    if (bounds) {
+      conditions.push("i.invoice_date BETWEEN ? AND ?");
+      params.push(bounds.start, bounds.end);
+    }
+    // If "all", no date filter is added
   }
 
   if (filters.vendor) {
@@ -117,13 +120,15 @@ export function getCategories(): string[] {
 
 export function getInvoiceCount(fy?: string): number {
   if (fy) {
-    const { start, end } = fyBounds(fy);
-    const row = db
-      .prepare(
-        "SELECT COUNT(*) as count FROM invoices WHERE deleted_at IS NULL AND invoice_date BETWEEN ? AND ?"
-      )
-      .get(start, end) as { count: number };
-    return row.count;
+    const bounds = fyBoundsOrAll(fy);
+    if (bounds) {
+      const row = db
+        .prepare(
+          "SELECT COUNT(*) as count FROM invoices WHERE deleted_at IS NULL AND invoice_date BETWEEN ? AND ?"
+        )
+        .get(bounds.start, bounds.end) as { count: number };
+      return row.count;
+    }
   }
   const row = db
     .prepare("SELECT COUNT(*) as count FROM invoices WHERE deleted_at IS NULL")
@@ -136,9 +141,11 @@ export function getExceptionInvoices(fy?: string): InvoiceRow[] {
   const params: (string | number)[] = [];
 
   if (fy) {
-    const { start, end } = fyBounds(fy);
-    conditions.push("i.invoice_date BETWEEN ? AND ?");
-    params.push(start, end);
+    const bounds = fyBoundsOrAll(fy);
+    if (bounds) {
+      conditions.push("i.invoice_date BETWEEN ? AND ?");
+      params.push(bounds.start, bounds.end);
+    }
   }
 
   conditions.push(`

@@ -581,21 +581,12 @@ def ingest_email_ms365(
                         emit_progress("backfill_search", backfill_emails + updated, scanned, f"Scanned {scanned}: {backfill_emails} new, {updated} refreshed")
                     else:
                         emit_progress("backfill_search", backfill_emails, scanned, f"Scanned {scanned} emails: {backfill_emails} new, {skipped} already synced")
-                    _update_run_stats(conn, run_id=run_id, stats={"emails": backfill_emails, "skipped": skipped, "updated": updated, "scanned": scanned, "phase": "backfill"})
+                    stats = {"emails": backfill_emails, "skipped": skipped, "updated": updated, "scanned": scanned, "phase": "backfill"}
+                    _update_run_stats(conn, run_id=run_id, stats=stats)
                 emails += backfill_emails + updated
 
-                # Phase 2: Run delta sync to establish watermark for future runs
-                # We just need the watermark - skip DB checks since we already captured emails
-                emit_progress("backfill_delta", 0, 0, "Setting up incremental sync (this may take a while for large inboxes)")
-                delta_pages = 0
-                for batch in adapter.fetch_since(None):
-                    delta_pages += 1
-                    # Skip processing - we already have these emails from the search
-                    # Just iterate to get the watermark at the end
-                    emit_progress("backfill_delta", delta_pages, 0, f"Setting up sync... (page {delta_pages})")
-                _save_watermark(
-                    conn, SOURCE_ID, watermark=adapter.next_watermark, emit_count=emails
-                )
+                # Save date-based watermark for future incremental syncs
+                _save_date_watermark(conn, SOURCE_ID, emit_count=emails)
 
             # Search mode: use filters but don't set up delta sync
             elif sender or date_from or date_to:
@@ -637,14 +628,12 @@ def ingest_email_ms365(
                     else:
                         emit_progress("search", emails, scanned, f"Scanned {scanned} emails: {emails} new, {skipped} already synced")
 
-            # Standard delta sync
+            # Date-based incremental sync (faster than delta API)
             else:
-                watermark = None if initial else _load_watermark(conn, SOURCE_ID)
+                # Get the latest email date we've synced - that's our starting point
+                last_synced = None if initial else _get_last_synced_date(conn)
 
-                # First-run: do a full inbox scan, not delta sync
-                # Delta sync only returns emails that arrive AFTER initialization,
-                # so existing emails would be missed
-                if watermark is None:
+                if last_synced is None:
                     emit_progress("sync", 0, 0, "First run - scanning recent emails")
                     scanned = 0
                     for batch in adapter.search_inbox(max_pages=50):
@@ -661,31 +650,35 @@ def ingest_email_ms365(
                                     continue
                                 _upsert_email(conn, email.as_email_row())
                                 emails += 1
-                        emit_progress("sync", emails, scanned, f"Scanned {scanned} emails: {emails} new, {skipped} already synced")
-                        _update_run_stats(conn, run_id=run_id, stats={"emails": emails, "skipped": skipped, "scanned": scanned, "phase": "scan"})
-                    # Now set up delta sync for future runs - just get the watermark
-                    emit_progress("sync", emails, scanned, "Setting up incremental sync...")
-                    delta_pages = 0
-                    for batch in adapter.fetch_since(None):
-                        delta_pages += 1
-                        emit_progress("sync", emails, scanned, f"Setting up sync... (page {delta_pages})")
-                    _save_watermark(
-                        conn, SOURCE_ID, watermark=adapter.next_watermark, emit_count=emails
-                    )
+                        msg = f"Scanned {scanned}: {emails} new, {skipped} already synced"
+                        emit_progress("scan", emails, scanned, msg)
+                        stats = {"emails": emails, "skipped": skipped, "scanned": scanned, "phase": "scan"}
+                        _update_run_stats(conn, run_id=run_id, stats=stats)
+                    # Save latest date as watermark for future runs
+                    _save_date_watermark(conn, SOURCE_ID, emit_count=emails)
                 else:
-                    # Incremental sync with existing watermark
-                    emit_progress("sync", 0, 0, "Fetching new emails")
-                    for batch in adapter.fetch_since(watermark):
+                    # Incremental sync: fetch emails newer than our last sync
+                    emit_progress("sync", 0, 0, f"Fetching emails since {last_synced}")
+                    scanned = 0
+                    for batch in adapter.search_inbox(date_from=last_synced, max_pages=50):
                         batches += 1
-                        emails += len(batch)
                         with conn:
                             for email in batch:
+                                scanned += 1
+                                existing = conn.execute(
+                                    "SELECT 1 FROM emails WHERE msg_id = ?",
+                                    (email.msg_id,),
+                                ).fetchone()
+                                if existing:
+                                    skipped += 1
+                                    continue
                                 _upsert_email(conn, email.as_email_row())
-                        emit_progress("sync", emails, 0, f"Synced {emails} emails")
-                        _update_run_stats(conn, run_id=run_id, stats={"emails": emails, "phase": "incremental"})
-                    _save_watermark(
-                        conn, SOURCE_ID, watermark=adapter.next_watermark, emit_count=emails
-                    )
+                                emails += 1
+                        msg = f"Scanned {scanned}: {emails} new, {skipped} already synced"
+                        emit_progress("incremental", emails, scanned, msg)
+                        stats = {"emails": emails, "skipped": skipped, "scanned": scanned, "phase": "incremental"}
+                        _update_run_stats(conn, run_id=run_id, stats=stats)
+                    _save_date_watermark(conn, SOURCE_ID, emit_count=emails)
 
             _clear_reauth(conn, SOURCE_ID)
             _complete_run(
@@ -884,6 +877,10 @@ def ingest_invoice_process(
         int | None,
         typer.Option("--limit", help="Process at most N emails."),
     ] = None,
+    fy: Annotated[
+        str | None,
+        typer.Option("--fy", help="Filter to emails received in this fiscal year (e.g., FY-2025-26)."),
+    ] = None,
     tmp_root: Annotated[
         Path | None,
         typer.Option("--tmp", help="Override temp directory (default: .tmp)."),
@@ -907,6 +904,7 @@ def ingest_invoice_process(
     Use ``--backfill`` for initial bulk processing (higher budget, longer cache).
     Use ``--workers N`` to process N emails in parallel (default: 5).
     Use ``--model claude`` for Claude Haiku (more accurate, higher cost).
+    Use ``--fy FY-2025-26`` to process only emails from a specific fiscal year.
     """
     try:
         from execution.adapters.ms365 import Ms365Adapter, Ms365Auth
@@ -963,7 +961,8 @@ def ingest_invoice_process(
             # Update stats incrementally so interrupted runs show partial progress
             _update_run_stats(conn, run_id=run_id, stats={"processed": current, "total": total, "detail": detail})
 
-        emit_progress("process", 0, 0, f"Starting invoice processing with {workers} worker(s)")
+        fy_desc = f" for {fy}" if fy else ""
+        emit_progress("process", 0, 0, f"Starting invoice processing with {workers} worker(s){fy_desc}")
         try:
             stats = process_pending_emails(
                 conn,
@@ -974,6 +973,7 @@ def ingest_invoice_process(
                 extractor_prompt=extractor_prompt,
                 tmp_root=resolved_tmp,
                 limit=limit,
+                fy_filter=fy,
                 on_progress=progress_callback,
                 workers=workers,
                 db_path=db_path,
@@ -1407,6 +1407,42 @@ def _save_watermark(
                 last_emit_count = excluded.last_emit_count
             """,
             (source, watermark, now_utc().isoformat(), emit_count, 24),
+        )
+
+
+def _get_last_synced_date(conn: sqlite3.Connection) -> str | None:
+    """Get the date of the most recent synced email (YYYY-MM-DD format)."""
+    row = conn.execute(
+        "SELECT MAX(DATE(received_at)) as last_date FROM emails WHERE source_adapter = 'ms365'"
+    ).fetchone()
+    if row is None or row["last_date"] is None:
+        return None
+    return str(row["last_date"])
+
+
+def _save_date_watermark(
+    conn: sqlite3.Connection,
+    source: str,
+    *,
+    emit_count: int,
+) -> None:
+    """Save the current date as the watermark (simpler than delta links)."""
+    from execution.shared.clock import now_utc
+
+    today = now_utc().strftime("%Y-%m-%d")
+    with conn:
+        conn.execute(
+            """
+            INSERT INTO watermarks
+                (source, last_watermark, last_success_at, last_emit_count,
+                 expected_cadence_hours)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(source) DO UPDATE SET
+                last_watermark = excluded.last_watermark,
+                last_success_at = excluded.last_success_at,
+                last_emit_count = excluded.last_emit_count
+            """,
+            (source, today, now_utc().isoformat(), emit_count, 24),
         )
 
 

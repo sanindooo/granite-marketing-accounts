@@ -61,6 +61,10 @@ function buildArgs(command: PipelineCommand, options: z.infer<typeof commandSche
     args.push("--limit", String(options.limit));
   }
 
+  if (options.fiscalYear && command === "processInvoices") {
+    args.push("--fy", options.fiscalYear);
+  }
+
   if (options.workers && command === "processInvoices") {
     args.push("--workers", String(options.workers));
   }
