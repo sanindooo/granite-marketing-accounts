@@ -754,18 +754,18 @@ def ingest_invoice_process(
     model: Annotated[
         str,
         typer.Option("--model", help="LLM provider: claude or openai."),
-    ] = "claude",
+    ] = "openai",
 ) -> None:
     """Classify, extract, and file pending emails as invoices.
 
     Processes all emails with ``processed_at IS NULL``. Each email is:
-    1. Classified via Haiku 4.5 (invoice | receipt | statement | neither).
-    2. If invoice/receipt: PDF extracted, data extracted via Claude.
+    1. Classified via GPT-4o-mini or Claude Haiku (invoice | receipt | statement | neither).
+    2. If invoice/receipt: PDF extracted, data extracted via LLM.
     3. Filed to Google Drive and written to the ``invoices`` table.
 
     Use ``--backfill`` for initial bulk processing (higher budget, longer cache).
     Use ``--workers N`` to process N emails in parallel (default: 5).
-    Use ``--model openai`` for cheaper bulk processing (GPT-4o-mini).
+    Use ``--model claude`` for Claude Haiku (more accurate, higher cost).
     """
     try:
         from execution.adapters.ms365 import Ms365Adapter, Ms365Auth
@@ -787,11 +787,6 @@ def ingest_invoice_process(
             emit_error(f"Invalid model: {model}. Must be 'claude' or 'openai'.")
             raise typer.Exit(1)
 
-        if model == "openai":
-            # OpenAI support requires classifier/extractor updates - coming soon
-            emit_error("OpenAI model support is not yet implemented. Using Claude for now.")
-            # Fall through to use Claude
-
         conn = db_mod.connect(db_path)
         db_mod.apply_migrations(conn)
         run_id = _begin_run(conn, kind="invoice", operation="ingest_invoice")
@@ -799,12 +794,19 @@ def ingest_invoice_process(
         # Setup budget and LLM client with thread-safe SharedBudget
         budget_gbp = BACKFILL_BUDGET_GBP if backfill else Decimal(budget)
         shared_budget = SharedBudget(ceiling_gbp=budget_gbp)
-        ttl = "1h" if backfill else "5m"
-        claude = ClaudeClient(shared_budget=shared_budget, ttl=ttl)
 
-        # Load prompts
-        classifier_prompt = load_prompt("classifier", model_id=HAIKU, weights=CLASSIFIER_WEIGHTS)
-        extractor_prompt = load_prompt("extractor", model_id=HAIKU, weights=EXTRACTOR_WEIGHTS)
+        if model == "openai":
+            from execution.shared.openai_client import OpenAIClient
+            llm_client = OpenAIClient(budget=shared_budget)
+            model_id = "gpt-4o-mini"
+        else:
+            ttl = "1h" if backfill else "5m"
+            llm_client = ClaudeClient(shared_budget=shared_budget, ttl=ttl)
+            model_id = HAIKU
+
+        # Load prompts (model_id used for token estimation)
+        classifier_prompt = load_prompt("classifier", model_id=model_id, weights=CLASSIFIER_WEIGHTS)
+        extractor_prompt = load_prompt("extractor", model_id=model_id, weights=EXTRACTOR_WEIGHTS)
 
         # Setup adapters
         auth = Ms365Auth.from_keychain()
@@ -825,7 +827,7 @@ def ingest_invoice_process(
             stats = process_pending_emails(
                 conn,
                 adapter=adapter,
-                claude=claude,
+                llm_client=llm_client,
                 google=google,
                 classifier_prompt=classifier_prompt,
                 extractor_prompt=extractor_prompt,

@@ -20,8 +20,9 @@ from typing import TYPE_CHECKING, Final, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
-from execution.shared.claude_client import HAIKU, ClaudeCall, ClaudeClient
+from execution.shared.budget import LLMCall
 from execution.shared.errors import SchemaViolationError
+from execution.shared.llm_client import LLMClient
 
 if TYPE_CHECKING:  # pragma: no cover
     from execution.shared.prompts import LoadedPrompt
@@ -93,13 +94,13 @@ def build_user_content(email: EmailInput, *, max_body_chars: int = 4000) -> str:
 
 
 def classify_email(
-    client: ClaudeClient,
+    client: LLMClient,
     prompt: LoadedPrompt,
     email: EmailInput,
     *,
     max_tokens: int = DEFAULT_MAX_TOKENS,
     max_body_chars: int = 4000,
-) -> tuple[ClassifierResult, ClaudeCall]:
+) -> tuple[ClassifierResult, LLMCall]:
     """Classify ``email``. Returns the parsed result and the call record.
 
     Raises :class:`SchemaViolationError` on a malformed or schema-invalid
@@ -107,12 +108,11 @@ def classify_email(
     park the email in the Exceptions tab.
     """
     user_content = build_user_content(email, max_body_chars=max_body_chars)
-    text, call = client.call_with_cached_prompt(
+    text, call = client.complete(
         loaded_prompt=prompt,
         user_content=user_content,
         max_tokens=max_tokens,
         stage="classify",
-        model=HAIKU,
     )
     return _parse_response(text), call
 

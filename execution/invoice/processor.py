@@ -47,7 +47,7 @@ from execution.invoice.filer import (
     file_invoice,
 )
 from execution.invoice.pdf_fetcher import FetchOutcome, FetchStatus, fetch_invoice_pdf
-from execution.shared.claude_client import ClaudeClient
+from execution.shared.llm_client import LLMClient
 from execution.shared.clock import now_utc
 from execution.shared.db import connect
 from execution.shared.errors import BudgetExceededError, PipelineError
@@ -139,7 +139,7 @@ def process_pending_emails(
     conn: sqlite3.Connection,
     *,
     adapter: Ms365Adapter,
-    claude: ClaudeClient,
+    llm_client: LLMClient,
     google: GoogleClients,
     classifier_prompt: LoadedPrompt,
     extractor_prompt: LoadedPrompt,
@@ -165,7 +165,7 @@ def process_pending_emails(
         return _process_sequential(
             conn=conn,
             adapter=adapter,
-            claude=claude,
+            llm_client=llm_client,
             google=google,
             classifier_prompt=classifier_prompt,
             extractor_prompt=extractor_prompt,
@@ -179,7 +179,7 @@ def process_pending_emails(
         main_conn=conn,
         db_path=db_path,
         adapter=adapter,
-        claude=claude,
+        llm_client=llm_client,
         google=google,
         classifier_prompt=classifier_prompt,
         extractor_prompt=extractor_prompt,
@@ -195,7 +195,7 @@ def _process_sequential(
     *,
     conn: sqlite3.Connection,
     adapter: Ms365Adapter,
-    claude: ClaudeClient,
+    llm_client: LLMClient,
     google: GoogleClients,
     classifier_prompt: LoadedPrompt,
     extractor_prompt: LoadedPrompt,
@@ -235,7 +235,7 @@ def _process_sequential(
                     conn=conn,
                     email_row=email_row,
                     adapter=adapter,
-                    claude=claude,
+                    llm_client=llm_client,
                     google=google,
                     classifier_prompt=classifier_prompt,
                     extractor_prompt=extractor_prompt,
@@ -284,7 +284,7 @@ def _process_sequential(
                 )
                 _update_email_outcome(conn, email_row.msg_id, "error", error_code="unexpected")
 
-        stats.cost_gbp = claude.budget.spent_gbp
+        stats.cost_gbp = llm_client.budget.spent_gbp
         return stats
 
     finally:
@@ -304,7 +304,7 @@ def _process_parallel(
     main_conn: sqlite3.Connection,
     db_path: Path | str | None,
     adapter: Ms365Adapter,
-    claude: ClaudeClient,
+    llm_client: LLMClient,
     google: GoogleClients,
     classifier_prompt: LoadedPrompt,
     extractor_prompt: LoadedPrompt,
@@ -350,7 +350,7 @@ def _process_parallel(
                 conn=conn,
                 email_row=email_row,
                 adapter=adapter,
-                claude=claude,
+                llm_client=llm_client,
                 google=google,
                 classifier_prompt=classifier_prompt,
                 extractor_prompt=extractor_prompt,
@@ -428,7 +428,7 @@ def _process_parallel(
                 conn = _get_thread_connection(db_path)
                 _update_email_outcome(conn, email.msg_id, "error", error_code="unexpected")
 
-    stats.cost_gbp = claude.budget.spent_gbp
+    stats.cost_gbp = llm_client.budget.spent_gbp
     return stats
 
 
@@ -437,7 +437,7 @@ def _process_one(
     conn: sqlite3.Connection,
     email_row: EmailRow,
     adapter: Ms365Adapter,
-    claude: ClaudeClient,
+    llm_client: LLMClient,
     google: GoogleClients,
     classifier_prompt: LoadedPrompt,
     extractor_prompt: LoadedPrompt,
@@ -454,7 +454,7 @@ def _process_one(
         sender=email_row.from_addr,
         body=body_text,
     )
-    result, _call = classify_email(claude, classifier_prompt, email_input)
+    result, _call = classify_email(llm_client, classifier_prompt, email_input)
 
     if result.classification not in ("invoice", "receipt"):
         return result.classification, None
@@ -494,7 +494,7 @@ def _process_one(
         source_text=source_text,
         email_received_date=received_date,
     )
-    extraction_outcome = extract_invoice(claude, extractor_prompt, extractor_input)
+    extraction_outcome = extract_invoice(llm_client, extractor_prompt, extractor_input)
     extraction = extraction_outcome.result
 
     # Assign category

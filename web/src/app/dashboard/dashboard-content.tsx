@@ -91,7 +91,7 @@ export function DashboardContent() {
     backfillFrom: "",
     rescan: false,
     workers: 5,
-    model: "claude",
+    model: "openai",
   });
 
   // Modal state for stale run detection
