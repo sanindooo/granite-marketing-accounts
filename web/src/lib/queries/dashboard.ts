@@ -88,18 +88,28 @@ export interface LastRun {
 export function getLastRuns(): LastRun[] {
   const operations = ["ingest_email", "ingest_invoice", "reconcile"];
 
+  // Priority: show running jobs first, then most recent completed
+  // Stale detection is read-only; cleanup happens in CLI layer
   const rows = db
     .prepare(
       `
-      WITH ranked AS (
+      WITH running AS (
+        SELECT operation, completed_at, started_at, status, stats_json
+        FROM runs
+        WHERE operation IN ('ingest_email', 'ingest_invoice', 'reconcile')
+          AND status = 'running'
+      ),
+      latest AS (
         SELECT operation, completed_at, started_at, status, stats_json,
                ROW_NUMBER() OVER (PARTITION BY operation ORDER BY started_at DESC) as rn
         FROM runs
         WHERE operation IN ('ingest_email', 'ingest_invoice', 'reconcile')
+          AND status != 'running'
       )
-      SELECT operation, completed_at, started_at, status, stats_json
-      FROM ranked
-      WHERE rn = 1
+      SELECT operation, completed_at, started_at, status, stats_json FROM running
+      UNION ALL
+      SELECT operation, completed_at, started_at, status, stats_json FROM latest WHERE rn = 1
+        AND operation NOT IN (SELECT operation FROM running)
     `
     )
     .all() as { operation: string; completed_at: string | null; started_at: string | null; status: string; stats_json: string | null }[];
@@ -126,6 +136,7 @@ export interface RunningJob {
 }
 
 export function getRunningJobs(operation: string): RunningJob[] {
+  // Read-only query; stale cleanup happens in CLI layer
   const rows = db
     .prepare(
       `
@@ -143,6 +154,20 @@ export function getRunningJobs(operation: string): RunningJob[] {
     startedAt: row.started_at,
     statsJson: row.stats_json,
   }));
+}
+
+export function cancelRunningJobs(operation: string): number {
+  const result = db
+    .prepare(
+      `
+      UPDATE runs
+      SET status = 'cancelled', completed_at = datetime('now')
+      WHERE operation = ? AND status = 'running'
+    `
+    )
+    .run(operation);
+
+  return result.changes;
 }
 
 export interface SyncCoverage {

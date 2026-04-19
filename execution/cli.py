@@ -354,6 +354,13 @@ def ingest_email_ms365(
             help="Backfill historical emails from this date (YYYY-MM-DD), then set up delta sync for future runs.",
         ),
     ] = None,
+    rescan: Annotated[
+        bool,
+        typer.Option(
+            "--rescan",
+            help="Re-scan emails even if already in database. Updates existing records and clears processed status for re-processing.",
+        ),
+    ] = False,
 ) -> None:
     """Fetch new MS Graph inbox messages into the ``emails`` table.
 
@@ -364,6 +371,7 @@ def ingest_email_ms365(
     Use --sender to search for emails from a specific company (e.g., --sender uber).
     Use --from and --to to limit the date range.
     Use --backfill-from to capture historical emails and set up incremental sync.
+    Use --rescan to re-fetch emails that are already in the database.
     """
     try:
         from datetime import datetime, timedelta
@@ -399,43 +407,51 @@ def ingest_email_ms365(
             # Backfill mode: search historical + set up delta sync
             if backfill_from:
                 # Phase 1: Backfill historical emails via search
-                emit_progress("backfill_search", 0, 0, f"Searching emails from {backfill_from}")
+                rescan_msg = " (rescan mode)" if rescan else ""
+                emit_progress("backfill_search", 0, 0, f"Searching emails from {backfill_from}{rescan_msg}")
+                scanned = 0
+                updated = 0
                 for batch in adapter.search_inbox(date_from=backfill_from):
                     batches += 1
                     with conn:
                         for email in batch:
+                            scanned += 1
                             existing = conn.execute(
                                 "SELECT 1 FROM emails WHERE msg_id = ?",
                                 (email.msg_id,),
                             ).fetchone()
                             if existing:
-                                skipped += 1
+                                if rescan:
+                                    # Clear processed status so it gets re-processed
+                                    conn.execute(
+                                        """UPDATE emails SET
+                                            processed_at = NULL, outcome = NULL,
+                                            classifier_version = NULL, error_code = NULL
+                                        WHERE msg_id = ?""",
+                                        (email.msg_id,),
+                                    )
+                                    updated += 1
+                                else:
+                                    skipped += 1
                                 continue
                             _upsert_email(conn, email.as_email_row())
                             backfill_emails += 1
-                    emit_progress("backfill_search", backfill_emails, 0, f"Fetched {backfill_emails} emails")
-                    _update_run_stats(conn, run_id=run_id, stats={"emails": backfill_emails, "skipped": skipped, "phase": "backfill"})
-                emails += backfill_emails
+                    if rescan:
+                        emit_progress("backfill_search", backfill_emails + updated, scanned, f"Scanned {scanned}: {backfill_emails} new, {updated} refreshed")
+                    else:
+                        emit_progress("backfill_search", backfill_emails, scanned, f"Scanned {scanned} emails: {backfill_emails} new, {skipped} already synced")
+                    _update_run_stats(conn, run_id=run_id, stats={"emails": backfill_emails, "skipped": skipped, "updated": updated, "scanned": scanned, "phase": "backfill"})
+                emails += backfill_emails + updated
 
                 # Phase 2: Run delta sync to establish watermark for future runs
-                emit_progress("backfill_delta", 0, 0, "Setting up incremental sync")
-                delta_emails = 0
+                # We just need the watermark - skip DB checks since we already captured emails
+                emit_progress("backfill_delta", 0, 0, "Setting up incremental sync (this may take a while for large inboxes)")
+                delta_pages = 0
                 for batch in adapter.fetch_since(None):
-                    batches += 1
-                    with conn:
-                        for email in batch:
-                            existing = conn.execute(
-                                "SELECT 1 FROM emails WHERE msg_id = ?",
-                                (email.msg_id,),
-                            ).fetchone()
-                            if existing:
-                                skipped += 1
-                                continue
-                            _upsert_email(conn, email.as_email_row())
-                            delta_emails += 1
-                    emit_progress("backfill_delta", delta_emails, 0, f"Delta sync: {delta_emails} new emails")
-                    _update_run_stats(conn, run_id=run_id, stats={"emails": emails + delta_emails, "skipped": skipped, "phase": "delta"})
-                emails += delta_emails
+                    delta_pages += 1
+                    # Skip processing - we already have these emails from the search
+                    # Just iterate to get the watermark at the end
+                    emit_progress("backfill_delta", delta_pages, 0, f"Setting up sync... (page {delta_pages})")
                 _save_watermark(
                     conn, SOURCE_ID, watermark=adapter.next_watermark, emit_count=emails
                 )
@@ -443,24 +459,42 @@ def ingest_email_ms365(
             # Search mode: use filters but don't set up delta sync
             elif sender or date_from or date_to:
                 filter_desc = sender or date_from or "filtered"
-                emit_progress("search", 0, 0, f"Searching emails: {filter_desc}")
+                rescan_msg = " (rescan mode)" if rescan else ""
+                emit_progress("search", 0, 0, f"Searching emails: {filter_desc}{rescan_msg}")
+                scanned = 0
+                updated = 0
                 for batch in adapter.search_inbox(
                     sender=sender, date_from=date_from, date_to=date_to
                 ):
                     batches += 1
                     with conn:
                         for email in batch:
+                            scanned += 1
                             existing = conn.execute(
                                 "SELECT 1 FROM emails WHERE msg_id = ?",
                                 (email.msg_id,),
                             ).fetchone()
                             if existing:
-                                skipped += 1
+                                if rescan:
+                                    # Clear processed status so it gets re-processed
+                                    conn.execute(
+                                        """UPDATE emails SET
+                                            processed_at = NULL, outcome = NULL,
+                                            classifier_version = NULL, error_code = NULL
+                                        WHERE msg_id = ?""",
+                                        (email.msg_id,),
+                                    )
+                                    updated += 1
+                                else:
+                                    skipped += 1
                                 continue
                             _upsert_email(conn, email.as_email_row())
                             emails += 1
-                    _update_run_stats(conn, run_id=run_id, stats={"emails": emails, "skipped": skipped, "phase": "search"})
-                    emit_progress("search", emails, 0, f"Found {emails} new emails")
+                    _update_run_stats(conn, run_id=run_id, stats={"emails": emails, "skipped": skipped, "updated": updated, "scanned": scanned, "phase": "search"})
+                    if rescan:
+                        emit_progress("search", emails + updated, scanned, f"Scanned {scanned}: {emails} new, {updated} reset for re-processing")
+                    else:
+                        emit_progress("search", emails, scanned, f"Scanned {scanned} emails: {emails} new, {skipped} already synced")
 
             # Standard delta sync
             else:
@@ -470,11 +504,13 @@ def ingest_email_ms365(
                 # Delta sync only returns emails that arrive AFTER initialization,
                 # so existing emails would be missed
                 if watermark is None:
-                    emit_progress("sync", 0, 0, "First run - scanning full inbox")
+                    emit_progress("sync", 0, 0, "First run - scanning recent emails")
+                    scanned = 0
                     for batch in adapter.search_inbox(max_pages=50):
                         batches += 1
                         with conn:
                             for email in batch:
+                                scanned += 1
                                 existing = conn.execute(
                                     "SELECT 1 FROM emails WHERE msg_id = ?",
                                     (email.msg_id,),
@@ -484,22 +520,14 @@ def ingest_email_ms365(
                                     continue
                                 _upsert_email(conn, email.as_email_row())
                                 emails += 1
-                        emit_progress("sync", emails, 0, f"Scanned {emails} emails")
-                        _update_run_stats(conn, run_id=run_id, stats={"emails": emails, "skipped": skipped, "phase": "scan"})
-                    # Now set up delta sync for future runs
-                    emit_progress("sync", emails, 0, "Setting up incremental sync")
+                        emit_progress("sync", emails, scanned, f"Scanned {scanned} emails: {emails} new, {skipped} already synced")
+                        _update_run_stats(conn, run_id=run_id, stats={"emails": emails, "skipped": skipped, "scanned": scanned, "phase": "scan"})
+                    # Now set up delta sync for future runs - just get the watermark
+                    emit_progress("sync", emails, scanned, "Setting up incremental sync...")
+                    delta_pages = 0
                     for batch in adapter.fetch_since(None):
-                        # Just consume to get the watermark, skip duplicates
-                        with conn:
-                            for email in batch:
-                                existing = conn.execute(
-                                    "SELECT 1 FROM emails WHERE msg_id = ?",
-                                    (email.msg_id,),
-                                ).fetchone()
-                                if not existing:
-                                    _upsert_email(conn, email.as_email_row())
-                                    emails += 1
-                        _update_run_stats(conn, run_id=run_id, stats={"emails": emails, "skipped": skipped, "phase": "delta_setup"})
+                        delta_pages += 1
+                        emit_progress("sync", emails, scanned, f"Setting up sync... (page {delta_pages})")
                     _save_watermark(
                         conn, SOURCE_ID, watermark=adapter.next_watermark, emit_count=emails
                     )
@@ -1948,6 +1976,182 @@ def vendors_list(
     sys.stdout.write(_json.dumps(payload, default=str))
     sys.stdout.write("\n")
     sys.stdout.flush()
+
+
+# ---------------------------------------------------------------------------
+# runs subcommands (run management for agent-native parity)
+# ---------------------------------------------------------------------------
+
+
+runs_app = typer.Typer(name="runs", help="Manage pipeline runs.", no_args_is_help=True)
+app.add_typer(runs_app)
+
+
+@runs_app.command("list")
+def runs_list(
+    db_path: Annotated[Path | None, typer.Option("--db")] = None,
+    running: Annotated[
+        bool,
+        typer.Option("--running", "-r", help="Show only currently running jobs."),
+    ] = False,
+    limit: Annotated[
+        int,
+        typer.Option("--limit", "-n", help="Maximum number of runs to show."),
+    ] = 10,
+) -> None:
+    """List recent pipeline runs."""
+    import json as _json
+
+    conn = db_mod.connect(db_path)
+    db_mod.apply_migrations(conn)
+
+    if running:
+        rows = conn.execute(
+            """
+            SELECT run_id, operation, started_at, completed_at, status, stats_json
+            FROM runs
+            WHERE status = 'running'
+            ORDER BY started_at DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            """
+            SELECT run_id, operation, started_at, completed_at, status, stats_json
+            FROM runs
+            ORDER BY started_at DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+
+    conn.close()
+
+    runs = []
+    for row in rows:
+        stats = None
+        if row[5]:
+            try:
+                stats = _json.loads(row[5])
+            except _json.JSONDecodeError:
+                stats = None
+        runs.append({
+            "run_id": row[0],
+            "operation": row[1],
+            "started_at": row[2],
+            "completed_at": row[3],
+            "status": row[4],
+            "stats": stats,
+        })
+
+    emit_success({"count": len(runs), "runs": runs})
+
+
+@runs_app.command("cancel")
+def runs_cancel(
+    operation: Annotated[
+        str,
+        typer.Argument(help="Operation to cancel (ingest_email, ingest_invoice, reconcile)."),
+    ],
+    db_path: Annotated[Path | None, typer.Option("--db")] = None,
+) -> None:
+    """Cancel running jobs for an operation."""
+    valid_ops = {"ingest_email", "ingest_invoice", "reconcile"}
+    if operation not in valid_ops:
+        emit_error(ValueError(f"Invalid operation: {operation}. Must be one of: {', '.join(valid_ops)}"))
+        return
+
+    conn = db_mod.connect(db_path)
+    db_mod.apply_migrations(conn)
+
+    from execution.shared.clock import now_utc
+
+    with conn:
+        cursor = conn.execute(
+            """
+            UPDATE runs
+            SET status = 'cancelled', completed_at = ?
+            WHERE operation = ? AND status = 'running'
+            """,
+            (now_utc().isoformat(), operation),
+        )
+        cancelled = cursor.rowcount
+
+    conn.close()
+    emit_success({"cancelled": cancelled, "operation": operation})
+
+
+@runs_app.command("status")
+def runs_status(
+    run_id: Annotated[str, typer.Argument(help="The run ID to check.")],
+    db_path: Annotated[Path | None, typer.Option("--db")] = None,
+) -> None:
+    """Get detailed status of a specific run."""
+    import json as _json
+
+    conn = db_mod.connect(db_path)
+    db_mod.apply_migrations(conn)
+
+    row = conn.execute(
+        """
+        SELECT run_id, operation, started_at, completed_at, status, stats_json, cost_gbp
+        FROM runs
+        WHERE run_id = ?
+        """,
+        (run_id,),
+    ).fetchone()
+
+    conn.close()
+
+    if not row:
+        emit_error(ValueError(f"Run not found: {run_id}"))
+        return
+
+    stats = None
+    if row[5]:
+        try:
+            stats = _json.loads(row[5])
+        except _json.JSONDecodeError:
+            stats = None
+
+    emit_success({
+        "run_id": row[0],
+        "operation": row[1],
+        "started_at": row[2],
+        "completed_at": row[3],
+        "status": row[4],
+        "stats": stats,
+        "cost_gbp": row[6],
+    })
+
+
+@runs_app.command("cleanup")
+def runs_cleanup(
+    db_path: Annotated[Path | None, typer.Option("--db")] = None,
+) -> None:
+    """Clean up stale runs (running >1 hour) across all operations."""
+    conn = db_mod.connect(db_path)
+    db_mod.apply_migrations(conn)
+
+    from execution.shared.clock import now_utc
+
+    one_hour_ago = (now_utc() - timedelta(hours=1)).isoformat()
+
+    with conn:
+        cursor = conn.execute(
+            """
+            UPDATE runs
+            SET status = 'interrupted', completed_at = datetime('now')
+            WHERE status = 'running' AND started_at < ?
+            """,
+            (one_hour_ago,),
+        )
+        cleaned = cursor.rowcount
+
+    conn.close()
+    emit_success({"cleaned": cleaned})
 
 
 if __name__ == "__main__":

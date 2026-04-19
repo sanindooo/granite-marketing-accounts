@@ -80,18 +80,9 @@ export async function cancelRun(
   operation: "ingest_email" | "ingest_invoice" | "reconcile"
 ): Promise<Result<{ cancelled: number }>> {
   try {
-    const response = await fetch("http://localhost:3000/api/pipeline/cancel", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ operation }),
-    });
-
-    if (!response.ok) {
-      throw new Error("Failed to cancel run");
-    }
-
-    const data = await response.json();
-    return { ok: true, data: { cancelled: data.cancelled } };
+    const { cancelRunningJobs } = await import("@/lib/queries/dashboard");
+    const cancelled = cancelRunningJobs(operation);
+    return { ok: true, data: { cancelled } };
   } catch (error) {
     return {
       ok: false,
