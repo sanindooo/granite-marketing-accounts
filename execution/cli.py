@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import sqlite3
 import sys
-from datetime import date
+from datetime import date, timedelta
 from decimal import Decimal
 from pathlib import Path
 from typing import TYPE_CHECKING, Annotated
@@ -29,7 +29,13 @@ if TYPE_CHECKING:  # pragma: no cover
 import typer
 
 from execution.shared import db as db_mod
-from execution.shared.errors import ConfigError, PipelineError, emit_error, emit_progress, emit_success
+from execution.shared.errors import (
+    ConfigError,
+    PipelineError,
+    emit_error,
+    emit_progress,
+    emit_success,
+)
 from execution.shared.fiscal import london_today_fy
 from execution.shared.secrets import ensure_backend, is_mock
 
@@ -313,6 +319,13 @@ def ingest_email_ms365(
             help="Ignore the saved watermark and start a fresh delta sync.",
         ),
     ] = False,
+    reset: Annotated[
+        bool,
+        typer.Option(
+            "--reset",
+            help="Clear all synced emails and watermark, then do a full inbox search (90 days back).",
+        ),
+    ] = False,
     sender: Annotated[
         str | None,
         typer.Option(
@@ -353,10 +366,26 @@ def ingest_email_ms365(
     Use --backfill-from to capture historical emails and set up incremental sync.
     """
     try:
+        from datetime import datetime, timedelta
+
         from execution.adapters.ms365 import SOURCE_ID, Ms365Adapter, Ms365Auth
 
         conn = db_mod.connect(db_path)
         db_mod.apply_migrations(conn)
+
+        # Reset mode: clear everything and start fresh
+        if reset:
+            emit_progress("reset", 0, 0, "Clearing synced emails and watermark")
+            with conn:
+                # Delete in correct order due to foreign key constraints
+                conn.execute("DELETE FROM invoices")  # References emails, must go first
+                conn.execute("DELETE FROM emails WHERE source_adapter = 'ms365'")
+                conn.execute("DELETE FROM watermarks WHERE source = ?", (SOURCE_ID,))
+            # Set date_from to 90 days back for full resync
+            reset_from = (datetime.now() - timedelta(days=90)).strftime("%Y-%m-%d")
+            emit_progress("reset", 0, 0, f"Will search emails from {reset_from}")
+            date_from = reset_from
+
         run_id = _begin_run(conn, kind="email", operation="ingest_email")
 
         auth = Ms365Auth.from_keychain()
@@ -385,6 +414,7 @@ def ingest_email_ms365(
                             _upsert_email(conn, email.as_email_row())
                             backfill_emails += 1
                     emit_progress("backfill_search", backfill_emails, 0, f"Fetched {backfill_emails} emails")
+                    _update_run_stats(conn, run_id=run_id, stats={"emails": backfill_emails, "skipped": skipped, "phase": "backfill"})
                 emails += backfill_emails
 
                 # Phase 2: Run delta sync to establish watermark for future runs
@@ -404,6 +434,7 @@ def ingest_email_ms365(
                             _upsert_email(conn, email.as_email_row())
                             delta_emails += 1
                     emit_progress("backfill_delta", delta_emails, 0, f"Delta sync: {delta_emails} new emails")
+                    _update_run_stats(conn, run_id=run_id, stats={"emails": emails + delta_emails, "skipped": skipped, "phase": "delta"})
                 emails += delta_emails
                 _save_watermark(
                     conn, SOURCE_ID, watermark=adapter.next_watermark, emit_count=emails
@@ -428,27 +459,64 @@ def ingest_email_ms365(
                                 continue
                             _upsert_email(conn, email.as_email_row())
                             emails += 1
+                    _update_run_stats(conn, run_id=run_id, stats={"emails": emails, "skipped": skipped, "phase": "search"})
                     emit_progress("search", emails, 0, f"Found {emails} new emails")
 
             # Standard delta sync
             else:
                 watermark = None if initial else _load_watermark(conn, SOURCE_ID)
 
-                # First-run warning: no watermark means historical emails will be missed
-                if watermark is None and not initial:
-                    emit_progress("sync", 0, 0, "No prior sync found - consider using --backfill-from")
-
-                emit_progress("sync", 0, 0, "Fetching new emails")
-                for batch in adapter.fetch_since(watermark):
-                    batches += 1
-                    emails += len(batch)
-                    with conn:
-                        for email in batch:
-                            _upsert_email(conn, email.as_email_row())
-                    emit_progress("sync", emails, 0, f"Synced {emails} emails")
-                _save_watermark(
-                    conn, SOURCE_ID, watermark=adapter.next_watermark, emit_count=emails
-                )
+                # First-run: do a full inbox scan, not delta sync
+                # Delta sync only returns emails that arrive AFTER initialization,
+                # so existing emails would be missed
+                if watermark is None:
+                    emit_progress("sync", 0, 0, "First run - scanning full inbox")
+                    for batch in adapter.search_inbox(max_pages=50):
+                        batches += 1
+                        with conn:
+                            for email in batch:
+                                existing = conn.execute(
+                                    "SELECT 1 FROM emails WHERE msg_id = ?",
+                                    (email.msg_id,),
+                                ).fetchone()
+                                if existing:
+                                    skipped += 1
+                                    continue
+                                _upsert_email(conn, email.as_email_row())
+                                emails += 1
+                        emit_progress("sync", emails, 0, f"Scanned {emails} emails")
+                        _update_run_stats(conn, run_id=run_id, stats={"emails": emails, "skipped": skipped, "phase": "scan"})
+                    # Now set up delta sync for future runs
+                    emit_progress("sync", emails, 0, "Setting up incremental sync")
+                    for batch in adapter.fetch_since(None):
+                        # Just consume to get the watermark, skip duplicates
+                        with conn:
+                            for email in batch:
+                                existing = conn.execute(
+                                    "SELECT 1 FROM emails WHERE msg_id = ?",
+                                    (email.msg_id,),
+                                ).fetchone()
+                                if not existing:
+                                    _upsert_email(conn, email.as_email_row())
+                                    emails += 1
+                        _update_run_stats(conn, run_id=run_id, stats={"emails": emails, "skipped": skipped, "phase": "delta_setup"})
+                    _save_watermark(
+                        conn, SOURCE_ID, watermark=adapter.next_watermark, emit_count=emails
+                    )
+                else:
+                    # Incremental sync with existing watermark
+                    emit_progress("sync", 0, 0, "Fetching new emails")
+                    for batch in adapter.fetch_since(watermark):
+                        batches += 1
+                        emails += len(batch)
+                        with conn:
+                            for email in batch:
+                                _upsert_email(conn, email.as_email_row())
+                        emit_progress("sync", emails, 0, f"Synced {emails} emails")
+                        _update_run_stats(conn, run_id=run_id, stats={"emails": emails, "phase": "incremental"})
+                    _save_watermark(
+                        conn, SOURCE_ID, watermark=adapter.next_watermark, emit_count=emails
+                    )
 
             _clear_reauth(conn, SOURCE_ID)
             _complete_run(
@@ -495,6 +563,125 @@ def ingest_email_ms365(
             db_mod.apply_migrations(conn)
             _record_reauth(conn, err.source, message=str(err))
         emit_error(err)
+    except Exception as err:
+        emit_error(err)
+
+
+@ingest_email_app.command("body")
+def ingest_email_body(
+    msg_id: Annotated[str, typer.Argument(help="The message ID to fetch body for.")],
+) -> None:
+    """Fetch and return the email body for a given message ID."""
+    try:
+        from execution.adapters.ms365 import Ms365Adapter, Ms365Auth
+
+        auth = Ms365Auth.from_keychain()
+        adapter = Ms365Adapter(auth=auth)
+        try:
+            body_html, body_text = adapter.fetch_message_body_both(msg_id)
+            emit_success({
+                "msg_id": msg_id,
+                "body_html": body_html,
+                "body_text": body_text,
+            })
+        finally:
+            adapter.close()
+    except PipelineError as err:
+        emit_error(err)
+    except Exception as err:
+        emit_error(err)
+
+
+@ingest_email_app.command("pending")
+def ingest_email_pending(
+    db_path: Annotated[Path | None, typer.Option("--db")] = None,
+    limit: Annotated[int, typer.Option("--limit", help="Max items to return.")] = 50,
+) -> None:
+    """List emails that need attention (manual download, errors, no attachment)."""
+    try:
+        from execution.shared import db as db_mod
+
+        conn = db_mod.connect(db_path)
+        db_mod.apply_migrations(conn)
+        rows = conn.execute(
+            """
+            SELECT msg_id, from_addr, subject, received_at, outcome
+            FROM emails
+            WHERE outcome IN ('needs_manual_download', 'error', 'no_attachment')
+              AND dismissed_at IS NULL
+            ORDER BY received_at DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+        emit_success({
+            "count": len(rows),
+            "items": [
+                {
+                    "msg_id": r[0],
+                    "from_addr": r[1],
+                    "subject": r[2],
+                    "received_at": r[3],
+                    "outcome": r[4],
+                }
+                for r in rows
+            ],
+        })
+    except Exception as err:
+        emit_error(err)
+
+
+@ingest_email_app.command("dismiss")
+def ingest_email_dismiss(
+    msg_id: Annotated[str, typer.Argument(help="The message ID to dismiss.")],
+    reason: Annotated[
+        str,
+        typer.Option("--reason", help="Reason: not_invoice, resolved, or duplicate."),
+    ] = "resolved",
+    db_path: Annotated[Path | None, typer.Option("--db")] = None,
+) -> None:
+    """Dismiss an email from the needs-attention queue."""
+    try:
+        from execution.shared import db as db_mod
+        from execution.shared.clock import now_utc
+
+        valid_reasons = ("not_invoice", "resolved", "duplicate")
+        if reason not in valid_reasons:
+            emit_error(ValueError(f"Invalid reason. Must be one of: {valid_reasons}"))
+            return
+
+        conn = db_mod.connect(db_path)
+        db_mod.apply_migrations(conn)
+
+        row = conn.execute(
+            "SELECT from_addr, subject FROM emails WHERE msg_id = ?", (msg_id,)
+        ).fetchone()
+        if not row:
+            emit_error(ValueError(f"Email not found: {msg_id}"))
+            return
+
+        from_addr, subject = row
+        domain = from_addr.split("@")[1] if "@" in from_addr else ""
+        now = now_utc()
+
+        conn.execute(
+            "UPDATE emails SET dismissed_at = ?, dismissed_reason = ? WHERE msg_id = ?",
+            (now, reason, msg_id),
+        )
+        conn.execute(
+            """
+            INSERT INTO email_feedback (msg_id, feedback_type, feedback_value, from_addr, subject, sender_domain, created_at)
+            VALUES (?, 'dismiss', ?, ?, ?, ?, ?)
+            """,
+            (msg_id, reason, from_addr, subject, domain, now),
+        )
+        conn.commit()
+
+        emit_success({
+            "msg_id": msg_id,
+            "reason": reason,
+            "domain": domain,
+        })
     except Exception as err:
         emit_error(err)
 
@@ -548,8 +735,7 @@ def ingest_invoice_process(
             BACKFILL_BUDGET_GBP,
             process_pending_emails,
         )
-        from execution.shared.claude_client import ClaudeClient
-        from execution.shared.claude_client import HAIKU
+        from execution.shared.claude_client import HAIKU, ClaudeClient
         from execution.shared.prompts import (
             CLASSIFIER_WEIGHTS,
             EXTRACTOR_WEIGHTS,
@@ -581,6 +767,8 @@ def ingest_invoice_process(
 
         def progress_callback(current: int, total: int, detail: str) -> None:
             emit_progress("process", current, total, detail)
+            # Update stats incrementally so interrupted runs show partial progress
+            _update_run_stats(conn, run_id=run_id, stats={"processed": current, "total": total, "detail": detail})
 
         emit_progress("process", 0, 0, "Starting invoice processing")
         try:
@@ -628,6 +816,134 @@ def ingest_invoice_process(
             raise
         finally:
             adapter.close()
+
+    except PipelineError as err:
+        emit_error(err)
+    except Exception as err:
+        emit_error(err)
+
+
+@ingest_invoice_app.command("upload-pdf")
+def ingest_invoice_upload_pdf(
+    msg_id: Annotated[str, typer.Argument(help="The message ID to attach the PDF to.")],
+    pdf_path: Annotated[Path, typer.Argument(help="Path to the PDF file.")],
+    db_path: Annotated[Path | None, typer.Option("--db")] = None,
+    tmp_root: Annotated[
+        Path | None,
+        typer.Option("--tmp", help="Override temp directory (default: .tmp)."),
+    ] = None,
+) -> None:
+    """Upload a manually downloaded PDF for a flagged invoice.
+
+    Use this when the invoice PDF couldn't be auto-fetched (login-gated vendors,
+    expired URLs). The PDF will be extracted and filed to Google Drive.
+    """
+    try:
+        from datetime import date as date_type
+
+        from execution.invoice.category import resolve_category
+        from execution.invoice.extractor import ExtractorInput, extract_invoice
+        from execution.invoice.filer import FilerInput, file_invoice
+        from execution.shared.claude_client import HAIKU, ClaudeClient
+        from execution.shared.clock import now_utc
+        from execution.shared.prompts import EXTRACTOR_WEIGHTS, load_prompt
+        from execution.shared.sheet import GoogleClients
+
+        if not pdf_path.exists():
+            emit_error(FileNotFoundError(f"PDF not found: {pdf_path}"))
+            return
+
+        if pdf_path.suffix.lower() != ".pdf":
+            emit_error(ValueError("File must be a PDF"))
+            return
+
+        conn = db_mod.connect(db_path)
+        db_mod.apply_migrations(conn)
+
+        email = conn.execute(
+            "SELECT from_addr, subject, received_at, outcome FROM emails WHERE msg_id = ?",
+            (msg_id,),
+        ).fetchone()
+        if not email:
+            emit_error(ValueError(f"Email not found: {msg_id}"))
+            return
+
+        from_addr, subject, received_at, outcome = email
+        if outcome not in ("needs_manual_download", "error", "no_attachment"):
+            emit_error(ValueError(f"Email doesn't need manual upload (outcome: {outcome})"))
+            return
+
+        sender_domain = from_addr.split("@")[1] if "@" in from_addr else None
+        pdf_bytes = pdf_path.read_bytes()
+
+        # Extract text from PDF
+        import io
+
+        import pdfplumber
+
+        text_parts: list[str] = []
+        with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+            for page in pdf.pages:
+                text = page.extract_text()
+                if text:
+                    text_parts.append(text)
+        source_text = "\n\n".join(text_parts) if text_parts else ""
+
+        # Parse received date
+        received_date = date_type.fromisoformat(received_at[:10])
+
+        claude = ClaudeClient(budget_gbp=Decimal("1.00"), ttl="5m")
+        extractor_prompt = load_prompt("extractor", model_id=HAIKU, weights=EXTRACTOR_WEIGHTS)
+        google = GoogleClients.connect()
+
+        resolved_tmp = tmp_root or Path(".tmp")
+        resolved_tmp.mkdir(parents=True, exist_ok=True)
+
+        # Build extractor input
+        extractor_input = ExtractorInput(
+            subject=subject,
+            sender=from_addr,
+            source_text=source_text,
+            email_received_date=received_date,
+        )
+
+        # Run extraction
+        extraction_outcome = extract_invoice(claude, extractor_prompt, extractor_input)
+        extraction = extraction_outcome.result
+
+        # Resolve category
+        category_decision = resolve_category(
+            vendor_name=extraction.supplier_name,
+            sender_domain=sender_domain,
+        )
+
+        filer_input = FilerInput(
+            source_msg_id=msg_id,
+            attachment_index=0,
+            pdf_bytes=pdf_bytes,
+            extraction=extraction,
+            extractor_version=extractor_prompt.version,
+            invoice_number_confidence=extraction.field_confidence.invoice_number,
+            category=category_decision.category,
+            sender_domain=sender_domain,
+            tmp_root=resolved_tmp,
+        )
+
+        filed = file_invoice(google, conn, filer_input)
+
+        conn.execute(
+            "UPDATE emails SET processed_at = ?, outcome = ? WHERE msg_id = ?",
+            (now_utc(), "invoice", msg_id),
+        )
+        conn.commit()
+
+        emit_success({
+            "msg_id": msg_id,
+            "invoice_id": filed.invoice_id,
+            "outcome": filed.outcome.value,
+            "drive_file_id": filed.drive_file_id,
+            "vendor_id": filed.vendor_id,
+        })
 
     except PipelineError as err:
         emit_error(err)
@@ -1139,11 +1455,44 @@ def _stats_dict(stats: object) -> dict[str, object]:
     return {}
 
 
+def _cleanup_stale_runs(conn: sqlite3.Connection, *, operation: str) -> int:
+    """Mark runs stuck in 'running' for >1 hour as 'interrupted'.
+
+    Returns the number of runs cleaned up.
+    """
+    from execution.shared.clock import now_utc
+
+    one_hour_ago = (now_utc() - timedelta(hours=1)).isoformat()
+    with conn:
+        cursor = conn.execute(
+            """
+            UPDATE runs
+               SET status = 'interrupted',
+                   ended_at = datetime('now'),
+                   completed_at = datetime('now')
+             WHERE operation = ?
+               AND status = 'running'
+               AND started_at < ?
+            """,
+            (operation, one_hour_ago),
+        )
+        return cursor.rowcount
+
+
 def _begin_run(conn: sqlite3.Connection, *, kind: str, operation: str) -> str:
-    """Insert a ``runs`` record and return the generated ``run_id``."""
+    """Insert a ``runs`` record and return the generated ``run_id``.
+
+    Also cleans up any stale 'running' records for this operation that are
+    more than 1 hour old, marking them as 'interrupted'.
+    """
     import secrets as _rnd
 
     from execution.shared.clock import now_utc
+
+    # Cleanup stale runs first
+    cleaned = _cleanup_stale_runs(conn, operation=operation)
+    if cleaned > 0:
+        emit_progress("cleanup", cleaned, cleaned, f"Cleaned up {cleaned} stale run(s)")
 
     run_id = f"{kind}-{now_utc().strftime('%Y%m%dT%H%M%S')}-{_rnd.token_hex(4)}"
     with conn:
@@ -1155,6 +1504,19 @@ def _begin_run(conn: sqlite3.Connection, *, kind: str, operation: str) -> str:
             (run_id, operation, now_utc().isoformat()),
         )
     return run_id
+
+
+def _update_run_stats(conn: sqlite3.Connection, *, run_id: str, stats: dict[str, object]) -> None:
+    """Update stats_json for a running job (for incremental progress tracking)."""
+    import json as _json
+
+    with conn:
+        conn.execute(
+            """
+            UPDATE runs SET stats_json = ? WHERE run_id = ?
+            """,
+            (_json.dumps(stats, default=str), run_id),
+        )
 
 
 def _complete_run(
