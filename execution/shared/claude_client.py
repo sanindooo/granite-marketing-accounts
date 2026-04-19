@@ -21,7 +21,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from decimal import Decimal
-from typing import TYPE_CHECKING, Final, Literal
+from typing import TYPE_CHECKING, Any, Final, Literal
 
 import anthropic
 
@@ -30,6 +30,8 @@ from execution.shared.errors import BudgetExceededError, ConfigError
 
 if TYPE_CHECKING:  # pragma: no cover — anthropic ships types lazily
     from anthropic.types import Message
+
+    from execution.shared.prompts import LoadedPrompt
 
 Model = Literal["claude-haiku-4-5", "claude-sonnet-4-6"]
 CacheTTL = Literal["5m", "1h"]
@@ -198,6 +200,80 @@ class ClaudeClient:
         )
         self.budget.record(call)
         return call
+
+    def call_with_cached_prompt(
+        self,
+        *,
+        loaded_prompt: LoadedPrompt,
+        user_content: str,
+        max_tokens: int,
+        stage: Stage,
+        model: Model = HAIKU,
+        extra_system_suffix: str | None = None,
+    ) -> tuple[str, ClaudeCall]:
+        """Send a Messages call with ``loaded_prompt.text`` as a cached system block.
+
+        ``extra_system_suffix`` is appended as a *non-cached* second system
+        block — used by the extractor to inject per-invoice hints (e.g.
+        "This email's sender domain is zoom.us") without busting the cache.
+
+        Returns the raw response text and the :class:`ClaudeCall` record.
+        ``tools=[]`` is explicit: we never let Claude drive external calls
+        on adversary-controllable content (see plan § Prompt-injection
+        defense).
+        """
+        system: list[dict[str, Any]] = [
+            {
+                "type": "text",
+                "text": loaded_prompt.text,
+                "cache_control": {"type": "ephemeral", "ttl": self.ttl},
+            }
+        ]
+        if extra_system_suffix:
+            system.append({"type": "text", "text": extra_system_suffix})
+
+        self.budget.reserve(self._reserve_estimate(max_tokens, model))
+        msg = self._client.messages.create(
+            model=model,
+            max_tokens=max_tokens,
+            system=system,  # type: ignore[arg-type]
+            messages=[{"role": "user", "content": user_content}],
+            tools=[],
+        )
+        usage = ClaudeUsage.from_message(msg)
+        cost = estimate_cost_gbp(model, usage, self.ttl)
+        call = ClaudeCall(
+            model=model, stage=stage, usage=usage, cost_gbp=cost, ttl=self.ttl
+        )
+        self.budget.record(call)
+        return _extract_text(msg), call
+
+    @staticmethod
+    def _reserve_estimate(max_tokens: int, model: Model) -> Decimal:
+        """A rough per-call ceiling used for budget pre-check.
+
+        Cost upper-bounded by assuming a full cache-write on input (worst-case
+        5m TTL = 1.25x) and the full ``max_tokens`` on output. Keeps the
+        reservation pessimistic so ``BudgetExceededError`` fires *before* the
+        call, not after.
+        """
+        pricing = _PRICING[model]
+        # Pessimistic: 8k input tokens at cache-write + max_tokens output.
+        input_usd = Decimal(8192) * pricing["input"] * Decimal("1.25") / _PER_MTOK
+        output_usd = Decimal(max_tokens) * pricing["output"] / _PER_MTOK
+        return ((input_usd + output_usd) * _USD_TO_GBP).quantize(_FOUR_PLACES)
+
+
+def _extract_text(msg: Any) -> str:
+    """Collapse the ``content`` list of a Messages response into plain text."""
+    parts: list[str] = []
+    for block in getattr(msg, "content", None) or []:
+        text = getattr(block, "text", None)
+        if text is None and isinstance(block, dict):
+            text = block.get("text")
+        if text:
+            parts.append(str(text))
+    return "".join(parts)
 
 
 __all__ = [

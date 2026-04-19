@@ -1,0 +1,33 @@
+{
+  "type": "object",
+  "properties": {
+    "classification": {
+      "type": "string",
+      "enum": ["invoice", "receipt", "statement", "neither"]
+    },
+    "confidence": {
+      "type": "number"
+    },
+    "reasoning": {
+      "type": "string"
+    },
+    "signals": {
+      "type": "object",
+      "properties": {
+        "has_attachment_mentioned": { "type": "boolean" },
+        "sender_domain_known_vendor": { "type": "boolean" },
+        "contains_amount": { "type": "boolean" },
+        "looks_like_marketing": { "type": "boolean" }
+      },
+      "required": [
+        "has_attachment_mentioned",
+        "sender_domain_known_vendor",
+        "contains_amount",
+        "looks_like_marketing"
+      ],
+      "additionalProperties": false
+    }
+  },
+  "required": ["classification", "confidence", "reasoning", "signals"],
+  "additionalProperties": false
+}
