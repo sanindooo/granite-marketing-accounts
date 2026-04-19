@@ -4,12 +4,10 @@ import {
   getDashboardMetrics as getMetrics,
   getLastRuns as getRuns,
   getSyncCoverage as getCoverage,
-  getActiveRun as getActive,
   getPendingActions as getPending,
   type DashboardMetrics,
   type LastRun,
   type SyncCoverage,
-  type ActiveRun,
   type PendingAction,
 } from "@/lib/queries/dashboard";
 import type { Result } from "@/lib/types";
@@ -61,12 +59,10 @@ export async function fetchSyncCoverage(): Promise<Result<SyncCoverage>> {
   }
 }
 
-export async function fetchActiveRun(
-  operation: string
-): Promise<Result<ActiveRun | null>> {
+export async function fetchPendingActions(): Promise<Result<PendingAction[]>> {
   try {
-    const run = getActive(operation);
-    return { ok: true, data: run };
+    const actions = getPending();
+    return { ok: true, data: actions };
   } catch (error) {
     return {
       ok: false,
@@ -78,15 +74,27 @@ export async function fetchActiveRun(
   }
 }
 
-export async function fetchPendingActions(): Promise<Result<PendingAction[]>> {
+export async function cancelRun(
+  operation: "ingest_email" | "ingest_invoice" | "reconcile"
+): Promise<Result<{ cancelled: number }>> {
   try {
-    const actions = getPending();
-    return { ok: true, data: actions };
+    const response = await fetch("http://localhost:3000/api/pipeline/cancel", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ operation }),
+    });
+
+    if (!response.ok) {
+      throw new Error("Failed to cancel run");
+    }
+
+    const data = await response.json();
+    return { ok: true, data: { cancelled: data.cancelled } };
   } catch (error) {
     return {
       ok: false,
       error: {
-        code: "FETCH_ERROR",
+        code: "CANCEL_ERROR",
         message: error instanceof Error ? error.message : "Unknown error",
       },
     };

@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useQueryState, parseAsString } from "nuqs";
 import { toast } from "sonner";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -17,9 +17,10 @@ import {
 import { getCurrentFY } from "@/lib/fiscal";
 import { formatCurrency, formatDateTime } from "@/lib/formatters";
 import type { DashboardMetrics, LastRun, SyncCoverage, PendingAction } from "@/lib/queries/dashboard";
-import { fetchDashboardMetrics, fetchLastRuns, fetchSyncCoverage, fetchPendingActions } from "@/lib/actions/dashboard";
-import type { PipelineCommand, PipelineOptions } from "@/lib/actions/pipeline";
+import { fetchDashboardMetrics, fetchLastRuns, fetchSyncCoverage, fetchPendingActions, cancelRun } from "@/lib/actions/dashboard";
+import type { PipelineCommand, PipelineOptions } from "@/lib/types";
 import { usePipelineStream } from "@/hooks/use-pipeline-stream";
+import { NeedsAttentionCard } from "./needs-attention-card";
 
 const PIPELINE_COMMANDS: { key: PipelineCommand; label: string; description: string }[] = [
   { key: "syncEmails", label: "Sync emails", description: "Fetch new invoices from MS365" },
@@ -51,20 +52,24 @@ export function DashboardContent() {
     backfillFrom: "",
   });
 
+  const refreshAllData = useCallback(async () => {
+    const [metricsResult, runsResult, coverageResult, actionsResult] = await Promise.all([
+      fetchDashboardMetrics(fy),
+      fetchLastRuns(),
+      fetchSyncCoverage(),
+      fetchPendingActions(),
+    ]);
+    if (metricsResult.ok) setMetrics(metricsResult.data);
+    if (runsResult.ok) setLastRuns(runsResult.data);
+    if (coverageResult.ok) setSyncCoverage(coverageResult.data);
+    if (actionsResult.ok) setPendingActions(actionsResult.data);
+  }, [fy]);
+
   useEffect(() => {
     async function loadData() {
       setLoading(true);
       try {
-        const [metricsResult, runsResult, coverageResult, actionsResult] = await Promise.all([
-          fetchDashboardMetrics(fy),
-          fetchLastRuns(),
-          fetchSyncCoverage(),
-          fetchPendingActions(),
-        ]);
-        if (metricsResult.ok) setMetrics(metricsResult.data);
-        if (runsResult.ok) setLastRuns(runsResult.data);
-        if (coverageResult.ok) setSyncCoverage(coverageResult.data);
-        if (actionsResult.ok) setPendingActions(actionsResult.data);
+        await refreshAllData();
       } catch (err) {
         console.error("Failed to load metrics:", err);
       } finally {
@@ -72,7 +77,7 @@ export function DashboardContent() {
       }
     }
     loadData();
-  }, [fy]);
+  }, [refreshAllData]);
 
   const prevRunningRef = useRef(false);
 
@@ -95,17 +100,8 @@ export function DashboardContent() {
     if (wasRunning && !stream.isRunning) {
       if (stream.result) {
         toast.success("Command completed successfully");
-        Promise.all([
-          fetchDashboardMetrics(fy),
-          fetchLastRuns(),
-          fetchSyncCoverage(),
-          fetchPendingActions(),
-        ]).then(([metricsResult, runsResult, coverageResult, actionsResult]) => {
-          if (metricsResult.ok) setMetrics(metricsResult.data);
-          if (runsResult.ok) setLastRuns(runsResult.data);
-          if (coverageResult.ok) setSyncCoverage(coverageResult.data);
-          if (actionsResult.ok) setPendingActions(actionsResult.data);
-        });
+        // eslint-disable-next-line react-hooks/set-state-in-effect -- intentional: refreshing data after external process completes
+        refreshAllData();
       } else if (stream.error) {
         if (stream.error.error_code === "needs_reauth") {
           toast.error("Authentication expired", {
@@ -117,7 +113,29 @@ export function DashboardContent() {
         }
       }
     }
-  }, [stream.isRunning, stream.result, stream.error, fy]);
+  }, [stream.isRunning, stream.result, stream.error, refreshAllData]);
+
+  // Poll for updates when any run is active (either via stream or DB status)
+  const hasRunningInDb = lastRuns.some((r) => r.status === "running");
+  useEffect(() => {
+    if (!stream.isRunning && !hasRunningInDb) return;
+
+    const interval = setInterval(() => {
+      refreshAllData();
+    }, 15000); // Poll every 15 seconds
+
+    return () => clearInterval(interval);
+  }, [stream.isRunning, hasRunningInDb, refreshAllData]);
+
+  const handleCancelRun = async (operation: "ingest_email" | "ingest_invoice" | "reconcile") => {
+    const result = await cancelRun(operation);
+    if (result.ok) {
+      toast.success(`Cancelled ${result.data.cancelled} running job(s)`);
+      await refreshAllData();
+    } else {
+      toast.error("Failed to cancel run");
+    }
+  };
 
   if (loading) {
     return <div className="text-muted-foreground">Loading metrics...</div>;
@@ -250,56 +268,35 @@ export function DashboardContent() {
       </div>
 
       {pendingActions.length > 0 && (
-        <Card className="border-amber-200 bg-amber-50/50">
-          <CardHeader>
-            <CardTitle className="flex items-center gap-2 text-amber-800">
-              <span className="inline-flex h-2 w-2 rounded-full bg-amber-500" />
-              Needs Attention ({pendingActions.length})
-            </CardTitle>
-          </CardHeader>
-          <CardContent>
-            <Table>
-              <TableHeader>
-                <TableRow>
-                  <TableHead>From</TableHead>
-                  <TableHead>Subject</TableHead>
-                  <TableHead>Date</TableHead>
-                  <TableHead>Issue</TableHead>
-                </TableRow>
-              </TableHeader>
-              <TableBody>
-                {pendingActions.map((action) => (
-                  <TableRow key={action.msgId}>
-                    <TableCell className="max-w-32 truncate text-sm">
-                      {action.fromAddr}
-                    </TableCell>
-                    <TableCell className="max-w-64 truncate text-sm">
-                      {action.subject}
-                    </TableCell>
-                    <TableCell className="text-sm text-muted-foreground">
-                      {new Date(action.receivedAt).toLocaleDateString()}
-                    </TableCell>
-                    <TableCell>
-                      <span className={`inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium ${
-                        action.outcome === "needs_manual_download"
-                          ? "bg-amber-100 text-amber-800"
-                          : "bg-red-100 text-red-800"
-                      }`}>
-                        {action.outcome === "needs_manual_download"
-                          ? "Manual download needed"
-                          : "Processing error"}
-                      </span>
-                    </TableCell>
-                  </TableRow>
-                ))}
-              </TableBody>
-            </Table>
-            <p className="mt-3 text-xs text-muted-foreground">
-              These emails contain invoices that could not be automatically processed.
-              Visit the vendor portal to download the PDF manually.
-            </p>
-          </CardContent>
-        </Card>
+        <NeedsAttentionCard
+          pendingActions={pendingActions}
+          onDismiss={async (msgId, reason) => {
+            await fetch("/api/emails/dismiss", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ msgId, reason }),
+            });
+            const result = await fetchPendingActions();
+            if (result.ok) setPendingActions(result.data);
+            toast.success(reason === "not_invoice" ? "Marked as not an invoice" : "Marked as resolved");
+          }}
+          onUploadPdf={async (msgId, file) => {
+            const formData = new FormData();
+            formData.append("msgId", msgId);
+            formData.append("pdf", file);
+            const response = await fetch("/api/invoices/upload", {
+              method: "POST",
+              body: formData,
+            });
+            if (response.ok) {
+              toast.success("PDF uploaded and processed");
+              await refreshAllData();
+            } else {
+              const err = await response.json();
+              toast.error(err.error || "Upload failed");
+            }
+          }}
+        />
       )}
 
       <Card>
@@ -358,6 +355,12 @@ export function DashboardContent() {
                   </div>
                   <p className="text-xs text-muted-foreground">
                     Sync will search your inbox for emails from this sender and fetch new invoices
+                  </p>
+                </div>
+
+                <div className="space-y-2">
+                  <p className="text-xs text-muted-foreground">
+                    Set a date range to search your inbox for emails in that period. Without filters, sync only fetches emails that arrived since the last sync.
                   </p>
                 </div>
 
@@ -453,6 +456,7 @@ export function DashboardContent() {
               )}
             </div>
           )}
+
           <div className="space-y-4">
             {PIPELINE_COMMANDS.map((cmd) => {
               const lastRun = lastRuns.find(
@@ -467,6 +471,12 @@ export function DashboardContent() {
 
               const hasPending = cmd.key === "processInvoices" && metrics.pendingEmails > 0;
               const isThisRunning = stream.isRunning && stream.activeCommand === cmd.key;
+              const dbOperation = cmd.key === "syncEmails"
+                ? "ingest_email"
+                : cmd.key === "processInvoices"
+                ? "ingest_invoice"
+                : "reconcile";
+              const isStaleRunning = lastRun?.status === "running" && !isThisRunning;
 
               return (
                 <div
@@ -513,6 +523,8 @@ export function DashboardContent() {
                             className={
                               lastRun.status === "success" || lastRun.status === "ok"
                                 ? "ml-2 text-green-600"
+                                : lastRun.status === "running"
+                                ? "ml-2 text-amber-600"
                                 : "ml-2 text-red-600"
                             }
                           >
@@ -522,13 +534,25 @@ export function DashboardContent() {
                       </p>
                     )}
                   </div>
-                  <Button
-                    onClick={() => handleRunCommand(cmd.key)}
-                    disabled={stream.isRunning}
-                    variant={isThisRunning ? "secondary" : "default"}
-                  >
-                    {isThisRunning ? "Running..." : "Run"}
-                  </Button>
+                  <div className="flex gap-2">
+                    {isStaleRunning && (
+                      <Button
+                        onClick={() => handleCancelRun(dbOperation as "ingest_email" | "ingest_invoice" | "reconcile")}
+                        variant="outline"
+                        size="sm"
+                        className="text-red-600 hover:text-red-700 hover:bg-red-50"
+                      >
+                        Cancel
+                      </Button>
+                    )}
+                    <Button
+                      onClick={() => handleRunCommand(cmd.key)}
+                      disabled={stream.isRunning}
+                      variant={isThisRunning ? "secondary" : "default"}
+                    >
+                      {isThisRunning ? "Running..." : "Run"}
+                    </Button>
+                  </div>
                 </div>
               );
             })}
