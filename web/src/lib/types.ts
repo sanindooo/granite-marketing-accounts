@@ -8,7 +8,7 @@ export interface ActionError {
   userMessage?: string;
 }
 
-export interface InvoiceRow {
+export interface InvoiceListRow {
   invoice_id: string;
   source_msg_id: string;
   vendor_id: string;
@@ -21,19 +21,23 @@ export interface InvoiceRow {
   amount_gross: string;
   amount_gross_gbp: string | null;
   vat_rate: string | null;
-  vat_number_supplier: string | null;
-  reverse_charge: number;
   category: string;
   category_source: string;
   drive_file_id: string | null;
   drive_web_view_link: string | null;
+  last_exported_at: string | null;
+  deleted_at: string | null;
+  vendor_name?: string;
+}
+
+export interface InvoiceRow extends InvoiceListRow {
+  vat_number_supplier: string | null;
+  reverse_charge: number;
   confidence_json: string | null;
   classifier_version: string;
   hash_schema_version: number;
   is_business: number | null;
-  deleted_at: string | null;
   deleted_reason: string | null;
-  vendor_name?: string;
 }
 
 export interface VendorRow {
