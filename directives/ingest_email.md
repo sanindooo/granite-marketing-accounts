@@ -219,6 +219,10 @@ This is useful when:
 - You need to backfill historical invoices from a specific company
 - You're troubleshooting missing invoices from a particular sender
 
+> If `$search` returns 400 ("`$skip` is not supported"), the adapter is
+> doing manual `$skip` pagination — that's invalid for `$search` queries.
+> See `docs/solutions/integration-issues/ms365-search-pagination.md`.
+
 ## Backfill Mode
 
 For initial bulk processing of historical emails:
@@ -418,10 +422,22 @@ Use this to:
 
 ### "needs_reauth" Error
 
-MS365 token expired. Re-authenticate:
+Either MS365 or Google OAuth has expired. Two paths:
+
 ```bash
+# MS365 (email ingest)
 granite ops reauth ms365
+
+# Google (invoice filing → Drive + Sheets)
+granite ops reauth google
 ```
+
+The dashboard's Needs Attention card surfaces a red "Re-authenticate
+Google" banner whenever `error_code = needs_reauth` is observed on
+invoice-filing rows; clicking it runs the same command. Google reauth
+only deletes the cached token when Google explicitly returns
+`invalid_grant` — transient `RefreshError`s preserve it, so retry the
+run before reauthing.
 
 ### Budget Exhausted
 

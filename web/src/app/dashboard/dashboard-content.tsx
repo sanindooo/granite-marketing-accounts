@@ -583,10 +583,7 @@ fetchPendingActions(fy === "all" ? undefined : fy),
               toast.error(err.error || "Upload failed");
             }
           }}
-          onRetryAll={async () => {
-            await runRetry({});
-          }}
-          onRetrySelected={async (msgIds) => {
+          onRetry={async (msgIds) => {
             await runRetry({ msgIds });
           }}
           onReauthGoogle={async () => {

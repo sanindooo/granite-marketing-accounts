@@ -1485,6 +1485,13 @@ def ingest_invoice_retry_errors(
                 "confirm.",
                 source="cli",
             )
+        if msg_ids and outcomes != "error,needs_manual_download,no_attachment":
+            raise ConfigError(
+                "--outcomes is not compatible with --msg-id; the targeted "
+                "path always skips already-classified rows regardless of "
+                "outcome.",
+                source="cli",
+            )
 
         conn = db_mod.connect(db_path)
         db_mod.apply_migrations(conn)

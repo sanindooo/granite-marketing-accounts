@@ -1,4 +1,5 @@
 import { spawn } from "child_process";
+import { getGraniteBinary, getProjectRoot } from "@/lib/spawn-granite";
 
 export const runtime = "nodejs";
 
@@ -7,11 +8,10 @@ export const runtime = "nodejs";
 // refresh-token-capable token to .state/token.json. Blocking on the user
 // completing the browser flow (including 2FA if their account requires it).
 export async function POST(request: Request) {
-  const projectRoot = process.cwd().replace("/web", "");
-  const granitePath = `${projectRoot}/.venv/bin/granite`;
+  const projectRoot = getProjectRoot();
 
   return new Promise<Response>((resolve) => {
-    const proc = spawn(granitePath, ["ops", "reauth", "google"], {
+    const proc = spawn(getGraniteBinary(), ["ops", "reauth", "google"], {
       cwd: projectRoot,
       shell: false,
       env: { ...process.env },

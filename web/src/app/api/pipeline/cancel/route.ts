@@ -1,5 +1,6 @@
 import Database from "better-sqlite3";
 import { z } from "zod";
+import { getProjectRoot } from "@/lib/spawn-granite";
 
 export const runtime = "nodejs";
 
@@ -20,8 +21,7 @@ export async function POST(request: Request) {
 
   const { operation } = result.data;
 
-  const projectRoot = process.cwd().replace("/web", "");
-  const dbPath = `${projectRoot}/.state/pipeline.db`;
+  const dbPath = `${getProjectRoot()}/.state/pipeline.db`;
 
   try {
     const db = new Database(dbPath);

@@ -1,5 +1,6 @@
 import { spawn } from "child_process";
 import { z } from "zod";
+import { getGraniteBinary, getProjectRoot } from "@/lib/spawn-granite";
 
 export const runtime = "nodejs";
 
@@ -58,8 +59,8 @@ export async function POST(request: Request) {
     );
   }
 
-  const projectRoot = process.cwd().replace("/web", "");
-  const granitePath = `${projectRoot}/.venv/bin/granite`;
+  const projectRoot = getProjectRoot();
+  const granitePath = getGraniteBinary();
 
   const args = ["ingest", "invoice", "retry-errors"];
   if (parsed.msgIds && parsed.msgIds.length > 0) {

@@ -427,7 +427,7 @@ class TestLazyGoogleClients:
 
         monkeypatch.setattr(sheet_mod.GoogleClients, "connect", explode)
         proxy = sheet_mod.LazyGoogleClients()
-        assert proxy.is_connected is False
+        assert proxy._impl is None
         assert connect_calls[0] == 0
 
     def test_first_access_calls_connect_then_caches(
@@ -449,11 +449,10 @@ class TestLazyGoogleClients:
 
         proxy = sheet_mod.LazyGoogleClients(allow_interactive=False)
         assert proxy.drive is fake
-        assert proxy.creds == "C"
         assert proxy.sheets == "S"
         # Connect should be called exactly once (cached after first call):
         assert connect_calls[0] == 1
-        assert proxy.is_connected is True
+        assert proxy._impl is impl
 
     def test_failure_poisons_proxy_and_re_raises(
         self, monkeypatch: pytest.MonkeyPatch
@@ -482,7 +481,7 @@ class TestLazyGoogleClients:
         with pytest.raises(AuthExpiredError):
             _ = proxy.sheets
         with pytest.raises(AuthExpiredError):
-            _ = proxy.creds
+            _ = proxy.gspread
         assert connect_calls[0] == 1, "must not retry after first auth failure"
 
     def test_preconnected_bypasses_oauth(self) -> None:
@@ -494,6 +493,5 @@ class TestLazyGoogleClients:
             {"creds": "C", "drive": "D", "sheets": "S", "gspread": "G"},
         )()
         proxy = sheet_mod.LazyGoogleClients(preconnected=fake_impl)
-        assert proxy.is_connected is True
+        assert proxy._impl is fake_impl
         assert proxy.drive == "D"
-        assert proxy.creds == "C"

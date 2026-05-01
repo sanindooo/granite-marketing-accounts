@@ -1,6 +1,6 @@
 "use client";
 
-import { Fragment, useState, useRef } from "react";
+import { Fragment, useMemo, useState, useRef } from "react";
 import DOMPurify from "dompurify";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
@@ -41,24 +41,22 @@ interface NeedsAttentionCardProps {
   onDismiss: (msgId: string, reason: "not_invoice" | "resolved", blockDomain?: boolean) => Promise<void>;
   onBulkDismiss: (msgIds: string[], reason: "not_invoice" | "resolved") => Promise<void>;
   onUploadPdf: (msgId: string, file: File) => Promise<void>;
-  onRetryAll?: () => Promise<void>;
-  onRetrySelected?: (msgIds: string[]) => Promise<void>;
+  // Single retry callback. Pass an array for "Retry selected", omit for
+  // "Retry all". Both buttons gate on the same `retrying` state.
+  onRetry?: (msgIds?: string[]) => Promise<void>;
   onReauthGoogle?: () => Promise<void>;
 }
 
-// Map machine error_codes to short, user-readable labels. Unknown codes
-// fall through as the raw value so a new error_code at least surfaces
-// in the UI rather than being hidden as "Processing error".
+// Map machine error_codes to short, user-readable labels. Only codes that
+// are actually observed reaching Needs Attention live here; the fallback
+// in describeErrorCode renders unknown codes legibly with the raw value
+// so a new failure mode is visible in the UI without a code change.
 const ERROR_CODE_LABELS: Record<string, string> = {
   needs_reauth: "Re-authentication required",
   rate_limited: "Rate limited (will retry)",
   schema_violation: "Bad response from upstream",
-  data_quality: "Couldn't read invoice data",
   config_error: "Configuration problem",
   budget_exceeded: "Budget cap hit",
-  ssrf_rejected: "URL blocked (security)",
-  path_violation: "File path blocked (security)",
-  unhandled_exception: "Unexpected crash",
 };
 
 function describeErrorCode(code: string | null): string {
@@ -71,8 +69,7 @@ export function NeedsAttentionCard({
   onDismiss,
   onBulkDismiss,
   onUploadPdf,
-  onRetryAll,
-  onRetrySelected,
+  onRetry,
   onReauthGoogle,
 }: NeedsAttentionCardProps) {
   const [isCollapsed, setIsCollapsed] = useState(true);
@@ -90,12 +87,23 @@ export function NeedsAttentionCard({
   const [confirmingDismiss, setConfirmingDismiss] = useState<string | null>(null);
 
   const [retrying, setRetrying] = useState(false);
-  const [retryingSelected, setRetryingSelected] = useState(false);
   const [reauthing, setReauthing] = useState(false);
 
   const needsReauth = pendingActions.some(
     (a) => a.errorCode === "needs_reauth"
   );
+
+  // Memoise DOMPurify so re-renders triggered by bulk-select / retry state
+  // don't re-sanitise an already-sanitised HTML body. The sanitize call is
+  // ~milliseconds for large emails but runs inside the render path; useMemo
+  // collapses it to a single call per body change.
+  const sanitizedBodyHtml = useMemo(() => {
+    if (!emailBody?.body_html) return null;
+    return DOMPurify.sanitize(emailBody.body_html, {
+      FORBID_TAGS: ["script", "style", "iframe", "object", "embed"],
+      FORBID_ATTR: ["onerror", "onload", "onclick", "onmouseover"],
+    });
+  }, [emailBody?.body_html]);
 
   const toggleSelection = (msgId: string) => {
     setSelectedIds((prev) => {
@@ -199,23 +207,23 @@ export function NeedsAttentionCard({
               <span className="text-sm text-muted-foreground">
                 {selectedIds.size} selected
               </span>
-              {onRetrySelected && (
+              {onRetry && (
                 <Button
                   variant="outline"
                   size="sm"
                   className="h-7 text-xs"
-                  disabled={retryingSelected || bulkDismissing}
+                  disabled={retrying || bulkDismissing}
                   onClick={async () => {
-                    setRetryingSelected(true);
+                    setRetrying(true);
                     try {
-                      await onRetrySelected(Array.from(selectedIds));
+                      await onRetry(Array.from(selectedIds));
                       setSelectedIds(new Set());
                     } finally {
-                      setRetryingSelected(false);
+                      setRetrying(false);
                     }
                   }}
                 >
-                  {retryingSelected ? "Retrying…" : "Retry selected"}
+                  {retrying ? "Retrying…" : "Retry selected"}
                 </Button>
               )}
               <Button
@@ -249,7 +257,7 @@ export function NeedsAttentionCard({
         </div>
       </CardHeader>
       {!isCollapsed && <CardContent>
-        {(needsReauth || onRetryAll) && (
+        {(needsReauth || onRetry) && (
           <div className="mb-3 flex flex-wrap items-center gap-2">
             {needsReauth && onReauthGoogle && (
               <div
@@ -279,7 +287,7 @@ export function NeedsAttentionCard({
                 </Button>
               </div>
             )}
-            {onRetryAll && (
+            {onRetry && (
               <Button
                 variant="outline"
                 size="sm"
@@ -289,7 +297,7 @@ export function NeedsAttentionCard({
                   e.stopPropagation();
                   setRetrying(true);
                   try {
-                    await onRetryAll();
+                    await onRetry();
                   } finally {
                     setRetrying(false);
                   }
@@ -475,15 +483,10 @@ export function NeedsAttentionCard({
                         <div className="text-sm text-muted-foreground">Loading email content...</div>
                       ) : emailBody ? (
                         <div className="max-h-96 overflow-auto rounded border bg-gray-50 p-4">
-                          {emailBody.body_html ? (
+                          {sanitizedBodyHtml ? (
                             <div
                               className="prose prose-sm max-w-none"
-                              dangerouslySetInnerHTML={{
-                                __html: DOMPurify.sanitize(emailBody.body_html, {
-                                  FORBID_TAGS: ["script", "style", "iframe", "object", "embed"],
-                                  FORBID_ATTR: ["onerror", "onload", "onclick", "onmouseover"],
-                                }),
-                              }}
+                              dangerouslySetInnerHTML={{ __html: sanitizedBodyHtml }}
                             />
                           ) : (
                             <pre className="whitespace-pre-wrap text-sm">{emailBody.body_text}</pre>

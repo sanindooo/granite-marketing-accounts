@@ -66,14 +66,25 @@ granite ingest email ms365 --initial
 - OAuth consent screen in Testing mode (7-day token expiry)
 - 6 months of inactivity
 - Revoked access in Google Account settings
+- Pipeline emits `needs_reauth` and the dashboard's red "Re-authenticate
+  Google" banner appears on Needs Attention
 
 ### Process
 
 ```bash
-granite ops setup-sheets
+granite ops reauth google
 ```
 
-A browser window opens. Sign in and re-grant permissions.
+A browser window opens. Sign in and re-grant permissions. The dashboard's
+"Re-authenticate Google" button calls the same command.
+
+`load_credentials` only deletes `.state/token.json` when Google explicitly
+returns `invalid_grant` (token revoked / expired). Transient `RefreshError`s
+(network blips, 5xx from `oauth2.googleapis.com`) preserve the token —
+retry the run before reauthing.
+
+`granite ops setup-sheets` is the legacy bootstrap command for the initial
+OAuth flow; once a token exists, prefer `reauth google` for re-auth.
 
 ### Production Mode (Recommended)
 

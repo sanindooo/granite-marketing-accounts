@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { spawn } from "child_process";
 import { z } from "zod";
+import { getGraniteBinary, getProjectRoot } from "@/lib/spawn-granite";
 
 const bodySchema = z.object({
   msgId: z.string().min(1),
@@ -20,8 +21,8 @@ export async function POST(request: Request) {
 
     const { msgId } = result.data;
 
-    const projectRoot = process.cwd().replace("/web", "");
-    const granitePath = `${projectRoot}/.venv/bin/granite`;
+    const projectRoot = getProjectRoot();
+    const granitePath = getGraniteBinary();
 
     return new Promise<Response>((resolve) => {
       const proc = spawn(granitePath, ["ingest", "email", "body", msgId], {

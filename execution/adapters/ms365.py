@@ -30,6 +30,7 @@ only when the classifier + extractor ask for it.
 
 from __future__ import annotations
 
+import logging
 import threading
 from collections.abc import Iterator
 from dataclasses import dataclass
@@ -47,6 +48,8 @@ from execution.shared.errors import (
 if TYPE_CHECKING:  # pragma: no cover
     import httpx
     import msal
+
+logger = logging.getLogger(__name__)
 
 SOURCE_ID: Final[str] = "ms365"
 SECRETS_NAMESPACE: Final[str] = "ms365"
@@ -344,7 +347,7 @@ class Ms365Adapter:
         sender: str | None = None,
         date_from: str | None = None,
         date_to: str | None = None,
-        max_pages: int = 10,
+        max_pages: int = 50,
     ) -> Iterator[list[RawEmail]]:
         """Search inbox with optional filters.
 
@@ -488,6 +491,17 @@ class Ms365Adapter:
             else:
                 if not raw_messages:
                     break  # $skip path: empty page → done
+
+        # Hit the page ceiling but the API still has more results — log so
+        # the operator knows results are truncated. Without this signal a
+        # backfill can silently miss data when an unusually-broad sender
+        # filter exceeds max_pages * page_size.
+        if pages_fetched >= max_pages and use_search and next_url is not None:
+            logger.warning(
+                "ms365 search hit max_pages=%d ceiling with @odata.nextLink "
+                "still present; results truncated",
+                max_pages,
+            )
 
         if buffered:
             yield buffered

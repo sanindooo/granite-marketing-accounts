@@ -3,6 +3,7 @@ import { spawn } from "child_process";
 import { writeFile, mkdir, unlink } from "fs/promises";
 import { join } from "path";
 import { randomUUID } from "crypto";
+import { getGraniteBinary, getProjectRoot } from "@/lib/spawn-granite";
 
 export async function POST(request: Request) {
   try {
@@ -24,7 +25,7 @@ export async function POST(request: Request) {
       );
     }
 
-    const projectRoot = process.cwd().replace("/web", "");
+    const projectRoot = getProjectRoot();
     const tmpDir = join(projectRoot, ".tmp", "uploads");
     await mkdir(tmpDir, { recursive: true });
 
@@ -32,7 +33,7 @@ export async function POST(request: Request) {
     const bytes = await pdf.arrayBuffer();
     await writeFile(tmpPath, Buffer.from(bytes));
 
-    const granitePath = join(projectRoot, ".venv", "bin", "granite");
+    const granitePath = getGraniteBinary();
 
     return new Promise<Response>((resolve) => {
       const proc = spawn(

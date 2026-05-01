@@ -1,6 +1,7 @@
 import { spawn } from "child_process";
 import { createInterface } from "readline";
 import { z } from "zod";
+import { getGraniteBinary, getProjectRoot } from "@/lib/spawn-granite";
 
 export const runtime = "nodejs";
 
@@ -96,8 +97,8 @@ export async function POST(request: Request) {
   const { command } = result.data;
   const args = buildArgs(command, result.data);
 
-  const projectRoot = process.cwd().replace("/web", "");
-  const granitePath = `${projectRoot}/.venv/bin/granite`;
+  const projectRoot = getProjectRoot();
+  const granitePath = getGraniteBinary();
 
   const encoder = new TextEncoder();
 

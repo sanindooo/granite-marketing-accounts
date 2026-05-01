@@ -325,15 +325,6 @@ class LazyGoogleClients:
             return self._impl
 
     @property
-    def is_connected(self) -> bool:
-        """True if the OAuth flow has completed at least once for this proxy."""
-        return self._impl is not None
-
-    @property
-    def creds(self) -> Credentials:
-        return self._ensure().creds
-
-    @property
     def drive(self) -> Any:
         return self._ensure().drive
 

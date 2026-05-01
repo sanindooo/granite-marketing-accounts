@@ -510,7 +510,11 @@ def _process_one(
     # extractor can see anchor hrefs (e.g. Webflow's "PDF" link points at
     # invoice.stripe.com); plaintext is what the classifier prompt prefers.
     html_body, text_body = adapter.fetch_message_body_both(email_row.msg_id)
-    classifier_body = text_body or _html_to_text(html_body)
+    # Cap before parse: a 5MB Salesforce-style HTML body blocks the worker
+    # for ~half a second in the stdlib parser. The classifier prompt only
+    # uses the first few hundred lines anyway; 512KB leaves room for a
+    # whole email plus headers and is well below the cap.
+    classifier_body = text_body or _html_to_text(html_body[:512_000])
 
     # Classify
     email_input = EmailInput(

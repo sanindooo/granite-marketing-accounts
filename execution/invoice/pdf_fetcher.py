@@ -75,6 +75,23 @@ LOGIN_GATED_HOSTS: Final[dict[str, str]] = {
     "www.webflow.com": "Webflow requires account login for invoice PDF",
 }
 
+# Hosts whose every subdomain should also be treated as login-gated.
+# webflow.com publishes new billing/console subdomains periodically (e.g.
+# accounts.webflow.com); without a suffix match new ones silently regress
+# from "needs_manual_download" to "unexpected error" the first time they
+# appear.
+_LOGIN_GATED_DOMAIN_SUFFIXES: Final[tuple[str, ...]] = ("webflow.com",)
+
+
+def _login_gated_reason(host: str) -> str | None:
+    """Return the operator-facing reason if ``host`` is login-gated, else None."""
+    if host in LOGIN_GATED_HOSTS:
+        return LOGIN_GATED_HOSTS[host]
+    for suffix in _LOGIN_GATED_DOMAIN_SUFFIXES:
+        if host.endswith("." + suffix):
+            return LOGIN_GATED_HOSTS.get(suffix)
+    return None
+
 # Providers whose URLs expire quickly — fetch on email receipt, not deferred.
 # We recognise them to tag the provider on the FetchOutcome; resolving the
 # hosted_invoice_url → invoice_pdf redirect is handled by the SafeHttpClient
@@ -111,7 +128,7 @@ def classify_provider(url: str) -> str:
         return "stripe"
     if host in _PADDLE_HOSTS:
         return "paddle"
-    if host in LOGIN_GATED_HOSTS:
+    if _login_gated_reason(host) is not None:
         return "login_gated"
     return "generic"
 
@@ -151,12 +168,13 @@ def fetch_invoice_pdf(
 
     # Short-circuit on known login-gated portals — saves a round-trip and
     # produces a better Exceptions-row reason than a generic HTML rejection.
-    if host in LOGIN_GATED_HOSTS:
+    gated_reason = _login_gated_reason(host)
+    if gated_reason:
         return FetchOutcome(
             status=FetchStatus.NEEDS_MANUAL_DOWNLOAD,
             url=url,
             provider=provider,
-            reason=LOGIN_GATED_HOSTS[host],
+            reason=gated_reason,
         )
 
     try:
