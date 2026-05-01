@@ -131,6 +131,16 @@ Scripts called by agents must produce deterministic, parseable output on all cod
 - **Incremental saves**: For paid API operations, save results after each item to prevent data loss on crash.
 - **Batch discovery**: During self-annealing, look for batch endpoints that replace N+1 individual calls.
 
+## Database Migrations — Hard Rules
+
+`execution/shared/migrations/*.sql` files are **immutable once committed**. Every applied migration's SHA-256 is stored in `schema_migrations`, and `apply_migrations` refuses to start if any byte changed. That includes comments, whitespace, and trailing newlines — the runner cannot tell SQL from prose.
+
+- **Never edit any existing file in `execution/shared/migrations/`.** Not the SQL, not the comments. If you need to change something, write a new `0NN_*.sql`.
+- **Rollback notes belong in `execution/shared/migrations/README.md`**, not inside the migration files. The README is not checksummed.
+- **`tests/test_migrations_immutable.py` pins every committed hash.** The pre-commit hook (`.githooks/pre-commit`, enabled via `git config core.hooksPath .githooks`) runs that test before any commit lands. If it fails, the only correct fix is to revert the file — don't update the pinned hash unless the file was genuinely never applied to any database (rare).
+
+This rule exists because we hit it: editing a deployed migration to add a "ROLLBACK:" comment block wedged the local pipeline with a checksum mismatch the runner couldn't auto-recover from. The historical incident is in the README.
+
 ## Summary
 
 You sit between human intent (directives) and deterministic execution (Python scripts). Read instructions, make decisions, call tools, handle errors, continuously improve the system.

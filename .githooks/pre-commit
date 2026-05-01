@@ -1,0 +1,58 @@
+#!/usr/bin/env bash
+# Block commits that edit a committed migration file.
+#
+# Why: every migration's SHA-256 is stored in schema_migrations the first
+# time it runs. apply_migrations refuses to start if any byte changes — so
+# editing a deployed migration wedges every existing database. The runtime
+# check is the last line of defense; this hook moves the failure forward
+# to the moment of the bad commit, where it's cheap to fix.
+#
+# Install once per clone:
+#     git config core.hooksPath .githooks
+#
+# Bypass (for the rare legitimate case of editing a migration that has
+# never run anywhere — also requires updating EXPECTED_HASHES in
+# tests/test_migrations_immutable.py in the same commit):
+#     git commit --no-verify
+#
+# See execution/shared/migrations/README.md for the full rules.
+
+set -euo pipefail
+
+# Find the repo root regardless of which subdirectory git invoked us from.
+repo_root="$(git rev-parse --show-toplevel)"
+cd "$repo_root"
+
+# 1. Block staged edits to existing migration files. M = modified, D =
+#    deleted, R = renamed. A = added is allowed (new migration).
+staged="$(git diff --cached --name-only --diff-filter=MDR -- 'execution/shared/migrations/*.sql' || true)"
+if [[ -n "$staged" ]]; then
+    echo "ERROR: staged commit edits or removes a committed migration:" >&2
+    while IFS= read -r f; do echo "  $f" >&2; done <<<"$staged"
+    cat >&2 <<'EOF'
+
+Migrations are SHA-256 pinned. Editing a deployed file wedges every
+database that already ran it. Write a new 0NN_*.sql for whatever change
+you wanted instead. Rollback notes go in
+execution/shared/migrations/README.md, not the .sql.
+
+If this edit is genuinely safe (the file has never been applied
+anywhere), update tests/test_migrations_immutable.py::EXPECTED_HASHES in
+the same commit and use --no-verify.
+EOF
+    exit 1
+fi
+
+# 2. Run the immutability test as belt-and-braces. Catches edits the
+#    name-only check might miss (e.g. mode change, renames into the dir)
+#    and verifies any newly-added migration has a pinned hash.
+if [[ -x .venv/bin/pytest ]]; then
+    pytest_bin=".venv/bin/pytest"
+elif command -v pytest >/dev/null 2>&1; then
+    pytest_bin="pytest"
+else
+    echo "WARNING: no pytest found; skipping migration-immutability test" >&2
+    exit 0
+fi
+
+"$pytest_bin" -q tests/test_migrations_immutable.py
