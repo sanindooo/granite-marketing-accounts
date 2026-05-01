@@ -7,5 +7,18 @@
 -- Distinct from invoices.manual_download_url (migration 005) which only
 -- gets populated AFTER an invoices row exists — we need a place to land
 -- the URL when no invoices row was ever created.
+--
+-- NOTE: Migration 012 renames this column to `source_invoice_url` to
+-- disambiguate from invoices.manual_download_url. After migrating, queries
+-- and code reference the new name. This rollback block describes undoing
+-- migration 011 only — to undo 012 first, see that file.
+--
+-- ROLLBACK (SQLite >= 3.35):
+--   ALTER TABLE emails DROP COLUMN manual_download_url;
+--   DELETE FROM schema_migrations WHERE version = '011_add_email_manual_download_url';
+-- For older SQLite: rebuild emails_new without the column, swap, recreate
+-- indexes, then DELETE the schema_migrations row.
+-- Re-apply gotcha: schema_migrations row must be deleted first or the
+-- runner skips the file as already-applied.
 
 ALTER TABLE emails ADD COLUMN manual_download_url TEXT;

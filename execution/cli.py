@@ -12,6 +12,7 @@ Every leaf command prints a single JSON document via ``emit_success`` or
 
 from __future__ import annotations
 
+import re
 import sqlite3
 import sys
 from datetime import date, timedelta
@@ -758,25 +759,42 @@ def ingest_email_body(
 def ingest_email_pending(
     db_path: Annotated[Path | None, typer.Option("--db")] = None,
     limit: Annotated[int, typer.Option("--limit", help="Max items to return.")] = 50,
+    filter_error_code: Annotated[
+        str | None,
+        typer.Option(
+            "--filter-error-code",
+            help="Show only rows whose error_code matches (e.g. needs_reauth).",
+        ),
+    ] = None,
 ) -> None:
-    """List emails that need attention (manual download, errors, no attachment)."""
+    """List emails that need attention (manual download, errors, no attachment).
+
+    Mirrors the dashboard's Needs Attention card: same outcome filter, same
+    additional columns (``error_code``, ``error_message``,
+    ``source_invoice_url``). ``--filter-error-code`` lets agents narrow to
+    rows blocked by a specific cause without grep'ing the JSON.
+    """
     try:
         from execution.shared import db as db_mod
 
         conn = db_mod.connect(db_path)
         db_mod.apply_migrations(conn)
-        rows = conn.execute(
-            """
-            SELECT msg_id, from_addr, subject, received_at, outcome
+        sql = """
+            SELECT msg_id, from_addr, subject, received_at, outcome,
+                   error_code, error_message, source_invoice_url
             FROM emails
             WHERE outcome IN ('needs_manual_download', 'error', 'no_attachment')
               AND dismissed_at IS NULL
-            ORDER BY received_at DESC
-            LIMIT ?
-            """,
-            (limit,),
-        ).fetchall()
+        """
+        params: list[object] = []
+        if filter_error_code:
+            sql += " AND error_code = ?"
+            params.append(filter_error_code)
+        sql += " ORDER BY received_at DESC LIMIT ?"
+        params.append(limit)
+        rows = conn.execute(sql, params).fetchall()
         emit_success({
+            "schema_version": 2,
             "count": len(rows),
             "items": [
                 {
@@ -785,6 +803,9 @@ def ingest_email_pending(
                     "subject": r[2],
                     "received_at": r[3],
                     "outcome": r[4],
+                    "error_code": r[5],
+                    "error_message": r[6],
+                    "source_invoice_url": r[7],
                 }
                 for r in rows
             ],
@@ -1447,6 +1468,14 @@ def ingest_invoice_retry_errors(
     avoid clobbering successful state. ``error_message`` is preserved across
     the reset so the prior failure context stays visible until the next run
     overwrites it (or NULLs it on success).
+
+    Two-step workflow: this command only resets the rows. Chain into
+    ``granite ingest invoice process`` to actually re-run the pipeline
+    against the reset rows — that's what the dashboard's Retry button does.
+    Example::
+
+        granite ingest invoice retry-errors --all
+        granite ingest invoice process
     """
     try:
         if not msg_ids and not all_rows:
@@ -2504,6 +2533,192 @@ def runs_cleanup(
 
     conn.close()
     emit_success({"cleaned": cleaned})
+
+
+# ---------------------------------------------------------------------------
+# invoices subcommands (agent-native parity with the dashboard table)
+# ---------------------------------------------------------------------------
+
+
+invoices_app = typer.Typer(
+    name="invoices",
+    help="List invoices and mark them exported.",
+    no_args_is_help=True,
+)
+app.add_typer(invoices_app)
+
+
+@invoices_app.command("list")
+def invoices_list(
+    db_path: Annotated[Path | None, typer.Option("--db")] = None,
+    fy: Annotated[
+        str | None,
+        typer.Option("--fy", help="Fiscal year filter (e.g. FY-2025-26 or 'all')."),
+    ] = None,
+    vendor: Annotated[
+        str | None,
+        typer.Option("--vendor", help="Filter to a specific vendor_id."),
+    ] = None,
+    category: Annotated[
+        str | None,
+        typer.Option("--category", help="Filter to a specific category."),
+    ] = None,
+    search: Annotated[
+        str | None,
+        typer.Option(
+            "--search",
+            help="Prefix-match against vendor canonical name or invoice number.",
+        ),
+    ] = None,
+    date_from: Annotated[
+        str | None,
+        typer.Option("--from", help="Lower bound on invoice_date (YYYY-MM-DD)."),
+    ] = None,
+    date_to: Annotated[
+        str | None,
+        typer.Option("--to", help="Upper bound on invoice_date (YYYY-MM-DD)."),
+    ] = None,
+    exported: Annotated[
+        str | None,
+        typer.Option(
+            "--exported",
+            help="Filter on export state: 'yes' or 'no'.",
+        ),
+    ] = None,
+    limit: Annotated[
+        int, typer.Option("--limit", help="Max items to return.")
+    ] = 500,
+) -> None:
+    """List invoices with the same filters the dashboard supports.
+
+    Mirrors :data:`web/src/lib/queries/invoices.ts::LIST_COLUMNS` so an
+    agent answering "which FY26 invoices have not been exported yet?"
+    sees the same shape as the dashboard table.
+    """
+    try:
+        from execution.shared.fiscal import fy_bounds
+
+        conn = db_mod.connect(db_path)
+        db_mod.apply_migrations(conn)
+
+        conditions: list[str] = ["i.deleted_at IS NULL"]
+        params: list[object] = []
+
+        if fy and fy != "all":
+            start, end = fy_bounds(fy)
+            conditions.append("i.invoice_date BETWEEN ? AND ?")
+            params.extend([start.isoformat(), end.isoformat()])
+        if vendor:
+            conditions.append("i.vendor_id = ?")
+            params.append(vendor)
+        if category:
+            conditions.append("i.category = ?")
+            params.append(category)
+        if date_from:
+            conditions.append("i.invoice_date >= ?")
+            params.append(date_from)
+        if date_to:
+            conditions.append("i.invoice_date <= ?")
+            params.append(date_to)
+        if search:
+            escaped = (
+                search.replace("\\", "\\\\")
+                .replace("%", "\\%")
+                .replace("_", "\\_")
+            )
+            conditions.append(
+                "(v.canonical_name LIKE ? ESCAPE '\\' COLLATE NOCASE OR "
+                "i.invoice_number LIKE ? ESCAPE '\\' COLLATE NOCASE)"
+            )
+            params.extend([f"{escaped}%", f"{escaped}%"])
+        if exported == "yes":
+            conditions.append("i.last_exported_at IS NOT NULL")
+        elif exported == "no":
+            conditions.append("i.last_exported_at IS NULL")
+        elif exported is not None:
+            raise ConfigError(
+                f"--exported must be 'yes' or 'no'; got {exported!r}",
+                source="cli",
+            )
+
+        params.append(limit)
+
+        # `conditions` is built only from allowlisted fragments above —
+        # every dynamic value goes through ?-placeholders.
+        sql = f"""
+            SELECT i.invoice_id, i.source_msg_id, i.vendor_id, i.vendor_name_raw,
+                   i.invoice_number, i.invoice_date, i.currency,
+                   i.amount_net, i.amount_vat, i.amount_gross, i.amount_gross_gbp,
+                   i.vat_rate, i.category, i.category_source,
+                   i.drive_file_id, i.drive_web_view_link,
+                   i.last_exported_at, i.deleted_at,
+                   v.canonical_name AS vendor_name
+            FROM invoices i
+            LEFT JOIN vendors v ON i.vendor_id = v.vendor_id
+            WHERE {" AND ".join(conditions)}
+            ORDER BY i.invoice_date DESC
+            LIMIT ?
+        """  # noqa: S608 — placeholders bound below; conditions built from allowlist.
+        rows = conn.execute(sql, params).fetchall()
+
+        items = [dict(row) for row in rows]
+        emit_success({"count": len(items), "items": items})
+    except PipelineError as err:
+        emit_error(err)
+    except Exception as err:
+        emit_error(err)
+
+
+@invoices_app.command("mark-exported")
+def invoices_mark_exported(
+    invoice_ids: Annotated[
+        list[str],
+        typer.Option(
+            "--invoice-id",
+            help="Invoice ID to mark exported. Repeatable.",
+        ),
+    ],
+    db_path: Annotated[Path | None, typer.Option("--db")] = None,
+) -> None:
+    """Stamp ``last_exported_at`` on the supplied invoices.
+
+    Counterpart to ``markInvoicesExported`` in the web layer; an agent
+    pushing invoices through a non-zip channel can record the same
+    bookkeeping the dashboard does.
+    """
+    try:
+        if not invoice_ids:
+            raise ConfigError(
+                "mark-exported requires at least one --invoice-id",
+                source="cli",
+            )
+        for inv_id in invoice_ids:
+            if not re.fullmatch(r"[a-f0-9]{16}", inv_id):
+                raise ConfigError(
+                    f"invoice_id {inv_id!r} must be 16 hex chars",
+                    source="cli",
+                )
+
+        conn = db_mod.connect(db_path)
+        db_mod.apply_migrations(conn)
+
+        placeholders = ",".join(["?"] * len(invoice_ids))
+        with conn:
+            cursor = conn.execute(
+                f"""
+                UPDATE invoices
+                SET last_exported_at = datetime('now')
+                WHERE invoice_id IN ({placeholders})
+                  AND deleted_at IS NULL
+                """,  # noqa: S608 — placeholders bound below.
+                tuple(invoice_ids),
+            )
+            updated = cursor.rowcount
+        emit_success({"updated": updated, "invoice_ids": list(invoice_ids)})
+    except PipelineError as err:
+        emit_error(err)
+    except Exception as err:
+        emit_error(err)
 
 
 if __name__ == "__main__":

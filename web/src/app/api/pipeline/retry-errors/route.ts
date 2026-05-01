@@ -8,9 +8,20 @@ export const runtime = "nodejs";
 // Empty bodies / `{}` / `{msgIds: []}` are rejected with 400 — a missing
 // click that hits this route can no longer wipe the diagnostic state on
 // every Needs-Attention row by accident.
+//
+// MS Graph and Gmail msg_ids are base64url-shaped (letters, digits, `_`,
+// `-`, optional `=`/`+`/`/` padding). Tightening the regex past z.string()
+// blocks ANSI escape sequences and control characters from leaking into
+// CLI stderr where they could rewrite the developer's terminal — a
+// well-known attack class even when shell metacharacters are blocked.
+const MSG_ID_PATTERN = /^[A-Za-z0-9_=+/\-]{20,400}$/;
 const bodySchema = z
   .object({
-    msgIds: z.array(z.string().min(1).max(500)).min(1).max(200).optional(),
+    msgIds: z
+      .array(z.string().regex(MSG_ID_PATTERN, "invalid msg_id"))
+      .min(1)
+      .max(200)
+      .optional(),
     all: z.literal(true).optional(),
   })
   .refine((v) => Boolean(v.msgIds?.length) !== Boolean(v.all), {

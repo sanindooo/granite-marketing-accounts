@@ -2,6 +2,7 @@
 
 import { useQueryStates, parseAsString, parseAsBoolean } from "nuqs";
 import { useEffect, useState } from "react";
+import { useDebouncedSearch } from "@/hooks/use-debounced-search";
 import { toast } from "sonner";
 import { InvoiceTable } from "@/components/invoice-table";
 import { Button } from "@/components/ui/button";
@@ -49,13 +50,18 @@ export function InvoiceList() {
     exceptions,
   } = filters;
 
+  // 300 ms debounce on the search input. Without it, typing "webflow" issues
+  // 7 cumulative server actions; with the unindexed leading-wildcard LIKE
+  // (todo 025) that meant 70K row scans per word. Pair the debounce with the
+  // prefix-LIKE fix in queries/invoices.ts and the new NOCASE index.
+  const debouncedSearch = useDebouncedSearch(search);
+
   useEffect(() => {
     // AbortController on a Server Action does NOT cancel server-side execution
     // (see vercel/next.js#81418, discussion #54516). The Server Action runs to
     // completion; the cancelled flag below just drops stale results client-side
     // so the user sees the result of their latest filter change, not an older
-    // in-flight one. Real throughput fix is column trim + the 300 ms debounce
-    // on the search input + better-sqlite3 query speed.
+    // in-flight one.
     let cancelled = false;
 
     (async () => {
@@ -73,7 +79,7 @@ export function InvoiceList() {
                 (status as "matched" | "unmatched" | "pending" | "all") ||
                 "all",
               exported: (exported as "yes" | "no" | undefined) || undefined,
-              search: search || undefined,
+              search: debouncedSearch || undefined,
               dateFrom: dateFrom || undefined,
               dateTo: dateTo || undefined,
             });
@@ -94,7 +100,7 @@ export function InvoiceList() {
     return () => {
       cancelled = true;
     };
-  }, [fy, vendor, category, status, exported, search, dateFrom, dateTo, exceptions]);
+  }, [fy, vendor, category, status, exported, debouncedSearch, dateFrom, dateTo, exceptions]);
 
   const handleSelectAll = () => {
     const idsToSelect = invoices.slice(0, MAX_SELECTION).map((i) => i.invoice_id);

@@ -9,6 +9,25 @@ import { markInvoicesExported } from "@/lib/actions/exports";
 
 const MAX_INVOICES = 100;
 const CONCURRENCY = 5;
+const MARK_RETRIES = 3;
+const MARK_RETRY_BACKOFF_MS = 100;
+
+async function markInvoicesExportedWithRetry(ids: string[]): Promise<void> {
+  let lastErr: unknown;
+  for (let attempt = 0; attempt < MARK_RETRIES; attempt++) {
+    try {
+      await markInvoicesExported(ids);
+      return;
+    } catch (e) {
+      lastErr = e;
+      if (attempt === MARK_RETRIES - 1) break;
+      await new Promise((r) =>
+        setTimeout(r, MARK_RETRY_BACKOFF_MS * 5 ** attempt)
+      );
+    }
+  }
+  throw lastErr;
+}
 
 // invoice_id is sha256(msg_id||idx)[:16] (see execution/invoice/filer.py:_invoice_id),
 // not a UUID. Validate the actual hex shape so a typo regresses loudly.
@@ -49,9 +68,20 @@ export async function POST(request: Request) {
     const exportedIds: string[] = [];
 
     // Wire client disconnect to abort the archive so we don't waste bandwidth
-    // and don't credit exports that the client never received.
-    request.signal.addEventListener("abort", () => archive.abort());
+    // and don't credit exports that the client never received. Pair with a
+    // removal in the archive 'end' handler so we don't call archive.abort()
+    // on a finalized archive when an abort fires after end (TCP buffers
+    // still flushing) — that throws an undefined-state error in archiver.
+    const onAbort = () => archive.abort();
+    request.signal.addEventListener("abort", onAbort, { once: true });
 
+    // Note on CONCURRENCY: pLimit caps how many Drive downloads run in
+    // parallel, but archiver consumes streams sequentially. The promise
+    // each task awaits ('end' on the entry) holds a pLimit slot until
+    // archiver finishes that entry — so a slow stream blocks all later
+    // streams from being read into the zip. Raising CONCURRENCY above ~5
+    // costs Drive bandwidth without speeding up the zip itself; that's
+    // the trade-off, not a bug to fix until we switch archive layouts.
     const limit = pLimit(CONCURRENCY);
     const tasks = invoicesWithFiles.map((invoice) =>
       limit(async () => {
@@ -96,10 +126,14 @@ export async function POST(request: Request) {
     // Mark exports only AFTER archive emits 'end' (zip fully written) and the
     // request was not aborted. A client that disconnects between 'end' and the
     // OS flushing TCP buffers will still get marked — accept that trade-off.
+    // Retry the UPDATE up to 3x on SQLITE_BUSY: the dashboard poll + pipeline
+    // writes can briefly hold the lock; failing here means the user's invoices
+    // resurface in the unexported filter on next refresh.
     archive.on("end", () => {
+      request.signal.removeEventListener("abort", onAbort);
       if (!request.signal.aborted && exportedIds.length > 0) {
-        markInvoicesExported(exportedIds).catch((e) =>
-          console.error("markInvoicesExported failed:", e)
+        markInvoicesExportedWithRetry(exportedIds).catch((e) =>
+          console.error("markInvoicesExported failed after retries:", e)
         );
       }
     });

@@ -17,6 +17,20 @@ import {
 import type { PendingAction } from "@/lib/queries/dashboard";
 import { apiFetch } from "@/lib/api-fetch";
 
+// Render the URL hostname inside the "Open at …" pill so the user has a
+// visible cue about where the link points before clicking. Server-side
+// validation already rejects userinfo / non-https / private-IP URLs (see
+// _set_source_invoice_url), but a raw "Open URL" label hid the destination
+// from the user — this surfaces it so origin-spoofing tricks can't sneak
+// past visual inspection.
+function extractHost(url: string): string {
+  try {
+    return new URL(url).hostname;
+  } catch {
+    return "unknown host";
+  }
+}
+
 interface EmailBody {
   body_html: string;
   body_text: string;
@@ -365,7 +379,7 @@ export function NeedsAttentionCard({
                           className="rounded border border-blue-200 bg-blue-50 px-2 py-1 text-xs text-blue-700 hover:bg-blue-100"
                           title={`Open invoice URL: ${action.manualDownloadUrl}`}
                         >
-                          Open URL
+                          Open at {extractHost(action.manualDownloadUrl)}
                         </a>
                       )}
                       {/* Upload PDF is offered for any failure mode where

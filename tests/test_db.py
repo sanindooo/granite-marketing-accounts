@@ -84,6 +84,28 @@ class TestMigrations:
         db_mod.apply_migrations(conn)
         assert db_mod.current_version(conn) == "013_add_vendor_search_index"
 
+    def test_new_columns_queryable(self) -> None:
+        """Pin column shape for migrations 009/010/012/013.
+
+        ``current_version`` only proves the row was inserted; a typo in the
+        migration body would still pass that check. SELECT each new column
+        with LIMIT 0 — sqlite raises OperationalError if any column is
+        missing or renamed without our knowing.
+        """
+        conn = _fresh_conn()
+        db_mod.apply_migrations(conn)
+        conn.execute("SELECT last_exported_at FROM invoices LIMIT 0")
+        conn.execute(
+            "SELECT error_message, source_invoice_url FROM emails LIMIT 0"
+        )
+        # Vendor-search index added in migration 013 — assert it's present
+        # so a future schema rebuild that drops it gets caught here.
+        idx = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='index' "
+            "AND name='idx_vendors_canonical_name_nocase'"
+        ).fetchone()
+        assert idx is not None
+
     def test_tampered_migration_rejected(self, tmp_path: Path) -> None:
         # Build a migrations dir with a single file, apply it, then mutate
         # the file and ensure we refuse to re-apply.

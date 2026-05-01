@@ -377,10 +377,16 @@ fetchPendingActions(fy === "all" ? undefined : fy),
     }
   }, [stream.isRunning, stream.result, stream.error, refreshAllData]);
 
-  // Poll for updates when any run is active (either via stream or DB status)
+  // Poll only when a DB-tracked run is active without a connected stream
+  // (e.g. another browser tab kicked it off, or the user navigated here
+  // mid-run). When `stream.isRunning` is true the SSE connection delivers
+  // per-event updates and the completion handler above does the
+  // refreshAllData call; another 5s poll on top of that hammers the
+  // sync-only better-sqlite3 connection for no UI win.
   const hasRunningInDb = lastRuns.some((r) => r.status === "running");
   useEffect(() => {
-    if (!stream.isRunning && !hasRunningInDb) return;
+    if (stream.isRunning) return;
+    if (!hasRunningInDb) return;
 
     const interval = setInterval(() => {
       refreshAllData();

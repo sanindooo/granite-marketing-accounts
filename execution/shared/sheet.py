@@ -29,6 +29,7 @@ from __future__ import annotations
 import os
 import re
 import sqlite3
+import threading
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
@@ -142,23 +143,34 @@ def load_credentials(*, allow_interactive: bool = True) -> Credentials:
             try:
                 creds.refresh(Request())
             except RefreshError as err:
-                # The refresh token has been revoked, expired (7 days for
-                # unverified apps in testing), or the OAuth client was
-                # rotated. Wipe the stale token so the next interactive
-                # run starts clean.
-                _delete_token(token_p)
+                # Only wipe the stored token when Google actually says the
+                # refresh token is dead (``invalid_grant``). RefreshError
+                # also fires for transient network blips, 5xx from
+                # oauth2.googleapis.com, and side-channel rate-limit
+                # responses — none of those should force the user back
+                # through the browser flow. Keep the token, surface the
+                # error, let the next attempt retry.
+                error_code = _refresh_error_code(err)
+                if error_code == "invalid_grant":
+                    _delete_token(token_p)
                 raise AuthExpiredError(
-                    "Google OAuth refresh failed: token has been expired "
-                    "or revoked",
+                    f"Google OAuth refresh failed: {error_code or 'transient error'}",
                     source=SOURCE_ID,
                     user_message=(
                         "Google access has expired. Run "
                         "`granite ops reauth google` from your terminal to "
                         "re-authorise. (The browser-based OAuth flow can't "
                         "run from the web UI — it needs a desktop browser.)"
+                    ) if error_code == "invalid_grant" else (
+                        "Google OAuth refresh hit a transient error. Retry "
+                        "the run; if it persists, run "
+                        "`granite ops reauth google` from your terminal."
                     ),
                     cause=err,
-                    details={"token_path": str(token_p)},
+                    details={
+                        "token_path": str(token_p),
+                        "error_code": error_code,
+                    },
                 ) from err
         else:
             creds = None
@@ -195,6 +207,24 @@ def _delete_token(token_p: Path) -> None:
     """Remove a stale token file. Best-effort; missing file is not an error."""
     with suppress(FileNotFoundError):
         token_p.unlink()
+
+
+def _refresh_error_code(err: Exception) -> str:
+    """Extract Google's OAuth ``error`` code from a RefreshError.
+
+    google-auth raises ``RefreshError(message, response_dict)`` where
+    ``response_dict`` is the JSON body Google returned (e.g.
+    ``{"error": "invalid_grant", "error_description": "..."}``). We use the
+    code to decide whether to delete the token: only ``invalid_grant`` means
+    the token is genuinely dead. Everything else is transient.
+    """
+    args = getattr(err, "args", ())
+    for arg in args:
+        if isinstance(arg, dict):
+            code = arg.get("error")
+            if isinstance(code, str):
+                return code
+    return ""
 
 
 def _write_token(token_p: Path, body: str) -> None:
@@ -268,11 +298,23 @@ class LazyGoogleClients:
         self._allow_interactive = allow_interactive
         self._impl: GoogleClients | None = preconnected
         self._failed_with: AuthExpiredError | None = None
+        # Double-checked locking around connect() so a 20-thread pipeline
+        # only triggers one OAuth refresh — and on failure, every thread
+        # raises the same AuthExpiredError instance instead of each making
+        # its own doomed refresh request.
+        self._connect_lock = threading.Lock()
 
     def _ensure(self) -> GoogleClients:
+        impl = self._impl
+        if impl is not None:
+            return impl
         if self._failed_with is not None:
             raise self._failed_with
-        if self._impl is None:
+        with self._connect_lock:
+            if self._impl is not None:
+                return self._impl
+            if self._failed_with is not None:
+                raise self._failed_with
             try:
                 self._impl = GoogleClients.connect(
                     allow_interactive=self._allow_interactive
@@ -280,7 +322,7 @@ class LazyGoogleClients:
             except AuthExpiredError as err:
                 self._failed_with = err
                 raise
-        return self._impl
+            return self._impl
 
     @property
     def is_connected(self) -> bool:

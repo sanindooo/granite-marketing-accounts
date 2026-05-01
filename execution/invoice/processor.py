@@ -54,6 +54,7 @@ from execution.invoice.filer import (
 from execution.invoice.pdf_fetcher import FetchOutcome, FetchStatus, fetch_invoice_pdf
 from execution.shared.clock import now_utc
 from execution.shared.db import connect
+from execution.shared.error_message import prepare_error_message
 from execution.shared.errors import BudgetExceededError, PipelineError
 from execution.shared.http import SafeHttpClient
 from execution.shared.llm_client import LLMClient
@@ -675,9 +676,6 @@ def _count_pending_emails(
     return conn.execute(query, params).fetchone()[0]
 
 
-_ERROR_MESSAGE_CAP: Final[int] = 2000
-
-
 def _update_email_outcome(
     conn: sqlite3.Connection,
     msg_id: str,
@@ -689,17 +687,17 @@ def _update_email_outcome(
     """Mark an email as processed with the given outcome.
 
     ``error_message`` is the human-readable failure detail (e.g. an LLM
-    parser exception, a Drive 4xx body) — capped to ``_ERROR_MESSAGE_CAP``
-    chars so a verbose stack trace doesn't bloat the row. None on success.
+    parser exception, a Drive 4xx body). It is routed through
+    :func:`prepare_error_message` which redacts Bearer tokens, signed URLs,
+    and email addresses before truncating to a fixed length. None on
+    success.
 
     Note: ``source_invoice_url`` is intentionally NOT updated here so a
     successful retry (which routes through this function with no URL)
     doesn't clobber a URL set by a prior failed run. Use
     :func:`_set_source_invoice_url` to write it explicitly.
     """
-    truncated_msg = (
-        error_message[:_ERROR_MESSAGE_CAP] if error_message else None
-    )
+    truncated_msg = prepare_error_message(error_message)
     with conn:
         conn.execute(
             """
