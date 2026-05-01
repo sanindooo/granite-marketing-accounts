@@ -919,7 +919,7 @@ def ingest_invoice_process(
             EXTRACTOR_WEIGHTS,
             load_prompt,
         )
-        from execution.shared.sheet import GoogleClients
+        from execution.shared.sheet import LazyGoogleClients
 
         # Validate model parameter
         if model not in ("claude", "openai"):
@@ -950,7 +950,11 @@ def ingest_invoice_process(
         # Setup adapters
         auth = Ms365Auth.from_keychain()
         adapter = Ms365Adapter(auth=auth)
-        google = GoogleClients.connect()
+        # Defer Google OAuth: classify-only runs (every email turns out to be
+        # `neither`/`no_attachment`) never need Drive. The first invoice/receipt
+        # triggers connect; if the refresh token is dead the per-email error
+        # handler records it as needs_reauth and continues with the next email.
+        google = LazyGoogleClients(allow_interactive=False)
 
         # Resolve tmp directory
         resolved_tmp = tmp_root or Path(".tmp")
@@ -1361,9 +1365,95 @@ def ops_reauth(
                 }
             )
             return
+        if source == "google":
+            from execution.shared.sheet import (
+                SOURCE_ID as GOOGLE_SOURCE,
+            )
+            from execution.shared.sheet import (
+                load_credentials,
+                token_path,
+            )
+
+            # Wipe any stale token first so the OAuth flow starts clean
+            # (the cached token may have been revoked or rotated; without
+            # deleting we'd just keep failing to refresh).
+            token_p = token_path()
+            if token_p.exists():
+                token_p.unlink()
+
+            sys.stderr.write(
+                "Opening browser for Google OAuth. Approve access in the "
+                "browser window. The CLI will exit once the token is saved.\n"
+            )
+            sys.stderr.flush()
+            # InstalledAppFlow.run_local_server() spins up a localhost
+            # listener and opens the user's browser; this returns when the
+            # user finishes consent (including 2FA if their account requires it).
+            load_credentials(allow_interactive=True)
+
+            conn = db_mod.connect(db_path)
+            db_mod.apply_migrations(conn)
+            _clear_reauth(conn, GOOGLE_SOURCE)
+            emit_success({"source": GOOGLE_SOURCE, "reauth": "ok"})
+            return
         raise ConfigError(
-            f"unknown reauth source {source!r}; supported: 'ms365', 'monzo'",
+            f"unknown reauth source {source!r}; supported: 'ms365', 'monzo', 'google'",
             source="cli",
+        )
+    except PipelineError as err:
+        emit_error(err)
+    except Exception as err:
+        emit_error(err)
+
+
+@ingest_invoice_app.command("retry-errors")
+def ingest_invoice_retry_errors(
+    db_path: Annotated[Path | None, typer.Option("--db")] = None,
+    outcomes: Annotated[
+        str,
+        typer.Option(
+            "--outcomes",
+            help="Comma-separated outcomes to retry (default: error,needs_manual_download,no_attachment).",
+        ),
+    ] = "error,needs_manual_download,no_attachment",
+) -> None:
+    """Reset processed_at on all emails currently in the Needs Attention list.
+
+    The next ``ingest invoice process`` run will re-classify and re-extract
+    them. Useful after a fix lands (e.g. Google reauth, new URL extractor) to
+    sweep the backlog without manually picking each email.
+    """
+    try:
+        valid = {"error", "needs_manual_download", "no_attachment"}
+        requested = {o.strip() for o in outcomes.split(",") if o.strip()}
+        invalid = requested - valid
+        if invalid:
+            raise ConfigError(
+                f"unknown outcome(s): {sorted(invalid)}; allowed: {sorted(valid)}",
+                source="cli",
+            )
+
+        conn = db_mod.connect(db_path)
+        db_mod.apply_migrations(conn)
+        # `placeholders` is a fixed-shape "?,?,?" string built from the
+        # validated, allowlisted `requested` set above — no user input is
+        # interpolated here, so the f-string is safe.
+        placeholders = ",".join(["?"] * len(requested))
+        with conn:
+            cursor = conn.execute(
+                f"""
+                UPDATE emails
+                SET processed_at = NULL,
+                    outcome = NULL,
+                    error_code = NULL
+                WHERE outcome IN ({placeholders})
+                  AND dismissed_at IS NULL
+                """,  # noqa: S608 — placeholders are bound parameters
+                tuple(requested),
+            )
+            reset_count = cursor.rowcount
+        emit_success(
+            {"reset": reset_count, "outcomes": sorted(requested)}
         )
     except PipelineError as err:
         emit_error(err)

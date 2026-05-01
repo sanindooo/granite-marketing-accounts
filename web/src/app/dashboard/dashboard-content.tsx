@@ -538,6 +538,67 @@ fetchPendingActions(fy === "all" ? undefined : fy),
               toast.error(err.error || "Upload failed");
             }
           }}
+          onRetryAll={async () => {
+            // Reset processed_at on every email currently in this list, then
+            // kick off a fresh process run so they get re-classified with
+            // any fixes that have landed since.
+            const reset = await fetch("/api/pipeline/retry-errors", {
+              method: "POST",
+            });
+            if (!reset.ok) {
+              const err = await reset.json();
+              toast.error(err.error?.message || "Retry failed");
+              return;
+            }
+            const body = await reset.json();
+            const count = body?.result?.reset ?? 0;
+            toast.success(
+              `Reset ${count} emails for re-processing — running pipeline now…`
+            );
+            // Then trigger Process invoices
+            const run = await fetch("/api/pipeline/stream", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ command: "processInvoices" }),
+            });
+            if (!run.ok) {
+              toast.error("Failed to start processing");
+              return;
+            }
+            // Drain the SSE stream to completion so we know to refresh.
+            const reader = run.body?.getReader();
+            if (reader) {
+              try {
+                while (true) {
+                  const { done } = await reader.read();
+                  if (done) break;
+                }
+              } finally {
+                reader.releaseLock();
+              }
+            }
+            await refreshAllData();
+            toast.success("Re-processing complete");
+          }}
+          onReauthGoogle={async () => {
+            toast.info(
+              "Browser will open for Google sign-in. Approve access (including 2FA), then return here."
+            );
+            const response = await fetch("/api/auth/google/reauth", {
+              method: "POST",
+            });
+            if (response.ok) {
+              toast.success("Google access restored");
+              await refreshAllData();
+            } else {
+              const err = await response.json();
+              toast.error(
+                err.error?.user_message ||
+                  err.error?.message ||
+                  "Re-authentication failed"
+              );
+            }
+          }}
         />
       )}
 

@@ -300,6 +300,7 @@ def test_sheet_module_reexports() -> None:
         "SHEET_TAB_NAMES",
         "FiscalYearSheet",
         "GoogleClients",
+        "LazyGoogleClients",
         "create_fy_workbook",
         "credentials_path",
         "ensure_drive_folder",
@@ -310,3 +311,189 @@ def test_sheet_module_reexports() -> None:
         "validate_fy_label",
     ]:
         assert hasattr(sheet_mod, name), f"missing: {name}"
+
+
+# ---------------------------------------------------------------------------
+# load_credentials — RefreshError translation + non-interactive surface
+# ---------------------------------------------------------------------------
+
+
+class _FakeCreds:
+    """Just enough of Credentials for the refresh code path."""
+
+    def __init__(
+        self,
+        *,
+        valid: bool,
+        expired: bool,
+        refresh_token: str | None,
+        refresh_should_raise: type[Exception] | None = None,
+    ) -> None:
+        self.valid = valid
+        self.expired = expired
+        self.refresh_token = refresh_token
+        self._refresh_should_raise = refresh_should_raise
+
+    def refresh(self, _request: object) -> None:
+        if self._refresh_should_raise is not None:
+            raise self._refresh_should_raise(
+                "invalid_grant: Token has been expired or revoked.",
+                {"error": "invalid_grant"},
+            )
+        self.valid = True
+        self.expired = False
+
+    def to_json(self) -> str:
+        return '{"refresh_token": "fake"}'
+
+
+def test_load_credentials_refresh_error_raises_auth_expired_and_deletes_token(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The fix in this PR: revoked refresh tokens become AuthExpiredError
+    with a user_message, AND the stale token is deleted so the next
+    `granite ops reauth google` starts clean."""
+    from google.auth.exceptions import RefreshError
+
+    from execution.shared.errors import AuthExpiredError
+
+    token_p = tmp_path / "token.json"
+    token_p.write_text("{}")
+    cred_p = tmp_path / "credentials.json"
+    cred_p.write_text("{}")
+    monkeypatch.setenv("GRANITE_GOOGLE_TOKEN", str(token_p))
+    monkeypatch.setenv("GRANITE_GOOGLE_CREDENTIALS", str(cred_p))
+
+    fake_creds = _FakeCreds(
+        valid=False,
+        expired=True,
+        refresh_token="present",
+        refresh_should_raise=RefreshError,
+    )
+
+    # Monkey-patch the Credentials.from_authorized_user_file lookup so we
+    # don't need a real token shape.
+    import google.oauth2.credentials as g_creds
+
+    monkeypatch.setattr(
+        g_creds.Credentials,
+        "from_authorized_user_file",
+        classmethod(lambda _cls, _path, _scopes: fake_creds),
+    )
+
+    with pytest.raises(AuthExpiredError) as excinfo:
+        sheet_mod.load_credentials(allow_interactive=False)
+
+    err = excinfo.value
+    assert err.error_code == "needs_reauth"
+    assert "granite ops reauth google" in err.user_message
+    # Stale token wiped:
+    assert not token_p.exists()
+
+
+def test_load_credentials_no_token_non_interactive_raises_auth_expired(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When called from a non-interactive context (web UI's spawned CLI) and
+    no token exists, surface a clear AuthExpiredError instead of blocking on
+    a browser flow that has no way to complete."""
+    from execution.shared.errors import AuthExpiredError
+
+    cred_p = tmp_path / "credentials.json"
+    cred_p.write_text("{}")
+    monkeypatch.setenv("GRANITE_GOOGLE_TOKEN", str(tmp_path / "missing.json"))
+    monkeypatch.setenv("GRANITE_GOOGLE_CREDENTIALS", str(cred_p))
+
+    with pytest.raises(AuthExpiredError) as excinfo:
+        sheet_mod.load_credentials(allow_interactive=False)
+    assert "granite ops reauth google" in excinfo.value.user_message
+
+
+# ---------------------------------------------------------------------------
+# LazyGoogleClients — defer auth + poison-on-failure
+# ---------------------------------------------------------------------------
+
+
+class TestLazyGoogleClients:
+    def test_does_not_connect_until_first_attribute_access(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Connect should NEVER be called if no one touches the proxy.
+        connect_calls = [0]
+
+        def explode(*_args: object, **_kwargs: object) -> object:
+            connect_calls[0] += 1
+            raise AssertionError("connect() must not be called for unused proxy")
+
+        monkeypatch.setattr(sheet_mod.GoogleClients, "connect", explode)
+        proxy = sheet_mod.LazyGoogleClients()
+        assert proxy.is_connected is False
+        assert connect_calls[0] == 0
+
+    def test_first_access_calls_connect_then_caches(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        fake = object()
+        impl = type(
+            "Stub",
+            (),
+            {"creds": "C", "drive": fake, "sheets": "S", "gspread": "G"},
+        )()
+        connect_calls = [0]
+
+        def fake_connect(*, allow_interactive: bool = True) -> object:
+            connect_calls[0] += 1
+            return impl
+
+        monkeypatch.setattr(sheet_mod.GoogleClients, "connect", fake_connect)
+
+        proxy = sheet_mod.LazyGoogleClients(allow_interactive=False)
+        assert proxy.drive is fake
+        assert proxy.creds == "C"
+        assert proxy.sheets == "S"
+        # Connect should be called exactly once (cached after first call):
+        assert connect_calls[0] == 1
+        assert proxy.is_connected is True
+
+    def test_failure_poisons_proxy_and_re_raises(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from execution.shared.errors import AuthExpiredError
+
+        boom = AuthExpiredError(
+            "Google OAuth refresh failed",
+            source="google",
+            user_message="Run granite ops reauth google",
+        )
+        connect_calls = [0]
+
+        def fake_connect(*, allow_interactive: bool = True) -> object:
+            connect_calls[0] += 1
+            raise boom
+
+        monkeypatch.setattr(sheet_mod.GoogleClients, "connect", fake_connect)
+
+        proxy = sheet_mod.LazyGoogleClients(allow_interactive=False)
+        with pytest.raises(AuthExpiredError):
+            _ = proxy.drive
+        # Subsequent access should NOT re-attempt connect — it should
+        # immediately re-raise the cached error so we don't spam the OAuth
+        # endpoint with a doomed refresh per email in the run.
+        with pytest.raises(AuthExpiredError):
+            _ = proxy.sheets
+        with pytest.raises(AuthExpiredError):
+            _ = proxy.creds
+        assert connect_calls[0] == 1, "must not retry after first auth failure"
+
+    def test_preconnected_bypasses_oauth(self) -> None:
+        # Test/fake usage: pass an existing GoogleClients instance and the
+        # proxy is a thin pass-through with no OAuth involvement.
+        fake_impl = type(
+            "Stub",
+            (),
+            {"creds": "C", "drive": "D", "sheets": "S", "gspread": "G"},
+        )()
+        proxy = sheet_mod.LazyGoogleClients(preconnected=fake_impl)
+        assert proxy.is_connected is True
+        assert proxy.drive == "D"
+        assert proxy.creds == "C"

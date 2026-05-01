@@ -321,6 +321,70 @@ def test_ops_reauth_rejects_unknown_source() -> None:
     doc = json.loads(last_line)
     assert doc["status"] == "error"
     assert "ms365" in doc["message"]
+    # Google should be listed as a supported source now.
+    assert "google" in doc["message"]
+
+
+def test_ingest_invoice_retry_errors_clears_processed_state(tmp_path) -> None:
+    """User clicks "Retry all" — every email currently flagged in Needs
+    Attention has its processed_at, outcome, and error_code reset so the
+    next process run picks them up again."""
+    db = tmp_path / "pipeline.db"
+    runner.invoke(app, ["db", "migrate", "--db", str(db)])
+
+    import sqlite3 as _sqlite
+
+    with _sqlite.connect(str(db)) as conn:
+        conn.execute(
+            "INSERT INTO emails (msg_id, source_adapter, from_addr, subject, "
+            "received_at, processed_at, outcome, error_code) VALUES "
+            "('a', 'ms365', 'x@y', 's', '2026-04-10T00:00:00Z', "
+            "'2026-04-11T00:00:00Z', 'error', 'needs_reauth')"
+        )
+        conn.execute(
+            "INSERT INTO emails (msg_id, source_adapter, from_addr, subject, "
+            "received_at, processed_at, outcome, error_code) VALUES "
+            "('b', 'ms365', 'x@y', 's', '2026-04-10T00:00:00Z', "
+            "'2026-04-11T00:00:00Z', 'invoice', NULL)"
+        )
+        conn.commit()
+
+    result = runner.invoke(
+        app, ["ingest", "invoice", "retry-errors", "--db", str(db)]
+    )
+    assert result.exit_code == 0
+    doc = json.loads(result.stdout.strip().splitlines()[-1])
+    assert doc["status"] == "success"
+    assert doc["reset"] == 1  # only the 'error' row, not the 'invoice' row
+
+    # Verify state on disk
+    with _sqlite.connect(str(db)) as conn:
+        a = conn.execute(
+            "SELECT processed_at, outcome, error_code FROM emails WHERE msg_id = 'a'"
+        ).fetchone()
+        b = conn.execute(
+            "SELECT processed_at, outcome, error_code FROM emails WHERE msg_id = 'b'"
+        ).fetchone()
+    assert a == (None, None, None), "errored email should be reset"
+    assert b == ("2026-04-11T00:00:00Z", "invoice", None), (
+        "successful email must NOT be touched"
+    )
+
+
+def test_ingest_invoice_retry_errors_rejects_invalid_outcome(tmp_path) -> None:
+    db = tmp_path / "pipeline.db"
+    runner.invoke(app, ["db", "migrate", "--db", str(db)])
+    result = runner.invoke(
+        app,
+        [
+            "ingest", "invoice", "retry-errors",
+            "--outcomes", "error,invoice",  # 'invoice' is not in the allowlist
+            "--db", str(db),
+        ],
+    )
+    assert result.exit_code != 0
+    doc = json.loads(result.stdout.strip().splitlines()[-1])
+    assert doc["status"] == "error"
 
 
 def test_ingest_ms365_surfaces_reauth_required(tmp_path, monkeypatch) -> None:

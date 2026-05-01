@@ -36,7 +36,9 @@ from typing import TYPE_CHECKING, Any, Final
 
 from execution.shared import secrets
 from execution.shared.clock import now_utc
-from execution.shared.errors import ConfigError
+from execution.shared.errors import AuthExpiredError, ConfigError
+
+SOURCE_ID: Final[str] = "google"
 
 if TYPE_CHECKING:  # pragma: no cover
     from google.oauth2.credentials import Credentials
@@ -106,13 +108,22 @@ def token_path() -> Path:
     return _project_root() / ".state" / "token.json"
 
 
-def load_credentials() -> Credentials:
+def load_credentials(*, allow_interactive: bool = True) -> Credentials:
     """Return authenticated Google OAuth ``Credentials``.
 
     First run: opens the browser-based :class:`InstalledAppFlow`, prompts for
     consent, then writes the refresh-capable token to ``token_path()``.
     Subsequent runs load the cached token and transparently refresh it.
+
+    Args:
+        allow_interactive: When ``False`` (e.g. running from the web UI's
+            spawned CLI process where there's no terminal), a missing or
+            revoked token surfaces as :class:`AuthExpiredError` with a
+            user_message telling the operator to run
+            ``granite ops reauth google`` from the terminal — instead of
+            blocking on a browser window that no one can see.
     """
+    from google.auth.exceptions import RefreshError
     from google.auth.transport.requests import Request
     from google.oauth2.credentials import Credentials
     from google_auth_oauthlib.flow import InstalledAppFlow
@@ -125,27 +136,65 @@ def load_credentials() -> Credentials:
         creds = Credentials.from_authorized_user_file(  # type: ignore[no-untyped-call]
             str(token_p), list(SCOPES)
         )
+
     if creds and not creds.valid:
         if creds.expired and creds.refresh_token:
-            creds.refresh(Request())
+            try:
+                creds.refresh(Request())
+            except RefreshError as err:
+                # The refresh token has been revoked, expired (7 days for
+                # unverified apps in testing), or the OAuth client was
+                # rotated. Wipe the stale token so the next interactive
+                # run starts clean.
+                _delete_token(token_p)
+                raise AuthExpiredError(
+                    "Google OAuth refresh failed: token has been expired "
+                    "or revoked",
+                    source=SOURCE_ID,
+                    user_message=(
+                        "Google access has expired. Run "
+                        "`granite ops reauth google` from your terminal to "
+                        "re-authorise. (The browser-based OAuth flow can't "
+                        "run from the web UI — it needs a desktop browser.)"
+                    ),
+                    cause=err,
+                    details={"token_path": str(token_p)},
+                ) from err
         else:
             creds = None
+
     if not creds or not creds.valid:
         if not cred_p.exists():
             raise ConfigError(
                 f"Google OAuth client not found at {cred_p}.",
-                source="sheet",
+                source=SOURCE_ID,
                 user_message=(
                     "Download an OAuth 2.0 Desktop client from Google Cloud "
                     "Console, save it as credentials.json at the project root, "
                     "then rerun. See directives/setup.md."
                 ),
             )
+        if not allow_interactive:
+            raise AuthExpiredError(
+                "Google OAuth requires interactive consent",
+                source=SOURCE_ID,
+                user_message=(
+                    "Google access has not been authorised yet. Run "
+                    "`granite ops reauth google` from your terminal."
+                ),
+                details={"token_path": str(token_p)},
+            )
         flow = InstalledAppFlow.from_client_secrets_file(str(cred_p), list(SCOPES))
         creds = flow.run_local_server(port=0)
 
     _write_token(token_p, creds.to_json())
     return creds
+
+
+def _delete_token(token_p: Path) -> None:
+    """Remove a stale token file. Best-effort; missing file is not an error."""
+    with suppress(FileNotFoundError):
+        token_p.unlink()
 
 
 def _write_token(token_p: Path, body: str) -> None:
@@ -178,15 +227,81 @@ class GoogleClients:
         return self._gspread
 
     @classmethod
-    def connect(cls) -> GoogleClients:
+    def connect(cls, *, allow_interactive: bool = True) -> GoogleClients:
         """Construct clients via the OAuth flow. Fails fast under mock mode."""
         if secrets.is_mock():
             raise ConfigError(
                 "GoogleClients.connect() called under MOCK_MODE; tests must "
                 "inject a fake.",
-                source="sheet",
+                source=SOURCE_ID,
             )
-        return cls(load_credentials())
+        return cls(load_credentials(allow_interactive=allow_interactive))
+
+
+class LazyGoogleClients:
+    """Defers Google OAuth until something actually needs Drive/Sheets.
+
+    Why: classify-only runs (where every email turns out to be ``neither`` /
+    ``no_attachment`` / ``needs_manual_download``) never reach
+    :func:`file_invoice` and therefore never need Google. Constructing
+    :class:`GoogleClients` upfront caused the entire run to fail when the
+    Google refresh token had expired — even though no Drive upload was
+    actually attempted. With this proxy, the refresh-token-expired error
+    only surfaces when an invoice/receipt is found AND we try to upload it.
+
+    On first :class:`AuthExpiredError`, the proxy is poisoned: subsequent
+    accesses re-raise the same exception without re-trying. This avoids
+    spamming the OAuth endpoint with a doomed refresh per email; the user
+    sees one ``needs_reauth`` error per emails-that-needed-Google rather
+    than one per all-emails-in-the-run.
+
+    Test/fake usage: pass an existing :class:`GoogleClients` instance via
+    ``preconnected=`` and the proxy is a thin pass-through.
+    """
+
+    def __init__(
+        self,
+        *,
+        allow_interactive: bool = False,
+        preconnected: GoogleClients | None = None,
+    ) -> None:
+        self._allow_interactive = allow_interactive
+        self._impl: GoogleClients | None = preconnected
+        self._failed_with: AuthExpiredError | None = None
+
+    def _ensure(self) -> GoogleClients:
+        if self._failed_with is not None:
+            raise self._failed_with
+        if self._impl is None:
+            try:
+                self._impl = GoogleClients.connect(
+                    allow_interactive=self._allow_interactive
+                )
+            except AuthExpiredError as err:
+                self._failed_with = err
+                raise
+        return self._impl
+
+    @property
+    def is_connected(self) -> bool:
+        """True if the OAuth flow has completed at least once for this proxy."""
+        return self._impl is not None
+
+    @property
+    def creds(self) -> Credentials:
+        return self._ensure().creds
+
+    @property
+    def drive(self) -> Any:
+        return self._ensure().drive
+
+    @property
+    def sheets(self) -> Any:
+        return self._ensure().sheets
+
+    @property
+    def gspread(self) -> Any:
+        return self._ensure().gspread
 
 
 @dataclass(frozen=True, slots=True)

@@ -26,9 +26,38 @@ interface NeedsAttentionCardProps {
   onDismiss: (msgId: string, reason: "not_invoice" | "resolved", blockDomain?: boolean) => Promise<void>;
   onBulkDismiss: (msgIds: string[], reason: "not_invoice" | "resolved") => Promise<void>;
   onUploadPdf: (msgId: string, file: File) => Promise<void>;
+  onRetryAll?: () => Promise<void>;
+  onReauthGoogle?: () => Promise<void>;
 }
 
-export function NeedsAttentionCard({ pendingActions, onDismiss, onBulkDismiss, onUploadPdf }: NeedsAttentionCardProps) {
+// Map machine error_codes to short, user-readable labels. Unknown codes
+// fall through as the raw value so a new error_code at least surfaces
+// in the UI rather than being hidden as "Processing error".
+const ERROR_CODE_LABELS: Record<string, string> = {
+  needs_reauth: "Re-authentication required",
+  rate_limited: "Rate limited (will retry)",
+  schema_violation: "Bad response from upstream",
+  data_quality: "Couldn't read invoice data",
+  config_error: "Configuration problem",
+  budget_exceeded: "Budget cap hit",
+  ssrf_rejected: "URL blocked (security)",
+  path_violation: "File path blocked (security)",
+  unhandled_exception: "Unexpected crash",
+};
+
+function describeErrorCode(code: string | null): string {
+  if (!code) return "Processing error";
+  return ERROR_CODE_LABELS[code] ?? `Processing error (${code})`;
+}
+
+export function NeedsAttentionCard({
+  pendingActions,
+  onDismiss,
+  onBulkDismiss,
+  onUploadPdf,
+  onRetryAll,
+  onReauthGoogle,
+}: NeedsAttentionCardProps) {
   const [isCollapsed, setIsCollapsed] = useState(true);
   const [expandedId, setExpandedId] = useState<string | null>(null);
   const [emailBody, setEmailBody] = useState<EmailBody | null>(null);
@@ -42,6 +71,13 @@ export function NeedsAttentionCard({ pendingActions, onDismiss, onBulkDismiss, o
 
   // Inline dismiss confirmation state (shows "Block domain? Yes/No" after clicking Not Invoice)
   const [confirmingDismiss, setConfirmingDismiss] = useState<string | null>(null);
+
+  const [retrying, setRetrying] = useState(false);
+  const [reauthing, setReauthing] = useState(false);
+
+  const needsReauth = pendingActions.some(
+    (a) => a.errorCode === "needs_reauth"
+  );
 
   const toggleSelection = (msgId: string) => {
     setSelectedIds((prev) => {
@@ -176,6 +212,57 @@ export function NeedsAttentionCard({ pendingActions, onDismiss, onBulkDismiss, o
         </div>
       </CardHeader>
       {!isCollapsed && <CardContent>
+        {(needsReauth || onRetryAll) && (
+          <div className="mb-3 flex flex-wrap items-center gap-2">
+            {needsReauth && onReauthGoogle && (
+              <div
+                className="flex flex-1 items-center justify-between gap-3 rounded-md border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-800"
+                role="alert"
+              >
+                <span>
+                  Google access has expired — re-authenticate to unblock
+                  invoice filing.
+                </span>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  className="h-7 border-red-300 bg-white text-xs text-red-700 hover:bg-red-100"
+                  disabled={reauthing}
+                  onClick={async (e) => {
+                    e.stopPropagation();
+                    setReauthing(true);
+                    try {
+                      await onReauthGoogle();
+                    } finally {
+                      setReauthing(false);
+                    }
+                  }}
+                >
+                  {reauthing ? "Opening browser…" : "Re-authenticate Google"}
+                </Button>
+              </div>
+            )}
+            {onRetryAll && (
+              <Button
+                variant="outline"
+                size="sm"
+                className="h-7 text-xs"
+                disabled={retrying}
+                onClick={async (e) => {
+                  e.stopPropagation();
+                  setRetrying(true);
+                  try {
+                    await onRetryAll();
+                  } finally {
+                    setRetrying(false);
+                  }
+                }}
+              >
+                {retrying ? "Retrying…" : "Retry all"}
+              </Button>
+            )}
+          </div>
+        )}
         <Table>
           <TableHeader>
             <TableRow>
@@ -228,18 +315,21 @@ export function NeedsAttentionCard({ pendingActions, onDismiss, onBulkDismiss, o
                     {new Date(action.receivedAt).toLocaleDateString()}
                   </TableCell>
                   <TableCell>
-                    <span className={`inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium ${
-                      action.outcome === "needs_manual_download"
-                        ? "bg-amber-100 text-amber-800"
-                        : action.outcome === "no_attachment"
-                        ? "bg-blue-100 text-blue-800"
-                        : "bg-red-100 text-red-800"
-                    }`}>
+                    <span
+                      title={action.errorCode || undefined}
+                      className={`inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium ${
+                        action.outcome === "needs_manual_download"
+                          ? "bg-amber-100 text-amber-800"
+                          : action.outcome === "no_attachment"
+                          ? "bg-blue-100 text-blue-800"
+                          : "bg-red-100 text-red-800"
+                      }`}
+                    >
                       {action.outcome === "needs_manual_download"
                         ? "Manual download needed"
                         : action.outcome === "no_attachment"
                         ? "No PDF attached"
-                        : "Processing error"}
+                        : describeErrorCode(action.errorCode)}
                     </span>
                   </TableCell>
                   <TableCell>
