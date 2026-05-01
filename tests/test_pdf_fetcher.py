@@ -78,6 +78,10 @@ _PUB = "8.8.8.8"
         ("https://checkout.paddle.com/i/x", "paddle"),
         ("https://zoom.us/billing/invoice/abc", "login_gated"),
         ("https://github.com/orgs/acme/billing/invoice.pdf", "login_gated"),
+        # Webflow added 2026-05-01: their "PDF" anchor in receipt emails
+        # 302s to webflow.com/login → 403. Short-circuit to NEEDS_MANUAL.
+        ("https://webflow.com/dashboard/invoice/pdf/cus_X/in_X.pdf",
+         "login_gated"),
         ("https://billing.example.com/inv.pdf", "generic"),
     ],
 )
@@ -156,6 +160,58 @@ def test_fetch_rejects_html_response_as_needs_manual(ip_map):
     assert outcome.status is FetchStatus.NEEDS_MANUAL_DOWNLOAD
     assert outcome.reason is not None
     assert "PDF" in outcome.reason
+
+
+def test_fetch_short_circuits_webflow_invoice_pdf(ip_map):
+    """Regression: 2026-05-01 the user reported every Webflow invoice email
+    crashed with HTTPStatusError 403 because webflow.com/dashboard/invoice/pdf
+    302s to webflow.com/login → 403. Webflow is now in LOGIN_GATED_HOSTS so
+    the fetcher short-circuits before ever making the HTTP request."""
+    ip_map({"webflow.com": [_PUB]})
+    called: list[bool] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        called.append(True)
+        return httpx.Response(200)
+
+    transport = httpx.MockTransport(handler)
+    with http_mod.SafeHttpClient(transport=transport) as client:
+        outcome = fetch_invoice_pdf(
+            "https://webflow.com/dashboard/invoice/pdf/cus_X/in_X.pdf",
+            client=client,
+        )
+    assert outcome.status is FetchStatus.NEEDS_MANUAL_DOWNLOAD
+    assert outcome.provider == "login_gated"
+    assert outcome.reason and "Webflow" in outcome.reason
+    assert called == [], "must not hit the network for known login-gated host"
+
+
+def test_fetch_handles_403_from_unknown_host_as_needs_manual(ip_map):
+    """Defensive: an unrecognised host returning 401/403 (e.g. session
+    expired, IP-blocked) used to propagate HTTPStatusError to the
+    processor's catch-all and surface as 'unexpected'. Now treated as
+    NEEDS_MANUAL_DOWNLOAD so the user can finish the download manually."""
+    ip_map({"unknown-billing.example": [_PUB]})
+    transport = _mock_transport(
+        [httpx.Response(403, content=b"Forbidden")]
+    )
+    with http_mod.SafeHttpClient(transport=transport) as client:
+        outcome = fetch_invoice_pdf(
+            "https://unknown-billing.example/inv.pdf", client=client
+        )
+    assert outcome.status is FetchStatus.NEEDS_MANUAL_DOWNLOAD
+    assert outcome.reason and "403" in outcome.reason
+
+
+def test_fetch_handles_5xx_as_upstream_error(ip_map):
+    ip_map({"flaky.example": [_PUB]})
+    transport = _mock_transport([httpx.Response(500, content=b"oops")])
+    with http_mod.SafeHttpClient(transport=transport) as client:
+        outcome = fetch_invoice_pdf(
+            "https://flaky.example/inv.pdf", client=client
+        )
+    assert outcome.status is FetchStatus.UPSTREAM_ERROR
+    assert outcome.reason and "500" in outcome.reason
 
 
 def test_fetch_returns_ssrf_rejected_on_private_ip(ip_map):

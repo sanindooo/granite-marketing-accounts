@@ -28,6 +28,8 @@ from enum import StrEnum
 from typing import Final
 from urllib.parse import urlparse
 
+import httpx
+
 from execution.shared.errors import RateLimitedError, SSRFValidationError
 from execution.shared.http import FetchResult, SafeHttpClient
 
@@ -64,6 +66,13 @@ LOGIN_GATED_HOSTS: Final[dict[str, str]] = {
     "thetrainline.com": "Trainline requires account login for ticket PDF",
     "www.thetrainline.com": "Trainline requires account login for ticket PDF",
     "booking.thetrainline.com": "Trainline requires account login for ticket PDF",
+    # Webflow's "PDF" anchor in receipt emails points at
+    # webflow.com/dashboard/invoice/pdf/<cus_X>/<in_X>.pdf which 302s to
+    # webflow.com/login → 403 when unauthenticated. Short-circuit to
+    # NEEDS_MANUAL_DOWNLOAD so the user gets a clickable link rather than
+    # an "unexpected" crash on the HTTPStatusError.
+    "webflow.com": "Webflow requires account login for invoice PDF",
+    "www.webflow.com": "Webflow requires account login for invoice PDF",
 }
 
 # Providers whose URLs expire quickly — fetch on email receipt, not deferred.
@@ -165,6 +174,29 @@ def fetch_invoice_pdf(
             url=url,
             provider=provider,
             reason=str(err),
+        )
+    except httpx.HTTPStatusError as err:
+        # The fetch reached the host but returned 4xx/5xx. Treat 401/403 as
+        # NEEDS_MANUAL_DOWNLOAD (auth wall — user can finish the download
+        # manually) and other status codes as UPSTREAM_ERROR. Without this
+        # branch httpx would propagate up to _process_one's catch-all and
+        # surface as "unexpected" — exactly the Webflow case we hit.
+        status = err.response.status_code
+        if status in (401, 403):
+            return FetchOutcome(
+                status=FetchStatus.NEEDS_MANUAL_DOWNLOAD,
+                url=url,
+                provider=provider,
+                reason=(
+                    f"upstream returned {status} — host likely requires "
+                    "session login; download manually and re-upload"
+                ),
+            )
+        return FetchOutcome(
+            status=FetchStatus.UPSTREAM_ERROR,
+            url=url,
+            provider=provider,
+            reason=f"HTTP {status} from upstream",
         )
 
     return FetchOutcome(

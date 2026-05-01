@@ -521,6 +521,13 @@ def _process_one(
         )
         if pdf_bytes is None:
             if fetch_outcome and fetch_outcome.status == FetchStatus.NEEDS_MANUAL_DOWNLOAD:
+                # Persist the URL so the dashboard can render it as a
+                # clickable link beside the Upload PDF button. The outer
+                # _update_email_outcome call won't clobber it because that
+                # function deliberately leaves manual_download_url alone.
+                _set_manual_download_url(
+                    conn, email_row.msg_id, fetch_outcome.url
+                )
                 return "needs_manual_download", None
             return "no_attachment", None
         attachment_index = 0
@@ -663,6 +670,11 @@ def _update_email_outcome(
     ``error_message`` is the human-readable failure detail (e.g. an LLM
     parser exception, a Drive 4xx body) — capped to ``_ERROR_MESSAGE_CAP``
     chars so a verbose stack trace doesn't bloat the row. None on success.
+
+    Note: ``manual_download_url`` is intentionally NOT updated here so a
+    successful retry (which routes through this function with no URL)
+    doesn't clobber a URL set by a prior failed run. Use
+    :func:`_set_manual_download_url` to write it explicitly.
     """
     truncated_msg = (
         error_message[:_ERROR_MESSAGE_CAP] if error_message else None
@@ -671,10 +683,37 @@ def _update_email_outcome(
         conn.execute(
             """
             UPDATE emails
-            SET processed_at = ?, outcome = ?, error_code = ?, error_message = ?
+            SET processed_at = ?,
+                outcome = ?,
+                error_code = ?,
+                error_message = ?
             WHERE msg_id = ?
             """,
             (now_utc().isoformat(), outcome, error_code, truncated_msg, msg_id),
+        )
+
+
+def _set_manual_download_url(
+    conn: sqlite3.Connection, msg_id: str, url: str
+) -> None:
+    """Persist the user-clickable invoice URL onto the email row.
+
+    Validates the scheme is ``https://`` to keep a malicious email from
+    planting a ``javascript:`` or ``data:`` URL that would become XSS the
+    moment the dashboard renders it as ``<a href={url}>``.
+    """
+    from urllib.parse import urlparse
+
+    try:
+        scheme = urlparse(url).scheme.lower()
+    except ValueError:
+        return
+    if scheme != "https":
+        return
+    with conn:
+        conn.execute(
+            "UPDATE emails SET manual_download_url = ? WHERE msg_id = ?",
+            (url, msg_id),
         )
 
 

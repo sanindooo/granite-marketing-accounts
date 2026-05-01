@@ -356,28 +356,39 @@ export function NeedsAttentionCard({
                   </TableCell>
                   <TableCell>
                     <div className="flex items-center gap-1">
-                      {(action.outcome === "needs_manual_download" || action.outcome === "no_attachment") && (
-                        <>
-                          <Input
-                            type="file"
-                            accept=".pdf"
-                            className="hidden"
-                            ref={(el) => {
-                              if (el) fileInputRefs.current.set(action.msgId, el);
-                            }}
-                            onChange={(e) => handleFileSelect(action.msgId, e.target.files?.[0])}
-                          />
-                          <Button
-                            variant="outline"
-                            size="sm"
-                            className="h-7 px-2 text-xs"
-                            disabled={uploadingId === action.msgId}
-                            onClick={() => fileInputRefs.current.get(action.msgId)?.click()}
-                          >
-                            {uploadingId === action.msgId ? "Uploading..." : "Upload PDF"}
-                          </Button>
-                        </>
+                      {action.manualDownloadUrl && (
+                        <a
+                          href={action.manualDownloadUrl}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="rounded border border-blue-200 bg-blue-50 px-2 py-1 text-xs text-blue-700 hover:bg-blue-100"
+                          title={`Open invoice URL: ${action.manualDownloadUrl}`}
+                        >
+                          Open URL
+                        </a>
                       )}
+                      {/* Upload PDF is offered for any failure mode where
+                          the user might have manually obtained the file —
+                          including `error` (e.g. unhandled HTTP failure
+                          mid-fetch) so we don't leave the user stranded. */}
+                      <Input
+                        type="file"
+                        accept=".pdf"
+                        className="hidden"
+                        ref={(el) => {
+                          if (el) fileInputRefs.current.set(action.msgId, el);
+                        }}
+                        onChange={(e) => handleFileSelect(action.msgId, e.target.files?.[0])}
+                      />
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        className="h-7 px-2 text-xs"
+                        disabled={uploadingId === action.msgId}
+                        onClick={() => fileInputRefs.current.get(action.msgId)?.click()}
+                      >
+                        {uploadingId === action.msgId ? "Uploading..." : "Upload PDF"}
+                      </Button>
                       {confirmingDismiss === action.msgId ? (
                         <div className="flex items-center gap-0.5 rounded border bg-white px-1.5 py-0.5 shadow-sm">
                           <span className="text-xs text-muted-foreground">Block?</span>
