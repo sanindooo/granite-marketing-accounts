@@ -488,3 +488,362 @@ def test_raw_email_as_email_row_shape():
 
 def test_ms365_module_surfaces_source_id():
     assert ms365.SOURCE_ID == "ms365"
+
+
+# ---------------------------------------------------------------------------
+# Adapter search_inbox
+# ---------------------------------------------------------------------------
+
+# Per MS Graph docs (api-reference/v1.0/api/user-list-messages.md):
+#   "Do not try to extract the $skip value from the @odata.nextLink URL to
+#    manipulate responses. This API uses the $skip value to keep count of all
+#    the items it has gone through in the user's mailbox to return a page of
+#    message-type items."
+# Combined with $search, manual $skip yields HTTP 400. The tests below pin
+# the contract: $search → @odata.nextLink, $filter-only → manual $skip.
+
+_INBOX_SEARCH_URL = f"{ms365.GRAPH_BASE}/me/mailFolders/inbox/messages"
+
+
+def _recording_transport(
+    handler: Any,
+) -> tuple[httpx.MockTransport, list[httpx.Request]]:
+    """MockTransport that records every request for assertion."""
+    seen: list[httpx.Request] = []
+
+    def wrapped(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return handler(request)
+
+    return httpx.MockTransport(wrapped), seen
+
+
+def _json_response(payload: dict[str, Any], status: int = 200) -> httpx.Response:
+    return httpx.Response(
+        status,
+        content=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+    )
+
+
+class TestSearchInboxSenderPath:
+    """Sender ($search) path must follow @odata.nextLink, never manual $skip."""
+
+    def test_first_request_uses_search_param_with_normalised_value(self):
+        seen: list[httpx.Request] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen.append(request)
+            return _json_response({"value": []})
+
+        adapter = Ms365Adapter(
+            auth=_StaticAuth(),  # type: ignore[arg-type]
+            http=httpx.Client(transport=httpx.MockTransport(handler)),
+        )
+        list(adapter.search_inbox(sender="Open AI"))
+        adapter.close()
+
+        assert len(seen) == 1
+        params = dict(seen[0].url.params)
+        # Normalisation: lowercase + spaces dropped → "openai"
+        assert params["$search"] == '"from:openai"'
+        # Critically, no manual $skip on $search requests:
+        assert "$skip" not in params
+        # Required header for $search:
+        assert seen[0].headers.get("ConsistencyLevel") == "eventual"
+
+    def test_paginates_via_nextLink_not_manual_skip(self):
+        # Server-generated nextLink with $skiptoken param. The adapter must
+        # follow it verbatim — never construct $skip itself.
+        next_url = (
+            "https://graph.microsoft.com/v1.0/me/mailFolders/inbox/messages"
+            "?%24skiptoken=ABCDEF"
+        )
+        page1 = [_email_payload(f"w-{i}") for i in range(3)]
+        page2 = [_email_payload(f"w-page2-{i}") for i in range(2)]
+        seen: list[httpx.Request] = []
+        call_count = [0]
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen.append(request)
+            call_count[0] += 1
+            if call_count[0] == 1:
+                return _json_response(
+                    {"value": page1, "@odata.nextLink": next_url}
+                )
+            return _json_response({"value": page2})
+
+        adapter = Ms365Adapter(
+            auth=_StaticAuth(),  # type: ignore[arg-type]
+            http=httpx.Client(transport=httpx.MockTransport(handler)),
+        )
+        batches = list(adapter.search_inbox(sender="Webflow"))
+        adapter.close()
+
+        all_msgs = [e for batch in batches for e in batch]
+        assert [m.msg_id for m in all_msgs] == [
+            "w-0", "w-1", "w-2", "w-page2-0", "w-page2-1",
+        ]
+        # Every request to the $search path must NOT carry a manual $skip:
+        for req in seen:
+            params = dict(req.url.params)
+            assert "$skip" not in params, (
+                f"manual $skip is forbidden with $search; saw {req.url}"
+            )
+
+    def test_consistency_level_header_set_on_every_page(self):
+        next_url = "https://graph.microsoft.com/v1.0/me/x?%24skiptoken=NEXT"
+        seen: list[httpx.Request] = []
+        call_count = [0]
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen.append(request)
+            call_count[0] += 1
+            if call_count[0] == 1:
+                return _json_response(
+                    {"value": [_email_payload("a")], "@odata.nextLink": next_url}
+                )
+            return _json_response({"value": [_email_payload("b")]})
+
+        adapter = Ms365Adapter(
+            auth=_StaticAuth(),  # type: ignore[arg-type]
+            http=httpx.Client(transport=httpx.MockTransport(handler)),
+        )
+        list(adapter.search_inbox(sender="Webflow"))
+        adapter.close()
+
+        # Per docs: ConsistencyLevel is NOT carried automatically into nextLink
+        # follows. Must be explicit on every page.
+        assert len(seen) == 2
+        for req in seen:
+            assert req.headers.get("ConsistencyLevel") == "eventual"
+
+    def test_terminates_when_no_nextLink(self):
+        def handler(request: httpx.Request) -> httpx.Response:
+            return _json_response({"value": [_email_payload("only")]})
+
+        adapter = Ms365Adapter(
+            auth=_StaticAuth(),  # type: ignore[arg-type]
+            http=httpx.Client(transport=httpx.MockTransport(handler)),
+        )
+        batches = list(adapter.search_inbox(sender="Webflow"))
+        adapter.close()
+        assert [e.msg_id for batch in batches for e in batch] == ["only"]
+
+    def test_400_response_raises_schema_violation_with_body(self):
+        graph_error = {
+            "error": {
+                "code": "InvalidRequest",
+                "message": "Invalid query parameter",
+            }
+        }
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return _json_response(graph_error, status=400)
+
+        adapter = Ms365Adapter(
+            auth=_StaticAuth(),  # type: ignore[arg-type]
+            http=httpx.Client(transport=httpx.MockTransport(handler)),
+        )
+        with pytest.raises(SchemaViolationError) as excinfo:
+            list(adapter.search_inbox(sender="Webflow"))
+        adapter.close()
+        # Surface the Graph body to the operator, not just the status code.
+        assert excinfo.value.details["body"] == graph_error
+
+    def test_dedupes_repeated_msg_ids_across_pages(self):
+        # Even if Graph echoes a duplicate across pages, we must yield it once.
+        next_url = "https://graph.microsoft.com/v1.0/me/x?%24skiptoken=NXT"
+        call_count = [0]
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            call_count[0] += 1
+            if call_count[0] == 1:
+                return _json_response(
+                    {
+                        "value": [_email_payload("dup"), _email_payload("a")],
+                        "@odata.nextLink": next_url,
+                    }
+                )
+            return _json_response(
+                {"value": [_email_payload("dup"), _email_payload("b")]}
+            )
+
+        adapter = Ms365Adapter(
+            auth=_StaticAuth(),  # type: ignore[arg-type]
+            http=httpx.Client(transport=httpx.MockTransport(handler)),
+        )
+        batches = list(adapter.search_inbox(sender="Webflow"))
+        adapter.close()
+        assert [e.msg_id for batch in batches for e in batch] == ["dup", "a", "b"]
+
+    def test_filters_dates_in_python_when_combined_with_search(self):
+        # MS Graph forbids $filter alongside $search — we must filter in Python.
+        in_range = {
+            **_email_payload("in"),
+            "receivedDateTime": "2026-04-15T12:00:00Z",
+        }
+        out_of_range = {
+            **_email_payload("out"),
+            "receivedDateTime": "2026-03-01T12:00:00Z",
+        }
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            params = dict(request.url.params)
+            # The HTTP request must NOT contain $filter when $search is in play.
+            assert "$filter" not in params
+            return _json_response({"value": [in_range, out_of_range]})
+
+        adapter = Ms365Adapter(
+            auth=_StaticAuth(),  # type: ignore[arg-type]
+            http=httpx.Client(transport=httpx.MockTransport(handler)),
+        )
+        batches = list(
+            adapter.search_inbox(
+                sender="Webflow", date_from="2026-04-01", date_to="2026-04-30"
+            )
+        )
+        adapter.close()
+        assert [e.msg_id for batch in batches for e in batch] == ["in"]
+
+    def test_respects_max_pages(self):
+        # Infinite loop guard: if the server keeps returning nextLink, stop.
+        call_count = [0]
+        next_url = "https://graph.microsoft.com/v1.0/me/x?$skiptoken=AGAIN"
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            call_count[0] += 1
+            return _json_response(
+                {"value": [_email_payload(f"x-{call_count[0]}")],
+                 "@odata.nextLink": next_url}
+            )
+
+        adapter = Ms365Adapter(
+            auth=_StaticAuth(),  # type: ignore[arg-type]
+            http=httpx.Client(transport=httpx.MockTransport(handler)),
+        )
+        list(adapter.search_inbox(sender="Webflow", max_pages=3))
+        adapter.close()
+        assert call_count[0] == 3
+
+
+class TestSearchInboxFilterPath:
+    """Date-only path keeps manual $skip — workaround for Graph's
+    nextLink-with-datetime-filter cursor bug (commit f9eccfe)."""
+
+    def test_filter_only_uses_skip_pagination(self):
+        # First call: $skip=0 returns 1 email. Second: $skip=100 returns 0 → stop.
+        seen: list[httpx.Request] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen.append(request)
+            params = dict(request.url.params)
+            skip = params.get("$skip", "0")
+            if skip == "0":
+                return _json_response({"value": [_email_payload("d-1")]})
+            return _json_response({"value": []})
+
+        adapter = Ms365Adapter(
+            auth=_StaticAuth(),  # type: ignore[arg-type]
+            http=httpx.Client(transport=httpx.MockTransport(handler)),
+        )
+        list(adapter.search_inbox(date_from="2026-04-01", date_to="2026-04-30"))
+        adapter.close()
+
+        # Both requests carry $skip and $filter (no $search):
+        for req in seen:
+            params = dict(req.url.params)
+            assert "$search" not in params
+            assert "$filter" in params
+            assert "$skip" in params
+        # Manual $skip increments by page_size between requests
+        skips = [int(dict(r.url.params)["$skip"]) for r in seen]
+        assert skips[0] == 0
+        assert skips[1] > 0
+
+    def test_filter_only_does_not_set_consistency_level_header(self):
+        seen: list[httpx.Request] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen.append(request)
+            return _json_response({"value": []})
+
+        adapter = Ms365Adapter(
+            auth=_StaticAuth(),  # type: ignore[arg-type]
+            http=httpx.Client(transport=httpx.MockTransport(handler)),
+        )
+        list(adapter.search_inbox(date_from="2026-04-01"))
+        adapter.close()
+        assert seen[0].headers.get("ConsistencyLevel") is None
+
+    def test_webflow_rescan_regression(self):
+        """End-to-end pin for the bug from 2026-05-01.
+
+        User clicked Sync Emails with vendor=Webflow and Re-scan toggled on.
+        CLI passed --sender Webflow to search_inbox. Old code sent
+        $search="from:webflow" with manual $skip=0, then $skip=100, ...
+        MS Graph returned 400 because $search forbids manual $skip.
+
+        New code follows @odata.nextLink and never sends $skip alongside
+        $search. This test would have caught the original bug.
+        """
+        next_url = (
+            "https://graph.microsoft.com/v1.0/me/mailFolders/inbox/messages"
+            "?%24skiptoken=PAGE2"
+        )
+        seen_requests: list[httpx.Request] = []
+        call_count = [0]
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen_requests.append(request)
+            call_count[0] += 1
+            params = dict(request.url.params)
+
+            # Simulate the actual MS Graph 400 the user hit when manual $skip
+            # is sent with $search:
+            if "$skip" in params and "$search" in params:
+                return _json_response(
+                    {"error": {"code": "InvalidRequest",
+                               "message": "$skip is not supported with $search"}},
+                    status=400,
+                )
+
+            if call_count[0] == 1:
+                return _json_response(
+                    {"value": [_email_payload(f"webflow-{i}") for i in range(5)],
+                     "@odata.nextLink": next_url}
+                )
+            return _json_response(
+                {"value": [_email_payload(f"webflow-{i}") for i in range(5, 8)]}
+            )
+
+        adapter = Ms365Adapter(
+            auth=_StaticAuth(),  # type: ignore[arg-type]
+            http=httpx.Client(transport=httpx.MockTransport(handler)),
+        )
+        batches = list(adapter.search_inbox(sender="Webflow"))
+        adapter.close()
+
+        all_msgs = [e for batch in batches for e in batch]
+        assert len(all_msgs) == 8, "Should return all 8 emails across 2 pages"
+        assert {m.msg_id for m in all_msgs} == {
+            f"webflow-{i}" for i in range(8)
+        }
+
+    def test_no_filters_returns_recent_inbox_with_orderby(self):
+        seen: list[httpx.Request] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen.append(request)
+            return _json_response({"value": []})
+
+        adapter = Ms365Adapter(
+            auth=_StaticAuth(),  # type: ignore[arg-type]
+            http=httpx.Client(transport=httpx.MockTransport(handler)),
+        )
+        list(adapter.search_inbox())
+        adapter.close()
+        params = dict(seen[0].url.params)
+        assert params["$orderby"] == "receivedDateTime desc"
+        assert "$search" not in params
+        assert "$filter" not in params

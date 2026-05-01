@@ -348,19 +348,39 @@ class Ms365Adapter:
     ) -> Iterator[list[RawEmail]]:
         """Search inbox with optional filters.
 
-        Unlike ``fetch_since``, this uses a regular search query instead of
+        Unlike :meth:`fetch_since`, this uses a regular search query instead of
         delta sync. Useful for finding emails from a specific sender or
         within a date range.
 
-        Note: MS Graph doesn't allow $search with $filter together. When both
-        sender and date filters are specified, we use $search for sender and
-        filter dates in Python.
+        MS Graph imposes two opposing constraints on ``/me/messages`` paging:
+
+        1. ``$search`` is **incompatible with manual ``$skip``**. Per the docs
+           (https://learn.microsoft.com/.../user-list-messages):
+           "Do not try to extract the $skip value from the @odata.nextLink
+           URL to manipulate responses. This API uses the $skip value to
+           keep count of all the items it has gone through in the user's
+           mailbox to return a page of message-type items." Manually
+           computing ``$skip = page * page_size`` undercounts because Graph's
+           internal scan position can already be much larger than the
+           page count, and combining $search with manual $skip yields HTTP
+           400 ("MS Graph returned unexpected status 400") on subsequent
+           pages — and sometimes immediately. Fix: follow ``@odata.nextLink``
+           verbatim on the $search path.
+        2. ``$filter`` on datetime fields with ``@odata.nextLink`` has a
+           known server-side cursor bug that returns duplicates and misses
+           results (issue documented in commit f9eccfe). For the $filter-
+           only path we keep manual ``$skip`` paging plus the dedup safety
+           net.
+
+        ``ConsistencyLevel: eventual`` is required for $search and is NOT
+        carried automatically into nextLink follow-ups; we set it on every
+        request when $search is in play.
 
         Args:
-            sender: Filter by sender name/email (e.g., "uber", "anthropic")
-            date_from: Filter emails received on or after this date (YYYY-MM-DD)
-            date_to: Filter emails received on or before this date (YYYY-MM-DD)
-            max_pages: Maximum number of API pages to fetch (default 10, ~1000 emails)
+            sender: Filter by sender name/email (e.g., "uber", "anthropic").
+            date_from: Filter emails received on or after this date (YYYY-MM-DD).
+            date_to: Filter emails received on or before this date (YYYY-MM-DD).
+            max_pages: Maximum number of API pages to fetch (default 10).
 
         Yields:
             Batches of :class:`RawEmail` matching the search criteria.
@@ -370,31 +390,25 @@ class Ms365Adapter:
         token = self._auth.access_token()
         client = self._client()
 
-        url = f"{GRAPH_BASE}/me/mailFolders/inbox/messages"
-        headers: dict[str, str] = {
-            "Authorization": f"Bearer {token}",
-        }
+        base_url = f"{GRAPH_BASE}/me/mailFolders/inbox/messages"
+        headers: dict[str, str] = {"Authorization": f"Bearer {token}"}
 
-        # MS Graph doesn't allow $search with $filter or $orderby
-        # Strategy: use $search for sender (more flexible), filter dates in Python
         use_search = sender is not None
-        filter_dates_in_python = use_search and (date_from or date_to)
+        filter_dates_in_python = use_search and bool(date_from or date_to)
 
-        # Build base params (rebuilt each page for $skip pagination)
         base_params: dict[str, str] = {
             "$top": str(self._page_size),
             "$select": SELECT_FIELDS,
         }
 
         if sender:
-            # Normalize: remove spaces for better matching
-            # "Open AI" → search for "openai" (more likely to match openai.com)
+            # Normalize: lowercase + drop spaces so "Open AI" → "openai"
+            # (matches the openai.com domain rather than missing on whitespace).
             normalized = sender.lower().replace(" ", "")
             base_params["$search"] = f'"from:{normalized}"'
-            headers["ConsistencyLevel"] = "eventual"  # Required for $search
-            # Note: Can't use $orderby with $search
+            headers["ConsistencyLevel"] = "eventual"
+            # NB: $orderby and manual $skip are forbidden alongside $search.
         else:
-            # No sender search, can use $filter and $orderby
             base_params["$orderby"] = "receivedDateTime desc"
             if date_from or date_to:
                 filters: list[str] = []
@@ -404,50 +418,76 @@ class Ms365Adapter:
                     filters.append(f"receivedDateTime le {date_to}T23:59:59Z")
                 base_params["$filter"] = " and ".join(filters)
 
-        # Parse date boundaries for Python filtering (make timezone-aware)
-        date_from_dt = dt.fromisoformat(f"{date_from}T00:00:00").replace(tzinfo=UTC) if date_from else None
-        date_to_dt = dt.fromisoformat(f"{date_to}T23:59:59").replace(tzinfo=UTC) if date_to else None
+        date_from_dt = (
+            dt.fromisoformat(f"{date_from}T00:00:00").replace(tzinfo=UTC)
+            if date_from
+            else None
+        )
+        date_to_dt = (
+            dt.fromisoformat(f"{date_to}T23:59:59").replace(tzinfo=UTC)
+            if date_to
+            else None
+        )
 
         buffered: list[RawEmail] = []
-        seen_ids: set[str] = set()  # MS Graph pagination can return duplicates
+        seen_ids: set[str] = set()
         pages_fetched = 0
 
-        # Use $skip-based pagination instead of @odata.nextLink.
-        # MS Graph's nextLink with $filter on datetime fields can return
-        # duplicates and miss results due to a server-side cursor bug.
+        # Pagination state differs between paths:
+        #   $search → follow @odata.nextLink verbatim (server-driven)
+        #   $filter → manual $skip (workaround for the datetime cursor bug)
+        next_url: str | None = base_url if use_search else None
+
         while pages_fetched < max_pages:
-            params = {**base_params, "$skip": str(pages_fetched * self._page_size)}
-            response = client.get(url, params=params, headers=headers)
+            if use_search:
+                # nextLink (when present) embeds all original params + a
+                # server-tracked $skip; we MUST NOT add $skip ourselves.
+                if next_url is None:
+                    break
+                if next_url == base_url:
+                    request_url = base_url
+                    request_params: dict[str, str] = base_params
+                else:
+                    request_url = next_url
+                    request_params = {}  # @odata.nextLink already carries them
+            else:
+                request_url = base_url
+                request_params = {
+                    **base_params,
+                    "$skip": str(pages_fetched * self._page_size),
+                }
+
+            response = client.get(request_url, params=request_params, headers=headers)
             _raise_for_graph_status(response)
             payload = response.json()
 
             raw_messages = payload.get("value", [])
-            if not raw_messages:
-                break  # No more results
-
             pages_fetched += 1
 
             for raw in raw_messages:
                 parsed = _parse_graph_message(raw)
                 if parsed is None:
                     continue
-
-                # Deduplicate (safety net)
                 if parsed.msg_id in seen_ids:
                     continue
                 seen_ids.add(parsed.msg_id)
-
-                # Apply date filter in Python if using $search
                 if filter_dates_in_python:
                     if date_from_dt and parsed.received_at < date_from_dt:
                         continue
                     if date_to_dt and parsed.received_at > date_to_dt:
                         continue
-
                 buffered.append(parsed)
                 if len(buffered) >= self._batch_size:
                     yield buffered
                     buffered = []
+
+            if use_search:
+                next_url = payload.get("@odata.nextLink")
+                if next_url is None:
+                    break
+            else:
+                if not raw_messages:
+                    break  # $skip path: empty page → done
 
         if buffered:
             yield buffered
