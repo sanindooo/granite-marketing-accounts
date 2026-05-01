@@ -35,7 +35,7 @@ def test_db_status_after_migrate(tmp_path) -> None:
     assert result.exit_code == 0
     doc = json.loads(result.stdout.strip().splitlines()[-1])
     assert doc["status"] == "success"
-    assert doc["schema_version"] == "009_add_invoice_export_tracking"
+    assert doc["schema_version"] == "010_add_email_error_message"
     assert doc["pragmas"]["foreign_keys"] == 1
 
 
@@ -368,6 +368,74 @@ def test_ingest_invoice_retry_errors_clears_processed_state(tmp_path) -> None:
     assert a == (None, None, None), "errored email should be reset"
     assert b == ("2026-04-11T00:00:00Z", "invoice", None), (
         "successful email must NOT be touched"
+    )
+
+
+def test_ingest_invoice_retry_errors_with_msg_ids_scopes_to_selection(
+    tmp_path,
+) -> None:
+    """User clicks "Retry selected" — only the supplied msg_ids are reset,
+    AND already-successful emails (outcome=invoice/receipt) are skipped to
+    avoid clobbering good state."""
+    db = tmp_path / "pipeline.db"
+    runner.invoke(app, ["db", "migrate", "--db", str(db)])
+
+    import sqlite3 as _sqlite
+
+    with _sqlite.connect(str(db)) as conn:
+        conn.execute(
+            "INSERT INTO emails (msg_id, source_adapter, from_addr, subject, "
+            "received_at, processed_at, outcome, error_code, error_message) "
+            "VALUES ('selected-error', 'ms365', 'x@y', 's', "
+            "'2026-04-10T00:00:00Z', '2026-04-11T00:00:00Z', 'error', "
+            "'unexpected', 'KeyError: foo')"
+        )
+        conn.execute(
+            "INSERT INTO emails (msg_id, source_adapter, from_addr, subject, "
+            "received_at, processed_at, outcome, error_code) VALUES "
+            "('selected-good', 'ms365', 'x@y', 's', '2026-04-10T00:00:00Z', "
+            "'2026-04-11T00:00:00Z', 'invoice', NULL)"
+        )
+        conn.execute(
+            "INSERT INTO emails (msg_id, source_adapter, from_addr, subject, "
+            "received_at, processed_at, outcome, error_code) VALUES "
+            "('not-selected', 'ms365', 'x@y', 's', '2026-04-10T00:00:00Z', "
+            "'2026-04-11T00:00:00Z', 'error', 'unexpected')"
+        )
+        conn.commit()
+
+    result = runner.invoke(
+        app,
+        [
+            "ingest", "invoice", "retry-errors",
+            "--msg-id", "selected-error",
+            "--msg-id", "selected-good",
+            "--db", str(db),
+        ],
+    )
+    assert result.exit_code == 0
+    doc = json.loads(result.stdout.strip().splitlines()[-1])
+    # Only the errored row was reset; the successful 'invoice' row was skipped.
+    assert doc["reset"] == 1
+    assert sorted(doc["msg_ids"]) == ["selected-error", "selected-good"]
+
+    with _sqlite.connect(str(db)) as conn:
+        rows = {
+            r[0]: r[1:]
+            for r in conn.execute(
+                "SELECT msg_id, processed_at, outcome, error_code, "
+                "error_message FROM emails"
+            )
+        }
+    # Selected-and-errored: cleared
+    assert rows["selected-error"] == (None, None, None, None)
+    # Selected-but-already-good: untouched
+    assert rows["selected-good"] == (
+        "2026-04-11T00:00:00Z", "invoice", None, None
+    )
+    # Not selected: untouched
+    assert rows["not-selected"] == (
+        "2026-04-11T00:00:00Z", "error", "unexpected", None
     )
 
 

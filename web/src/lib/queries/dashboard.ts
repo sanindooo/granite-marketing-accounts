@@ -213,13 +213,14 @@ export interface PendingAction {
   receivedAt: string;
   outcome: string;
   errorCode: string | null;
+  errorMessage: string | null;
 }
 
 export function getPendingActions(fy?: string): PendingAction[] {
   const bounds = fy ? fyBoundsOrAll(fy) : null;
 
   let query = `
-    SELECT msg_id, from_addr, subject, received_at, outcome, error_code
+    SELECT msg_id, from_addr, subject, received_at, outcome, error_code, error_message
     FROM emails
     WHERE outcome IN ('needs_manual_download', 'error', 'no_attachment')
       AND dismissed_at IS NULL
@@ -240,6 +241,7 @@ export function getPendingActions(fy?: string): PendingAction[] {
     received_at: string;
     outcome: string;
     error_code: string | null;
+    error_message: string | null;
   }[];
 
   return rows.map((row) => ({
@@ -249,6 +251,7 @@ export function getPendingActions(fy?: string): PendingAction[] {
     receivedAt: row.received_at,
     outcome: row.outcome,
     errorCode: row.error_code,
+    errorMessage: row.error_message,
   }));
 }
 

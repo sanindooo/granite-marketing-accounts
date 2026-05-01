@@ -286,14 +286,25 @@ def _process_sequential(
                     {"msg_id": email_row.msg_id, "error": str(err)}
                 )
                 _update_email_outcome(
-                    conn, email_row.msg_id, "error", error_code=err.error_code
+                    conn,
+                    email_row.msg_id,
+                    "error",
+                    error_code=err.error_code,
+                    error_message=str(err),
                 )
             except Exception as err:
                 stats.errors += 1
+                error_msg = f"{type(err).__name__}: {err}"
                 stats.error_details.append(
-                    {"msg_id": email_row.msg_id, "error": str(err)}
+                    {"msg_id": email_row.msg_id, "error": error_msg}
                 )
-                _update_email_outcome(conn, email_row.msg_id, "error", error_code="unexpected")
+                _update_email_outcome(
+                    conn,
+                    email_row.msg_id,
+                    "error",
+                    error_code="unexpected",
+                    error_message=error_msg,
+                )
 
         stats.cost_gbp = llm_client.budget.spent_gbp
         return stats
@@ -433,16 +444,27 @@ def _process_parallel(
                     )
                 conn = _get_thread_connection(db_path)
                 _update_email_outcome(
-                    conn, email.msg_id, "error", error_code=err.error_code
+                    conn,
+                    email.msg_id,
+                    "error",
+                    error_code=err.error_code,
+                    error_message=str(err),
                 )
             except Exception as err:
+                error_msg = f"{type(err).__name__}: {err}"
                 with stats_lock:
                     stats.errors += 1
                     stats.error_details.append(
-                        {"msg_id": email.msg_id, "error": str(err)}
+                        {"msg_id": email.msg_id, "error": error_msg}
                     )
                 conn = _get_thread_connection(db_path)
-                _update_email_outcome(conn, email.msg_id, "error", error_code="unexpected")
+                _update_email_outcome(
+                    conn,
+                    email.msg_id,
+                    "error",
+                    error_code="unexpected",
+                    error_message=error_msg,
+                )
 
     stats.cost_gbp = llm_client.budget.spent_gbp
     return stats
@@ -625,22 +647,34 @@ def _count_pending_emails(
     return conn.execute(query, params).fetchone()[0]
 
 
+_ERROR_MESSAGE_CAP: Final[int] = 2000
+
+
 def _update_email_outcome(
     conn: sqlite3.Connection,
     msg_id: str,
     outcome: str,
     *,
     error_code: str | None = None,
+    error_message: str | None = None,
 ) -> None:
-    """Mark an email as processed with the given outcome."""
+    """Mark an email as processed with the given outcome.
+
+    ``error_message`` is the human-readable failure detail (e.g. an LLM
+    parser exception, a Drive 4xx body) — capped to ``_ERROR_MESSAGE_CAP``
+    chars so a verbose stack trace doesn't bloat the row. None on success.
+    """
+    truncated_msg = (
+        error_message[:_ERROR_MESSAGE_CAP] if error_message else None
+    )
     with conn:
         conn.execute(
             """
             UPDATE emails
-            SET processed_at = ?, outcome = ?, error_code = ?
+            SET processed_at = ?, outcome = ?, error_code = ?, error_message = ?
             WHERE msg_id = ?
             """,
-            (now_utc().isoformat(), outcome, error_code, msg_id),
+            (now_utc().isoformat(), outcome, error_code, truncated_msg, msg_id),
         )
 
 

@@ -82,7 +82,7 @@ class TestMigrations:
     def test_current_version_records_latest(self) -> None:
         conn = _fresh_conn()
         db_mod.apply_migrations(conn)
-        assert db_mod.current_version(conn) == "009_add_invoice_export_tracking"
+        assert db_mod.current_version(conn) == "010_add_email_error_message"
 
     def test_tampered_migration_rejected(self, tmp_path: Path) -> None:
         # Build a migrations dir with a single file, apply it, then mutate

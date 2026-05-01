@@ -1416,14 +1416,53 @@ def ingest_invoice_retry_errors(
             help="Comma-separated outcomes to retry (default: error,needs_manual_download,no_attachment).",
         ),
     ] = "error,needs_manual_download,no_attachment",
+    msg_ids: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--msg-id",
+            help="Retry only these specific message IDs. Repeatable. "
+            "When supplied, --outcomes is ignored.",
+        ),
+    ] = None,
 ) -> None:
-    """Reset processed_at on all emails currently in the Needs Attention list.
+    """Reset processed_at on emails currently in the Needs Attention list.
 
-    The next ``ingest invoice process`` run will re-classify and re-extract
-    them. Useful after a fix lands (e.g. Google reauth, new URL extractor) to
-    sweep the backlog without manually picking each email.
+    Default: reset every email with an outcome in
+    ``error,needs_manual_download,no_attachment``. The next
+    ``ingest invoice process`` run will re-classify and re-extract them.
+
+    Pass ``--msg-id`` (repeatable) to scope the retry to specific messages —
+    used by the dashboard's "Retry selected" button. Already-good emails
+    (outcome ``invoice``/``receipt``) are skipped to avoid clobbering
+    successful state.
     """
     try:
+        conn = db_mod.connect(db_path)
+        db_mod.apply_migrations(conn)
+
+        if msg_ids:
+            # Targeted retry — scope to the supplied msg_ids, but still skip
+            # rows that have already been classified successfully so a
+            # double-click doesn't re-process invoices we already have.
+            placeholders = ",".join(["?"] * len(msg_ids))
+            with conn:
+                cursor = conn.execute(
+                    f"""
+                    UPDATE emails
+                    SET processed_at = NULL,
+                        outcome = NULL,
+                        error_code = NULL,
+                        error_message = NULL
+                    WHERE msg_id IN ({placeholders})
+                      AND dismissed_at IS NULL
+                      AND (outcome IS NULL OR outcome NOT IN ('invoice', 'receipt'))
+                    """,  # noqa: S608 — placeholders are bound parameters
+                    tuple(msg_ids),
+                )
+                reset_count = cursor.rowcount
+            emit_success({"reset": reset_count, "msg_ids": list(msg_ids)})
+            return
+
         valid = {"error", "needs_manual_download", "no_attachment"}
         requested = {o.strip() for o in outcomes.split(",") if o.strip()}
         invalid = requested - valid
@@ -1433,8 +1472,6 @@ def ingest_invoice_retry_errors(
                 source="cli",
             )
 
-        conn = db_mod.connect(db_path)
-        db_mod.apply_migrations(conn)
         # `placeholders` is a fixed-shape "?,?,?" string built from the
         # validated, allowlisted `requested` set above — no user input is
         # interpolated here, so the f-string is safe.
@@ -1445,7 +1482,8 @@ def ingest_invoice_retry_errors(
                 UPDATE emails
                 SET processed_at = NULL,
                     outcome = NULL,
-                    error_code = NULL
+                    error_code = NULL,
+                    error_message = NULL
                 WHERE outcome IN ({placeholders})
                   AND dismissed_at IS NULL
                 """,  # noqa: S608 — placeholders are bound parameters

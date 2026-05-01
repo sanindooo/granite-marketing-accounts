@@ -27,6 +27,7 @@ interface NeedsAttentionCardProps {
   onBulkDismiss: (msgIds: string[], reason: "not_invoice" | "resolved") => Promise<void>;
   onUploadPdf: (msgId: string, file: File) => Promise<void>;
   onRetryAll?: () => Promise<void>;
+  onRetrySelected?: (msgIds: string[]) => Promise<void>;
   onReauthGoogle?: () => Promise<void>;
 }
 
@@ -56,6 +57,7 @@ export function NeedsAttentionCard({
   onBulkDismiss,
   onUploadPdf,
   onRetryAll,
+  onRetrySelected,
   onReauthGoogle,
 }: NeedsAttentionCardProps) {
   const [isCollapsed, setIsCollapsed] = useState(true);
@@ -73,6 +75,7 @@ export function NeedsAttentionCard({
   const [confirmingDismiss, setConfirmingDismiss] = useState<string | null>(null);
 
   const [retrying, setRetrying] = useState(false);
+  const [retryingSelected, setRetryingSelected] = useState(false);
   const [reauthing, setReauthing] = useState(false);
 
   const needsReauth = pendingActions.some(
@@ -181,6 +184,25 @@ export function NeedsAttentionCard({
               <span className="text-sm text-muted-foreground">
                 {selectedIds.size} selected
               </span>
+              {onRetrySelected && (
+                <Button
+                  variant="outline"
+                  size="sm"
+                  className="h-7 text-xs"
+                  disabled={retryingSelected || bulkDismissing}
+                  onClick={async () => {
+                    setRetryingSelected(true);
+                    try {
+                      await onRetrySelected(Array.from(selectedIds));
+                      setSelectedIds(new Set());
+                    } finally {
+                      setRetryingSelected(false);
+                    }
+                  }}
+                >
+                  {retryingSelected ? "Retrying…" : "Retry selected"}
+                </Button>
+              )}
               <Button
                 variant="outline"
                 size="sm"
@@ -408,6 +430,21 @@ export function NeedsAttentionCard({
                 {expandedId === action.msgId && (
                   <TableRow>
                     <TableCell colSpan={7} className="bg-white p-4">
+                      {action.errorMessage && (
+                        <div className="mb-3 rounded border border-red-200 bg-red-50 p-3 text-sm">
+                          <div className="mb-1 font-medium text-red-800">
+                            Error detail
+                            {action.errorCode && (
+                              <span className="ml-2 font-mono text-xs text-red-600">
+                                ({action.errorCode})
+                              </span>
+                            )}
+                          </div>
+                          <pre className="whitespace-pre-wrap break-words font-mono text-xs text-red-900">
+                            {action.errorMessage}
+                          </pre>
+                        </div>
+                      )}
                       {loadingBody ? (
                         <div className="text-sm text-muted-foreground">Loading email content...</div>
                       ) : emailBody ? (

@@ -224,6 +224,59 @@ fetchPendingActions(fy === "all" ? undefined : fy),
     if (fxErrorsResult.ok) setFxErrors(fxErrorsResult.data);
   }, [fy]);
 
+  // Reset Needs Attention rows (all or a selection) and immediately kick off
+  // processInvoices. Used by both the "Retry all" and "Retry selected"
+  // buttons on the Needs Attention card.
+  const runRetry = useCallback(
+    async ({ msgIds }: { msgIds?: string[] }) => {
+      const reset = await fetch("/api/pipeline/retry-errors", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(msgIds ? { msgIds } : {}),
+      });
+      if (!reset.ok) {
+        const err = await reset.json().catch(() => ({}));
+        toast.error(err.error?.message || err.error || "Retry failed");
+        return;
+      }
+      const body = await reset.json();
+      const count = body?.result?.reset ?? 0;
+      if (count === 0) {
+        toast.info("Nothing to retry — no eligible emails were reset");
+        return;
+      }
+      toast.success(
+        msgIds
+          ? `Reset ${count} of ${msgIds.length} selected emails — running pipeline now…`
+          : `Reset ${count} emails for re-processing — running pipeline now…`
+      );
+      const run = await fetch("/api/pipeline/stream", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ command: "processInvoices" }),
+      });
+      if (!run.ok) {
+        toast.error("Failed to start processing");
+        return;
+      }
+      // Drain the SSE stream to completion so we know to refresh.
+      const reader = run.body?.getReader();
+      if (reader) {
+        try {
+          while (true) {
+            const { done } = await reader.read();
+            if (done) break;
+          }
+        } finally {
+          reader.releaseLock();
+        }
+      }
+      await refreshAllData();
+      toast.success("Re-processing complete");
+    },
+    [refreshAllData]
+  );
+
   useEffect(() => {
     async function loadData() {
       setLoading(true);
@@ -539,46 +592,10 @@ fetchPendingActions(fy === "all" ? undefined : fy),
             }
           }}
           onRetryAll={async () => {
-            // Reset processed_at on every email currently in this list, then
-            // kick off a fresh process run so they get re-classified with
-            // any fixes that have landed since.
-            const reset = await fetch("/api/pipeline/retry-errors", {
-              method: "POST",
-            });
-            if (!reset.ok) {
-              const err = await reset.json();
-              toast.error(err.error?.message || "Retry failed");
-              return;
-            }
-            const body = await reset.json();
-            const count = body?.result?.reset ?? 0;
-            toast.success(
-              `Reset ${count} emails for re-processing — running pipeline now…`
-            );
-            // Then trigger Process invoices
-            const run = await fetch("/api/pipeline/stream", {
-              method: "POST",
-              headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({ command: "processInvoices" }),
-            });
-            if (!run.ok) {
-              toast.error("Failed to start processing");
-              return;
-            }
-            // Drain the SSE stream to completion so we know to refresh.
-            const reader = run.body?.getReader();
-            if (reader) {
-              try {
-                while (true) {
-                  const { done } = await reader.read();
-                  if (done) break;
-                }
-              } finally {
-                reader.releaseLock();
-              }
-            }
-            await refreshAllData();
-            toast.success("Re-processing complete");
+            await runRetry({});
+          }}
+          onRetrySelected={async (msgIds) => {
+            await runRetry({ msgIds });
           }}
           onReauthGoogle={async () => {
             toast.info(
