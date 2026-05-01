@@ -222,7 +222,7 @@ export function getPendingActions(fy?: string): PendingAction[] {
 
   let query = `
     SELECT msg_id, from_addr, subject, received_at, outcome,
-           error_code, error_message, manual_download_url
+           error_code, error_message, source_invoice_url
     FROM emails
     WHERE outcome IN ('needs_manual_download', 'error', 'no_attachment')
       AND dismissed_at IS NULL
@@ -244,7 +244,7 @@ export function getPendingActions(fy?: string): PendingAction[] {
     outcome: string;
     error_code: string | null;
     error_message: string | null;
-    manual_download_url: string | null;
+    source_invoice_url: string | null;
   }[];
 
   return rows.map((row) => ({
@@ -255,7 +255,7 @@ export function getPendingActions(fy?: string): PendingAction[] {
     outcome: row.outcome,
     errorCode: row.error_code,
     errorMessage: row.error_message,
-    manualDownloadUrl: row.manual_download_url,
+    manualDownloadUrl: row.source_invoice_url,
   }));
 }
 

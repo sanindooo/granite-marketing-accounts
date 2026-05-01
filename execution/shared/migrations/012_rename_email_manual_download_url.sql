@@ -1,0 +1,16 @@
+-- Rename emails.manual_download_url → emails.source_invoice_url so it no
+-- longer collides with invoices.manual_download_url (migration 005). The
+-- two columns serve different purposes:
+--
+--   * invoices.manual_download_url — the user-supplied or extracted PDF URL
+--     persisted on an existing invoices row that we couldn't auto-fetch.
+--   * emails.source_invoice_url — the user-clickable URL on a Needs
+--     Attention email that never produced an invoices row (login-gated host,
+--     401/403 from upstream, etc.).
+--
+-- The dashboard reads emails.source_invoice_url; the processor writes it.
+-- Branch is local with zero production data on this column, so the rename
+-- is cheap right now and prohibitive later.
+--
+-- Rollback: ALTER TABLE emails RENAME COLUMN source_invoice_url TO manual_download_url;
+ALTER TABLE emails RENAME COLUMN manual_download_url TO source_invoice_url;

@@ -35,7 +35,7 @@ def test_db_status_after_migrate(tmp_path) -> None:
     assert result.exit_code == 0
     doc = json.loads(result.stdout.strip().splitlines()[-1])
     assert doc["status"] == "success"
-    assert doc["schema_version"] == "011_add_email_manual_download_url"
+    assert doc["schema_version"] == "013_add_vendor_search_index"
     assert doc["pragmas"]["foreign_keys"] == 1
 
 
@@ -350,7 +350,7 @@ def test_ingest_invoice_retry_errors_clears_processed_state(tmp_path) -> None:
         conn.commit()
 
     result = runner.invoke(
-        app, ["ingest", "invoice", "retry-errors", "--db", str(db)]
+        app, ["ingest", "invoice", "retry-errors", "--all", "--db", str(db)]
     )
     assert result.exit_code == 0
     doc = json.loads(result.stdout.strip().splitlines()[-1])
@@ -427,8 +427,10 @@ def test_ingest_invoice_retry_errors_with_msg_ids_scopes_to_selection(
                 "error_message FROM emails"
             )
         }
-    # Selected-and-errored: cleared
-    assert rows["selected-error"] == (None, None, None, None)
+    # Selected-and-errored: processed_at, outcome, error_code cleared.
+    # error_message is preserved so the prior failure context stays visible
+    # until the next process run overwrites or clears it (todo P1-028).
+    assert rows["selected-error"] == (None, None, None, "KeyError: foo")
     # Selected-but-already-good: untouched
     assert rows["selected-good"] == (
         "2026-04-11T00:00:00Z", "invoice", None, None

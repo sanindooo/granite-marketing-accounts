@@ -21,6 +21,7 @@ from __future__ import annotations
 import re
 import sqlite3
 import threading
+import time
 from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
@@ -30,6 +31,7 @@ from html.parser import HTMLParser
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Final, Literal
 
+import httpx
 import pdfplumber
 
 from execution.invoice.category import resolve_category
@@ -72,6 +74,25 @@ DEFAULT_BATCH_SIZE: int = 50
 DEFAULT_WORKERS: int = 1
 MAX_WORKERS: int = 20
 MAX_PDF_SIZE_BYTES: int = 20 * 1024 * 1024  # 20 MB
+
+# URL-fetch budget when scraping the email body for an invoice link. A real
+# email contains 1-3 useful PDF links plus a long tail of tracking pixels and
+# unsubscribe URLs; an adversarial email can contain thousands of fake
+# ``.pdf`` URLs designed to make us hang on per-fetch timeouts. Cap both the
+# count and the wall-clock so worst case is bounded by
+# ~MAX_PDF_URL_FETCHES_PER_EMAIL * PDF_URL_PER_FETCH_TIMEOUT_SECONDS, then
+# bounded again by the per-email budget.
+MAX_PDF_URL_FETCHES_PER_EMAIL: int = 5
+PDF_URL_FETCH_BUDGET_SECONDS: float = 30.0
+PDF_URL_PER_FETCH_TIMEOUT_SECONDS: float = 15.0
+
+# Per-fetch timeout passed into SafeHttpClient when scraping body URLs.
+# httpx.Timeout(N) applies the same N to connect/read/write/pool, so the
+# upper bound on a single fetch is ~N seconds even on a slow upstream — much
+# tighter than DEFAULT_TIMEOUT's (5, 60, 30, 5) for hostile email URLs.
+_PDF_URL_FETCH_TIMEOUT: httpx.Timeout = httpx.Timeout(
+    PDF_URL_PER_FETCH_TIMEOUT_SECONDS
+)
 
 # Thread-local storage for SQLite connections in parallel processing
 _thread_local = threading.local()
@@ -215,7 +236,7 @@ def _process_sequential(
 ) -> ProcessStats:
     """Original sequential processing implementation."""
     stats = ProcessStats()
-    http_client = SafeHttpClient()
+    http_client = SafeHttpClient(timeout=_PDF_URL_FETCH_TIMEOUT)
 
     # Load explicitly blocked domains
     blocked_domains = _load_blocked_domains(conn)
@@ -370,7 +391,7 @@ def _process_parallel(
         conn = _get_thread_connection(db_path)
 
         # Each worker gets its own HTTP client
-        http_client = SafeHttpClient()
+        http_client = SafeHttpClient(timeout=_PDF_URL_FETCH_TIMEOUT)
         try:
             outcome, invoice = _process_one(
                 conn=conn,
@@ -524,8 +545,8 @@ def _process_one(
                 # Persist the URL so the dashboard can render it as a
                 # clickable link beside the Upload PDF button. The outer
                 # _update_email_outcome call won't clobber it because that
-                # function deliberately leaves manual_download_url alone.
-                _set_manual_download_url(
+                # function deliberately leaves source_invoice_url alone.
+                _set_source_invoice_url(
                     conn, email_row.msg_id, fetch_outcome.url
                 )
                 return "needs_manual_download", None
@@ -671,10 +692,10 @@ def _update_email_outcome(
     parser exception, a Drive 4xx body) — capped to ``_ERROR_MESSAGE_CAP``
     chars so a verbose stack trace doesn't bloat the row. None on success.
 
-    Note: ``manual_download_url`` is intentionally NOT updated here so a
+    Note: ``source_invoice_url`` is intentionally NOT updated here so a
     successful retry (which routes through this function with no URL)
     doesn't clobber a URL set by a prior failed run. Use
-    :func:`_set_manual_download_url` to write it explicitly.
+    :func:`_set_source_invoice_url` to write it explicitly.
     """
     truncated_msg = (
         error_message[:_ERROR_MESSAGE_CAP] if error_message else None
@@ -693,26 +714,36 @@ def _update_email_outcome(
         )
 
 
-def _set_manual_download_url(
+def _set_source_invoice_url(
     conn: sqlite3.Connection, msg_id: str, url: str
 ) -> None:
     """Persist the user-clickable invoice URL onto the email row.
 
-    Validates the scheme is ``https://`` to keep a malicious email from
-    planting a ``javascript:`` or ``data:`` URL that would become XSS the
-    moment the dashboard renders it as ``<a href={url}>``.
+    Rejects any URL that doesn't survive a strict shape check: only
+    ``https://``, no ``user:pass@host`` userinfo (browsers send it as Basic
+    auth to whoever the host turns out to be — origin-spoofing risk when the
+    dashboard renders the URL with a tooltip), and a non-empty hostname. A
+    malicious ``javascript:`` / ``data:`` URL would otherwise become XSS the
+    moment the dashboard rendered it as ``<a href={url}>``.
+
+    Writes ``emails.source_invoice_url`` (renamed from ``manual_download_url``
+    in migration 012 to disambiguate from ``invoices.manual_download_url``).
     """
     from urllib.parse import urlparse
 
     try:
-        scheme = urlparse(url).scheme.lower()
+        parsed = urlparse(url)
     except ValueError:
         return
-    if scheme != "https":
+    if parsed.scheme.lower() != "https":
+        return
+    if parsed.username or parsed.password:
+        return
+    if not parsed.hostname:
         return
     with conn:
         conn.execute(
-            "UPDATE emails SET manual_download_url = ? WHERE msg_id = ?",
+            "UPDATE emails SET source_invoice_url = ? WHERE msg_id = ?",
             (url, msg_id),
         )
 
@@ -747,18 +778,42 @@ def _try_fetch_pdf_from_body(
     invoice URL) does not win the first-match. Pattern order in
     :data:`_PDF_URL_PATTERNS` puts the generic ``.pdf`` first; we still
     iterate every pattern so vendor-specific outcomes are reachable.
+
+    Caps the number of URLs attempted (:data:`MAX_PDF_URL_FETCHES_PER_EMAIL`)
+    and the wall-clock spent fetching (:data:`PDF_URL_FETCH_BUDGET_SECONDS`).
+    Without these the triple loop (body, pattern, match) would happily spend
+    minutes on a Webflow-shaped email with ten tracking URLs, and an
+    adversarial email with thousands of fake ``.pdf`` URLs would DoS the
+    pipeline outright.
     """
+    seen: set[str] = set()
+    candidates: list[str] = []
     for body in (html_body, text_body):
         if not body:
             continue
         for pattern in _PDF_URL_PATTERNS:
             for m in pattern.finditer(body):
                 url = m.group(0).rstrip(".,;:)")
-                outcome = fetch_invoice_pdf(url, client=http_client)
-                if outcome.status == FetchStatus.OK and outcome.body:
-                    return outcome.body, outcome
-                if outcome.status == FetchStatus.NEEDS_MANUAL_DOWNLOAD:
-                    return None, outcome
+                if url in seen:
+                    continue
+                seen.add(url)
+                candidates.append(url)
+                if len(candidates) >= MAX_PDF_URL_FETCHES_PER_EMAIL:
+                    break
+            if len(candidates) >= MAX_PDF_URL_FETCHES_PER_EMAIL:
+                break
+        if len(candidates) >= MAX_PDF_URL_FETCHES_PER_EMAIL:
+            break
+
+    deadline = time.monotonic() + PDF_URL_FETCH_BUDGET_SECONDS
+    for url in candidates:
+        if time.monotonic() > deadline:
+            break
+        outcome = fetch_invoice_pdf(url, client=http_client)
+        if outcome.status == FetchStatus.OK and outcome.body:
+            return outcome.body, outcome
+        if outcome.status == FetchStatus.NEEDS_MANUAL_DOWNLOAD:
+            return None, outcome
     return None, None
 
 

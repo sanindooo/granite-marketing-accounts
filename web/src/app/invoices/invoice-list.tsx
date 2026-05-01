@@ -8,6 +8,7 @@ import { Button } from "@/components/ui/button";
 import { getCurrentFY } from "@/lib/fiscal";
 import type { InvoiceListRow } from "@/lib/types";
 import { fetchInvoices, fetchExceptionInvoices } from "@/lib/actions/invoices";
+import { apiFetch } from "@/lib/api-fetch";
 
 const MAX_SELECTION = 100;
 
@@ -115,7 +116,7 @@ export function InvoiceList() {
 
     setDownloading(true);
     try {
-      const response = await fetch("/api/download", {
+      const response = await apiFetch("/api/download", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ invoiceIds: Array.from(selectedIds) }),

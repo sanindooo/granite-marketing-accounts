@@ -65,9 +65,14 @@ export function getInvoices(filters: InvoiceFilters = {}): InvoiceListRow[] {
   }
 
   if (filters.search) {
-    const escaped = `%${escapeLike(filters.search)}%`;
+    // Prefix-only LIKE so SQLite can use idx_vendors_canonical_name_nocase
+    // (migration 012). Leading-wildcard LIKE forces a full table scan, which
+    // is what was causing the multi-second hang on "webflow" searches as the
+    // invoices table grew. Substring matches now require typing a leading
+    // word boundary — acceptable trade for predictable latency.
+    const escaped = `${escapeLike(filters.search)}%`;
     conditions.push(
-      "(v.canonical_name LIKE ? ESCAPE '\\' OR i.invoice_number LIKE ? ESCAPE '\\')"
+      "(v.canonical_name LIKE ? ESCAPE '\\' COLLATE NOCASE OR i.invoice_number LIKE ? ESCAPE '\\' COLLATE NOCASE)"
     );
     params.push(escaped, escaped);
   }

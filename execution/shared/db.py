@@ -102,26 +102,52 @@ def apply_migrations(
     Returns the list of migration filenames that ran on this call. A
     migration whose checksum changed raises ``ConfigError`` — never silently
     re-execute a tampered file.
+
+    Concurrent CLI invocations (e.g. two dashboard buttons clicked back to
+    back) used to race here: both processes would read ``_applied_map``
+    before either had committed, both would try to ALTER the same table, and
+    the loser would crash on a duplicate-column error. We now run the entire
+    pending-migration loop under a single ``BEGIN IMMEDIATE`` (which takes
+    SQLite's reserved lock + waits up to ``busy_timeout`` for any peer
+    holding it). The second caller blocks until the first commits, then re-
+    reads ``_applied_map`` and finds nothing pending — no duplicate attempt.
+    Each script is split into statements so a mid-script failure rolls back
+    the whole outer transaction; ``executescript`` would issue its own
+    COMMIT semantics that conflict with this manual transaction handling.
     """
     mig_dir = migrations_dir or _MIGRATIONS_DIR
     _ensure_migrations_table(conn)
-    applied = _applied_map(conn)
-    available = sorted(mig_dir.glob("*.sql"))
-    ran: list[str] = []
-    for path in available:
-        version = path.stem  # e.g. "001_init"
-        sql = path.read_text(encoding="utf-8")
-        checksum = hashlib.sha256(sql.encode("utf-8")).hexdigest()
-        if version in applied:
-            if applied[version] != checksum:
-                raise ConfigError(
-                    f"migration {version} has changed on disk since it was "
-                    f"applied (checksum mismatch). Refusing to re-apply.",
-                    source="db",
-                )
-            continue
-        _apply_one(conn, version=version, sql=sql, checksum=checksum)
-        ran.append(path.name)
+    conn.execute("BEGIN IMMEDIATE;")
+    try:
+        applied = _applied_map(conn)
+        available = sorted(mig_dir.glob("*.sql"))
+        ran: list[str] = []
+        for path in available:
+            version = path.stem  # e.g. "001_init"
+            sql = path.read_text(encoding="utf-8")
+            checksum = hashlib.sha256(sql.encode("utf-8")).hexdigest()
+            if version in applied:
+                if applied[version] != checksum:
+                    raise ConfigError(
+                        f"migration {version} has changed on disk since it "
+                        f"was applied (checksum mismatch). Refusing to "
+                        f"re-apply.",
+                        source="db",
+                    )
+                continue
+            for stmt in _split_sql(sql):
+                conn.execute(stmt)
+            conn.execute(
+                "INSERT INTO schema_migrations (version, applied_at, checksum) "
+                "VALUES (?, datetime('now'), ?);",
+                (version, checksum),
+            )
+            ran.append(path.name)
+        conn.execute("COMMIT;")
+    except BaseException:
+        with suppress(sqlite3.OperationalError):
+            conn.execute("ROLLBACK;")
+        raise
     return ran
 
 
@@ -150,34 +176,6 @@ def _applied_map(conn: sqlite3.Connection) -> dict[str, str]:
         "SELECT version, checksum FROM schema_migrations"
     ).fetchall()
     return {row["version"]: row["checksum"] for row in rows}
-
-
-def _apply_one(
-    conn: sqlite3.Connection, *, version: str, sql: str, checksum: str
-) -> None:
-    """Apply a single migration atomically.
-
-    We split the script into statements and run each under one
-    ``BEGIN IMMEDIATE; ... COMMIT;`` so a mid-script failure rolls back the
-    whole migration. ``executescript`` issues its own ``COMMIT`` semantics
-    that conflict with our manual transaction management.
-    """
-    statements = _split_sql(sql)
-    conn.execute("BEGIN IMMEDIATE;")
-    try:
-        for stmt in statements:
-            conn.execute(stmt)
-        conn.execute(
-            "INSERT INTO schema_migrations (version, applied_at, checksum) "
-            "VALUES (?, datetime('now'), ?);",
-            (version, checksum),
-        )
-        conn.execute("COMMIT;")
-    except BaseException:
-        # Some errors leave no transaction active; rollback is a no-op.
-        with suppress(sqlite3.OperationalError):
-            conn.execute("ROLLBACK;")
-        raise
 
 
 def _split_sql(sql: str) -> list[str]:

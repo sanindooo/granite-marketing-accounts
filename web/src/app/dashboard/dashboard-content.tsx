@@ -20,6 +20,7 @@ import type { DashboardMetrics, LastRun, SyncCoverage, PendingAction, RunningJob
 import { fetchDashboardMetrics, fetchLastRuns, fetchSyncCoverage, fetchPendingActions, cancelRun, fetchRunningJobs, fetchFxErrors } from "@/lib/actions/dashboard";
 import type { PipelineCommand, PipelineOptions } from "@/lib/types";
 import { usePipelineStream } from "@/hooks/use-pipeline-stream";
+import { apiFetch } from "@/lib/api-fetch";
 import { NeedsAttentionCard } from "./needs-attention-card";
 import { FxErrorsCard } from "./fx-errors-card";
 import { StaleRunModal } from "./stale-run-modal";
@@ -224,23 +225,26 @@ fetchPendingActions(fy === "all" ? undefined : fy),
     if (fxErrorsResult.ok) setFxErrors(fxErrorsResult.data);
   }, [fy]);
 
-  // Reset Needs Attention rows (all or a selection) and immediately kick off
-  // processInvoices. Used by both the "Retry all" and "Retry selected"
-  // buttons on the Needs Attention card.
+  // Reset Needs Attention rows (all or a selection) and hand off to the
+  // existing pipeline-stream hook so the bottom Pipeline Controls show
+  // progress, errors surface as toasts, and isRunning stays true throughout.
+  // Used by both the "Retry all" and "Retry selected" buttons on the Needs
+  // Attention card.
   const runRetry = useCallback(
     async ({ msgIds }: { msgIds?: string[] }) => {
-      const reset = await fetch("/api/pipeline/retry-errors", {
+      const body = msgIds && msgIds.length > 0 ? { msgIds } : { all: true };
+      const reset = await apiFetch("/api/pipeline/retry-errors", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(msgIds ? { msgIds } : {}),
+        body: JSON.stringify(body),
       });
       if (!reset.ok) {
         const err = await reset.json().catch(() => ({}));
         toast.error(err.error?.message || err.error || "Retry failed");
         return;
       }
-      const body = await reset.json();
-      const count = body?.result?.reset ?? 0;
+      const payload = await reset.json();
+      const count = payload?.result?.reset ?? 0;
       if (count === 0) {
         toast.info("Nothing to retry — no eligible emails were reset");
         return;
@@ -250,31 +254,13 @@ fetchPendingActions(fy === "all" ? undefined : fy),
           ? `Reset ${count} of ${msgIds.length} selected emails — running pipeline now…`
           : `Reset ${count} emails for re-processing — running pipeline now…`
       );
-      const run = await fetch("/api/pipeline/stream", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ command: "processInvoices" }),
-      });
-      if (!run.ok) {
-        toast.error("Failed to start processing");
-        return;
-      }
-      // Drain the SSE stream to completion so we know to refresh.
-      const reader = run.body?.getReader();
-      if (reader) {
-        try {
-          while (true) {
-            const { done } = await reader.read();
-            if (done) break;
-          }
-        } finally {
-          reader.releaseLock();
-        }
-      }
-      await refreshAllData();
-      toast.success("Re-processing complete");
+      // Hand off to the hook — it parses SSE events, fires error toasts,
+      // tracks isRunning so the bottom Pipeline Controls reflect retry state,
+      // and refreshAllData fires from the existing transition handler when
+      // the run completes.
+      await stream.run("processInvoices");
     },
-    [refreshAllData]
+    [stream]
   );
 
   useEffect(() => {
@@ -547,7 +533,7 @@ fetchPendingActions(fy === "all" ? undefined : fy),
         <NeedsAttentionCard
           pendingActions={pendingActions}
           onDismiss={async (msgId, reason, blockDomain) => {
-            await fetch("/api/emails/dismiss", {
+            await apiFetch("/api/emails/dismiss", {
               method: "POST",
               headers: { "Content-Type": "application/json" },
               body: JSON.stringify({ msgId, reason, blockDomain }),
@@ -562,7 +548,7 @@ fetchPendingActions(fy === "all" ? undefined : fy),
             toast.success(message);
           }}
           onBulkDismiss={async (msgIds, reason) => {
-            const response = await fetch("/api/emails/bulk-dismiss", {
+            const response = await apiFetch("/api/emails/bulk-dismiss", {
               method: "POST",
               headers: { "Content-Type": "application/json" },
               body: JSON.stringify({ msgIds, reason }),
@@ -579,7 +565,7 @@ fetchPendingActions(fy === "all" ? undefined : fy),
             const formData = new FormData();
             formData.append("msgId", msgId);
             formData.append("pdf", file);
-            const response = await fetch("/api/invoices/upload", {
+            const response = await apiFetch("/api/invoices/upload", {
               method: "POST",
               body: formData,
             });
@@ -601,7 +587,7 @@ fetchPendingActions(fy === "all" ? undefined : fy),
             toast.info(
               "Browser will open for Google sign-in. Approve access (including 2FA), then return here."
             );
-            const response = await fetch("/api/auth/google/reauth", {
+            const response = await apiFetch("/api/auth/google/reauth", {
               method: "POST",
             });
             if (response.ok) {

@@ -1424,19 +1424,39 @@ def ingest_invoice_retry_errors(
             "When supplied, --outcomes is ignored.",
         ),
     ] = None,
+    all_rows: Annotated[
+        bool,
+        typer.Option(
+            "--all",
+            help="Bulk retry every Needs-Attention row matching --outcomes. "
+            "Required to invoke the destructive bulk path; calling without "
+            "either --msg-id or --all errors out so a double-click can't "
+            "wipe state by accident.",
+        ),
+    ] = False,
 ) -> None:
     """Reset processed_at on emails currently in the Needs Attention list.
 
-    Default: reset every email with an outcome in
-    ``error,needs_manual_download,no_attachment``. The next
-    ``ingest invoice process`` run will re-classify and re-extract them.
-
     Pass ``--msg-id`` (repeatable) to scope the retry to specific messages —
-    used by the dashboard's "Retry selected" button. Already-good emails
-    (outcome ``invoice``/``receipt``) are skipped to avoid clobbering
-    successful state.
+    used by the dashboard's "Retry selected" button. Pass ``--all`` to bulk-
+    reset every Needs-Attention row in the configured ``--outcomes`` set
+    ("Retry all"). Calling with neither errors out — accidental invocation
+    used to wipe diagnostic state on every error row in one shot.
+
+    Already-good emails (outcome ``invoice``/``receipt``) are skipped to
+    avoid clobbering successful state. ``error_message`` is preserved across
+    the reset so the prior failure context stays visible until the next run
+    overwrites it (or NULLs it on success).
     """
     try:
+        if not msg_ids and not all_rows:
+            raise ConfigError(
+                "retry-errors requires either --msg-id (one or more) or --all. "
+                "Refusing to default to bulk reset — pass --all explicitly to "
+                "confirm.",
+                source="cli",
+            )
+
         conn = db_mod.connect(db_path)
         db_mod.apply_migrations(conn)
 
@@ -1444,6 +1464,8 @@ def ingest_invoice_retry_errors(
             # Targeted retry — scope to the supplied msg_ids, but still skip
             # rows that have already been classified successfully so a
             # double-click doesn't re-process invoices we already have.
+            # error_message stays put: the next process run overwrites it
+            # if it errors again or NULLs it on success.
             placeholders = ",".join(["?"] * len(msg_ids))
             with conn:
                 cursor = conn.execute(
@@ -1451,8 +1473,7 @@ def ingest_invoice_retry_errors(
                     UPDATE emails
                     SET processed_at = NULL,
                         outcome = NULL,
-                        error_code = NULL,
-                        error_message = NULL
+                        error_code = NULL
                     WHERE msg_id IN ({placeholders})
                       AND dismissed_at IS NULL
                       AND (outcome IS NULL OR outcome NOT IN ('invoice', 'receipt'))
@@ -1474,7 +1495,8 @@ def ingest_invoice_retry_errors(
 
         # `placeholders` is a fixed-shape "?,?,?" string built from the
         # validated, allowlisted `requested` set above — no user input is
-        # interpolated here, so the f-string is safe.
+        # interpolated here, so the f-string is safe. error_message is
+        # preserved (see docstring + targeted branch above).
         placeholders = ",".join(["?"] * len(requested))
         with conn:
             cursor = conn.execute(
@@ -1482,8 +1504,7 @@ def ingest_invoice_retry_errors(
                 UPDATE emails
                 SET processed_at = NULL,
                     outcome = NULL,
-                    error_code = NULL,
-                    error_message = NULL
+                    error_code = NULL
                 WHERE outcome IN ({placeholders})
                   AND dismissed_at IS NULL
                 """,  # noqa: S608 — placeholders are bound parameters

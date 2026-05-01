@@ -15,6 +15,7 @@ import {
   TableRow,
 } from "@/components/ui/table";
 import type { PendingAction } from "@/lib/queries/dashboard";
+import { apiFetch } from "@/lib/api-fetch";
 
 interface EmailBody {
   body_html: string;
@@ -146,7 +147,7 @@ export function NeedsAttentionCard({
     setEmailBody(null);
 
     try {
-      const response = await fetch("/api/emails/body", {
+      const response = await apiFetch("/api/emails/body", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ msgId }),

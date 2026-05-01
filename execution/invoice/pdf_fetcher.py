@@ -31,7 +31,7 @@ from urllib.parse import urlparse
 import httpx
 
 from execution.shared.errors import RateLimitedError, SSRFValidationError
-from execution.shared.http import FetchResult, SafeHttpClient
+from execution.shared.http import FetchResult, SafeHttpClient, validate_url
 
 
 class FetchStatus(StrEnum):
@@ -131,6 +131,23 @@ def fetch_invoice_pdf(
     """
     provider = classify_provider(url)
     host = (urlparse(url).hostname or "").lower().rstrip(".")
+
+    # Run SSRF / userinfo / scheme / port-confusion validation BEFORE the
+    # login-gated short-circuit. Otherwise a URL like
+    # ``https://attacker@webflow.com/x.pdf`` matches the host allowlist,
+    # short-circuits to NEEDS_MANUAL_DOWNLOAD, and the persisted URL never
+    # sees the userinfo guard. validate_url's tiny extra DNS hit is cheap
+    # compared to the security gain (the result feeds straight into the
+    # SafeHttpClient redirect loop's first hop on the non-gated path).
+    try:
+        validate_url(url)
+    except SSRFValidationError as err:
+        return FetchOutcome(
+            status=FetchStatus.SSRF_REJECTED,
+            url=url,
+            provider=provider,
+            reason=str(err),
+        )
 
     # Short-circuit on known login-gated portals — saves a round-trip and
     # produces a better Exceptions-row reason than a generic HTML rejection.

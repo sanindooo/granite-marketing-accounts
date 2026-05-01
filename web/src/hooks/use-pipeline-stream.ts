@@ -2,6 +2,7 @@
 
 import { useCallback, useRef, useState } from "react";
 import type { PipelineCommand, PipelineOptions } from "@/lib/types";
+import { apiFetch } from "@/lib/api-fetch";
 
 export interface ProgressEvent {
   event: "progress";
@@ -61,7 +62,7 @@ export function usePipelineStream() {
       });
 
       try {
-        const response = await fetch("/api/pipeline/stream", {
+        const response = await apiFetch("/api/pipeline/stream", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ command, ...options }),
