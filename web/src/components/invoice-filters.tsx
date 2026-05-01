@@ -27,6 +27,7 @@ export function InvoiceFilters({ vendors, categories }: InvoiceFiltersProps) {
       vendor: parseAsString,
       category: parseAsString,
       status: parseAsString.withDefault("all"),
+      exported: parseAsString,
       search: parseAsString,
       dateFrom: parseAsString,
       dateTo: parseAsString,
@@ -54,6 +55,7 @@ export function InvoiceFilters({ vendors, categories }: InvoiceFiltersProps) {
       vendor: null,
       category: null,
       status: "all",
+      exported: null,
       search: null,
       dateFrom: null,
       dateTo: null,
@@ -65,6 +67,7 @@ export function InvoiceFilters({ vendors, categories }: InvoiceFiltersProps) {
     filters.vendor ||
     filters.category ||
     filters.status !== "all" ||
+    filters.exported ||
     filters.search ||
     filters.dateFrom ||
     filters.dateTo ||
@@ -141,6 +144,22 @@ export function InvoiceFilters({ vendors, categories }: InvoiceFiltersProps) {
             <SelectItem value="matched">Matched</SelectItem>
             <SelectItem value="unmatched">Unmatched</SelectItem>
             <SelectItem value="pending">Pending</SelectItem>
+          </SelectContent>
+        </Select>
+
+        <Select
+          value={filters.exported || "all"}
+          onValueChange={(value) =>
+            setFilters({ exported: value === "all" ? null : value })
+          }
+        >
+          <SelectTrigger className="w-36">
+            <SelectValue placeholder="Export" />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value="all">All exports</SelectItem>
+            <SelectItem value="no">Not exported</SelectItem>
+            <SelectItem value="yes">Exported</SelectItem>
           </SelectContent>
         </Select>
 

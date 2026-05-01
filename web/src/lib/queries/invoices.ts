@@ -1,10 +1,23 @@
 import { db } from "../db";
-import type { InvoiceRow, VendorRow } from "../types";
+import type { InvoiceListRow, InvoiceRow, VendorRow } from "../types";
 import { fyBoundsOrAll } from "../fiscal";
 
 function escapeLike(input: string): string {
   return input.replace(/\\/g, "\\\\").replace(/%/g, "\\%").replace(/_/g, "\\_");
 }
+
+// Trimmed projection for list/table consumers — omits confidence_json and
+// other detail-only blobs to keep RSC payloads small. Detail page uses i.*.
+const LIST_COLUMNS = `
+  i.invoice_id, i.source_msg_id, i.vendor_id, i.vendor_name_raw,
+  i.invoice_number, i.invoice_date, i.currency,
+  i.amount_net, i.amount_vat, i.amount_gross, i.amount_gross_gbp,
+  i.vat_rate, i.category, i.category_source,
+  i.drive_file_id, i.drive_web_view_link,
+  i.last_exported_at,
+  i.deleted_at,
+  v.canonical_name as vendor_name
+`;
 
 export interface InvoiceFilters {
   fy?: string;
@@ -14,10 +27,11 @@ export interface InvoiceFilters {
   search?: string;
   dateFrom?: string;
   dateTo?: string;
+  exported?: "yes" | "no";
   limit?: number;
 }
 
-export function getInvoices(filters: InvoiceFilters = {}): InvoiceRow[] {
+export function getInvoices(filters: InvoiceFilters = {}): InvoiceListRow[] {
   const conditions: string[] = ["i.deleted_at IS NULL"];
   const params: (string | number | null)[] = [];
 
@@ -58,6 +72,12 @@ export function getInvoices(filters: InvoiceFilters = {}): InvoiceRow[] {
     params.push(escaped, escaped);
   }
 
+  if (filters.exported === "yes") {
+    conditions.push("i.last_exported_at IS NOT NULL");
+  } else if (filters.exported === "no") {
+    conditions.push("i.last_exported_at IS NULL");
+  }
+
   if (filters.status && filters.status !== "all") {
     conditions.push(`
       EXISTS (
@@ -72,7 +92,7 @@ export function getInvoices(filters: InvoiceFilters = {}): InvoiceRow[] {
   params.push(limit);
 
   const sql = `
-    SELECT i.*, v.canonical_name as vendor_name
+    SELECT ${LIST_COLUMNS}
     FROM invoices i
     LEFT JOIN vendors v ON i.vendor_id = v.vendor_id
     WHERE ${conditions.join(" AND ")}
@@ -80,7 +100,7 @@ export function getInvoices(filters: InvoiceFilters = {}): InvoiceRow[] {
     LIMIT ?
   `;
 
-  return db.prepare(sql).all(...params) as InvoiceRow[];
+  return db.prepare(sql).all(...params) as InvoiceListRow[];
 }
 
 export function getInvoiceById(invoiceId: string): InvoiceRow | null {
@@ -93,16 +113,16 @@ export function getInvoiceById(invoiceId: string): InvoiceRow | null {
   return (db.prepare(sql).get(invoiceId) as InvoiceRow) ?? null;
 }
 
-export function getInvoicesByIds(invoiceIds: string[]): InvoiceRow[] {
+export function getInvoicesByIds(invoiceIds: string[]): InvoiceListRow[] {
   if (invoiceIds.length === 0) return [];
   const placeholders = invoiceIds.map(() => "?").join(",");
   const sql = `
-    SELECT i.*, v.canonical_name as vendor_name
+    SELECT ${LIST_COLUMNS}
     FROM invoices i
     LEFT JOIN vendors v ON i.vendor_id = v.vendor_id
     WHERE i.invoice_id IN (${placeholders})
   `;
-  return db.prepare(sql).all(...invoiceIds) as InvoiceRow[];
+  return db.prepare(sql).all(...invoiceIds) as InvoiceListRow[];
 }
 
 export function getVendors(): VendorRow[] {
@@ -136,7 +156,7 @@ export function getInvoiceCount(fy?: string): number {
   return row.count;
 }
 
-export function getExceptionInvoices(fy?: string): InvoiceRow[] {
+export function getExceptionInvoices(fy?: string): InvoiceListRow[] {
   const conditions: string[] = ["i.deleted_at IS NULL"];
   const params: (string | number)[] = [];
 
@@ -156,7 +176,7 @@ export function getExceptionInvoices(fy?: string): InvoiceRow[] {
   `);
 
   const sql = `
-    SELECT i.*, v.canonical_name as vendor_name
+    SELECT ${LIST_COLUMNS}
     FROM invoices i
     LEFT JOIN vendors v ON i.vendor_id = v.vendor_id
     WHERE ${conditions.join(" AND ")}
@@ -164,5 +184,5 @@ export function getExceptionInvoices(fy?: string): InvoiceRow[] {
     LIMIT 500
   `;
 
-  return db.prepare(sql).all(...params) as InvoiceRow[];
+  return db.prepare(sql).all(...params) as InvoiceListRow[];
 }

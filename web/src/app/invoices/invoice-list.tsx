@@ -6,13 +6,13 @@ import { toast } from "sonner";
 import { InvoiceTable } from "@/components/invoice-table";
 import { Button } from "@/components/ui/button";
 import { getCurrentFY } from "@/lib/fiscal";
-import type { InvoiceRow } from "@/lib/types";
+import type { InvoiceListRow } from "@/lib/types";
 import { fetchInvoices, fetchExceptionInvoices } from "@/lib/actions/invoices";
 
 const MAX_SELECTION = 100;
 
 export function InvoiceList() {
-  const [invoices, setInvoices] = useState<InvoiceRow[]>([]);
+  const [invoices, setInvoices] = useState<InvoiceListRow[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
@@ -24,6 +24,7 @@ export function InvoiceList() {
       vendor: parseAsString,
       category: parseAsString,
       status: parseAsString.withDefault("all"),
+      exported: parseAsString,
       search: parseAsString,
       dateFrom: parseAsString,
       dateTo: parseAsString,
@@ -32,44 +33,67 @@ export function InvoiceList() {
     { shallow: true }
   );
 
+  // Destructure individual primitive fields so the effect re-runs only when a
+  // field actually changes — depending on `filters` (a fresh object identity
+  // each render) caused redundant fetches.
+  const {
+    fy,
+    vendor,
+    category,
+    status,
+    exported,
+    search,
+    dateFrom,
+    dateTo,
+    exceptions,
+  } = filters;
+
   useEffect(() => {
-    async function loadInvoices() {
+    // AbortController on a Server Action does NOT cancel server-side execution
+    // (see vercel/next.js#81418, discussion #54516). The Server Action runs to
+    // completion; the cancelled flag below just drops stale results client-side
+    // so the user sees the result of their latest filter change, not an older
+    // in-flight one. Real throughput fix is column trim + the 300 ms debounce
+    // on the search input + better-sqlite3 query speed.
+    let cancelled = false;
+
+    (async () => {
       setLoading(true);
       setError(null);
       setSelectedIds(new Set());
-
       try {
-        let result;
-        if (filters.exceptions) {
-          result = await fetchExceptionInvoices(filters.fy);
-        } else {
-          result = await fetchInvoices({
-            fy: filters.fy,
-            vendor: filters.vendor || undefined,
-            category: filters.category || undefined,
-            status:
-              (filters.status as "matched" | "unmatched" | "pending" | "all") ||
-              "all",
-            search: filters.search || undefined,
-            dateFrom: filters.dateFrom || undefined,
-            dateTo: filters.dateTo || undefined,
-          });
-        }
+        const result = exceptions
+          ? await fetchExceptionInvoices(fy)
+          : await fetchInvoices({
+              fy,
+              vendor: vendor || undefined,
+              category: category || undefined,
+              status:
+                (status as "matched" | "unmatched" | "pending" | "all") ||
+                "all",
+              exported: (exported as "yes" | "no" | undefined) || undefined,
+              search: search || undefined,
+              dateFrom: dateFrom || undefined,
+              dateTo: dateTo || undefined,
+            });
 
+        if (cancelled) return;
         if (result.ok) {
           setInvoices(result.data);
         } else {
           setError(result.error.message);
         }
       } catch {
-        setError("Failed to load invoices");
+        if (!cancelled) setError("Failed to load invoices");
       } finally {
-        setLoading(false);
+        if (!cancelled) setLoading(false);
       }
-    }
+    })();
 
-    loadInvoices();
-  }, [filters]);
+    return () => {
+      cancelled = true;
+    };
+  }, [fy, vendor, category, status, exported, search, dateFrom, dateTo, exceptions]);
 
   const handleSelectAll = () => {
     const idsToSelect = invoices.slice(0, MAX_SELECTION).map((i) => i.invoice_id);
@@ -106,7 +130,7 @@ export function InvoiceList() {
       const url = window.URL.createObjectURL(blob);
       const a = document.createElement("a");
       a.href = url;
-      a.download = `invoices-${filters.fy}.zip`;
+      a.download = `invoices-${fy}.zip`;
       document.body.appendChild(a);
       a.click();
       window.URL.revokeObjectURL(url);

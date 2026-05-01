@@ -8,13 +8,21 @@ import {
   getExceptionInvoices,
   type InvoiceFilters,
 } from "@/lib/queries/invoices";
-import type { Result, InvoiceRow, VendorRow } from "@/lib/types";
+import type { Result, InvoiceListRow, InvoiceRow, VendorRow } from "@/lib/types";
 
 export async function fetchInvoices(
   filters: InvoiceFilters
-): Promise<Result<InvoiceRow[]>> {
+): Promise<Result<InvoiceListRow[]>> {
   try {
-    if (filters.status === "all" && !filters.vendor && !filters.category && !filters.search && !filters.dateFrom && !filters.dateTo) {
+    if (
+      filters.status === "all" &&
+      !filters.vendor &&
+      !filters.category &&
+      !filters.search &&
+      !filters.dateFrom &&
+      !filters.dateTo &&
+      !filters.exported
+    ) {
       const invoices = getInvoices({ fy: filters.fy, limit: filters.limit });
       return { ok: true, data: invoices };
     }
@@ -33,7 +41,7 @@ export async function fetchInvoices(
 
 export async function fetchExceptionInvoices(
   fy?: string
-): Promise<Result<InvoiceRow[]>> {
+): Promise<Result<InvoiceListRow[]>> {
   try {
     const invoices = getExceptionInvoices(fy);
     return { ok: true, data: invoices };

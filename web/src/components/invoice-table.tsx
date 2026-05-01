@@ -18,13 +18,14 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table";
+import { CheckCircle2 } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Checkbox } from "@/components/ui/checkbox";
 import { formatDate } from "@/lib/formatters";
-import type { InvoiceRow } from "@/lib/types";
+import type { InvoiceListRow } from "@/lib/types";
 
 interface InvoiceTableProps {
-  data: InvoiceRow[];
+  data: InvoiceListRow[];
   selectable?: boolean;
   selectedIds?: Set<string>;
   onSelectionChange?: (ids: Set<string>) => void;
@@ -49,12 +50,12 @@ export function InvoiceTable({
     { id: "invoice_date", desc: true },
   ]);
 
-  const columns: ColumnDef<InvoiceRow>[] = [
+  const columns: ColumnDef<InvoiceListRow>[] = [
     ...(selectable
       ? [
           {
             id: "select",
-            header: ({ table }: { table: ReturnType<typeof useReactTable<InvoiceRow>> }) => (
+            header: ({ table }: { table: ReturnType<typeof useReactTable<InvoiceListRow>> }) => (
               <Checkbox
                 checked={table.getIsAllPageRowsSelected()}
                 onCheckedChange={(value) => {
@@ -68,7 +69,7 @@ export function InvoiceTable({
                 }}
               />
             ),
-            cell: ({ row }: { row: { original: InvoiceRow } }) => (
+            cell: ({ row }: { row: { original: InvoiceListRow } }) => (
               <Checkbox
                 checked={selectedIds.has(row.original.invoice_id)}
                 onCheckedChange={(value) => {
@@ -85,7 +86,7 @@ export function InvoiceTable({
               />
             ),
             enableSorting: false,
-          } as ColumnDef<InvoiceRow>,
+          } as ColumnDef<InvoiceListRow>,
         ]
       : []),
     {
@@ -96,6 +97,21 @@ export function InvoiceTable({
           {formatDate(row.original.invoice_date)}
         </span>
       ),
+    },
+    {
+      id: "exported",
+      header: "",
+      cell: ({ row }) => {
+        const ts = row.original.last_exported_at;
+        if (!ts) return null;
+        const label = `Exported ${formatDate(ts)}`;
+        return (
+          <span title={label} aria-label={label}>
+            <CheckCircle2 className="size-4 text-green-600" />
+          </span>
+        );
+      },
+      enableSorting: false,
     },
     {
       accessorKey: "vendor_name",
