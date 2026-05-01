@@ -26,6 +26,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import date, datetime
 from decimal import Decimal
+from html.parser import HTMLParser
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Final, Literal
 
@@ -461,14 +462,17 @@ def _process_one(
     feedback_examples: list[FeedbackExample] | None = None,
 ) -> tuple[Outcome, FiledInvoice | None]:
     """Process a single email through the full pipeline."""
-    # Fetch full body
-    body_text = adapter.fetch_message_body(email_row.msg_id)
+    # Fetch both body variants in one Graph call. HTML is needed so the URL
+    # extractor can see anchor hrefs (e.g. Webflow's "PDF" link points at
+    # invoice.stripe.com); plaintext is what the classifier prompt prefers.
+    html_body, text_body = adapter.fetch_message_body_both(email_row.msg_id)
+    classifier_body = text_body or _html_to_text(html_body)
 
     # Classify
     email_input = EmailInput(
         subject=email_row.subject,
         sender=email_row.from_addr,
-        body=body_text,
+        body=classifier_body,
     )
     result, _call = classify_email(
         llm_client,
@@ -488,9 +492,10 @@ def _process_one(
     ]
 
     if not pdf_attachments:
-        # Check email body for invoice URLs (Stripe, Paddle, etc.)
+        # Check email body for invoice URLs (Stripe, Paddle, etc.). HTML body
+        # is scanned first because anchor hrefs only exist there.
         pdf_bytes, fetch_outcome = _try_fetch_pdf_from_body(
-            body_text, http_client=http_client
+            text_body=text_body, html_body=html_body, http_client=http_client
         )
         if pdf_bytes is None:
             if fetch_outcome and fetch_outcome.status == FetchStatus.NEEDS_MANUAL_DOWNLOAD:
@@ -655,21 +660,62 @@ def _extract_pdf_text(pdf_bytes: bytes) -> str:
 
 
 def _try_fetch_pdf_from_body(
-    body_text: str,
     *,
+    text_body: str,
+    html_body: str,
     http_client: SafeHttpClient,
 ) -> tuple[bytes | None, FetchOutcome | None]:
-    """Try to extract and fetch a PDF URL from the email body."""
-    for pattern in _PDF_URL_PATTERNS:
-        match = pattern.search(body_text)
-        if match:
-            url = match.group(0).rstrip(".,;:)")
-            outcome = fetch_invoice_pdf(url, client=http_client)
-            if outcome.status == FetchStatus.OK and outcome.body:
-                return outcome.body, outcome
-            if outcome.status == FetchStatus.NEEDS_MANUAL_DOWNLOAD:
-                return None, outcome
+    """Try to extract and fetch a PDF URL from the email body.
+
+    Scans HTML body first because anchor hrefs (e.g. Webflow's "PDF" link to
+    ``invoice.stripe.com``) only appear in HTML. Falls back to plaintext.
+    Uses ``finditer`` rather than ``search`` so a generic ``.pdf`` URL ahead
+    of a vendor-specific one (e.g. a marketing CDN PDF before the Stripe
+    invoice URL) does not win the first-match. Pattern order in
+    :data:`_PDF_URL_PATTERNS` puts the generic ``.pdf`` first; we still
+    iterate every pattern so vendor-specific outcomes are reachable.
+    """
+    for body in (html_body, text_body):
+        if not body:
+            continue
+        for pattern in _PDF_URL_PATTERNS:
+            for m in pattern.finditer(body):
+                url = m.group(0).rstrip(".,;:)")
+                outcome = fetch_invoice_pdf(url, client=http_client)
+                if outcome.status == FetchStatus.OK and outcome.body:
+                    return outcome.body, outcome
+                if outcome.status == FetchStatus.NEEDS_MANUAL_DOWNLOAD:
+                    return None, outcome
     return None, None
+
+
+class _HTMLToText(HTMLParser):
+    """Minimal HTML→text extractor for the classifier prompt.
+
+    stdlib parser is non-validating with no DTD/entity expansion, so it is
+    XXE-safe by construction. Do not swap to lxml without setting
+    ``no_network=True, resolve_entities=False, load_dtd=False``.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._parts: list[str] = []
+
+    def handle_data(self, data: str) -> None:
+        self._parts.append(data)
+
+    @property
+    def text(self) -> str:
+        return " ".join(p.strip() for p in self._parts if p.strip())
+
+
+def _html_to_text(html: str) -> str:
+    """Strip HTML markup so the classifier sees prose, not ``<table>`` tags."""
+    if not html:
+        return ""
+    parser = _HTMLToText()
+    parser.feed(html)
+    return parser.text
 
 
 def _extract_domain(email_addr: str) -> str | None:
