@@ -111,4 +111,5 @@ export interface PipelineOptions {
   workers?: number;
   model?: "claude" | "openai";
   force?: boolean;
+  msgIds?: string[];
 }

@@ -17,6 +17,7 @@ import {
 } from "@/components/ui/table";
 import { toast } from "sonner";
 import { fetchInboxEmails, fetchInboxCounts, rejectEmails } from "@/lib/actions/inbox";
+import { usePipelineStream } from "@/hooks/use-pipeline-stream";
 import type { InboxEmailRow, InboxCounts } from "@/lib/queries/inbox";
 
 type View = "unprocessed" | "all";
@@ -38,6 +39,7 @@ export function InboxContent() {
   const [loading, setLoading] = useState(true);
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
   const [rejecting, setRejecting] = useState(false);
+  const stream = usePipelineStream();
 
   useEffect(() => {
     setLocalSender(filters.sender || "");
@@ -151,6 +153,31 @@ export function InboxContent() {
     }
   };
 
+  const handleProcessSelected = async () => {
+    if (selectedIds.size === 0) return;
+    toast.info(`Processing ${selectedIds.size} selected emails...`);
+    setSelectedIds(new Set());
+    await stream.run("processInvoices", { msgIds: Array.from(selectedIds) });
+  };
+
+  // Handle stream completion
+  useEffect(() => {
+    if (!stream.isRunning && stream.result) {
+      toast.success("Processing complete");
+      refreshData();
+    } else if (!stream.isRunning && stream.error) {
+      if (stream.error.error_code === "needs_reauth") {
+        toast.error("Authentication expired", {
+          description: stream.error.user_message || "Run `granite ops reauth ms365` in terminal",
+          duration: 10000,
+        });
+      } else {
+        toast.error(stream.error.message);
+      }
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [stream.isRunning, stream.result, stream.error]);
+
   const formatDate = (dateStr: string) => {
     return new Date(dateStr).toLocaleDateString();
   };
@@ -189,11 +216,20 @@ export function InboxContent() {
                   {selectedIds.size} selected
                 </span>
                 <Button
+                  variant="default"
+                  size="sm"
+                  className="h-7 text-xs"
+                  onClick={handleProcessSelected}
+                  disabled={stream.isRunning || rejecting}
+                >
+                  {stream.isRunning ? "Processing..." : "Process selected"}
+                </Button>
+                <Button
                   variant="outline"
                   size="sm"
                   className="h-7 text-xs text-red-600 border-red-200 hover:bg-red-50 dark:text-red-400 dark:border-red-800 dark:hover:bg-red-950/50"
                   onClick={handleReject}
-                  disabled={rejecting}
+                  disabled={rejecting || stream.isRunning}
                 >
                   {rejecting ? "Rejecting..." : "Reject"}
                 </Button>
@@ -259,6 +295,29 @@ export function InboxContent() {
         </div>
       </CardHeader>
       <CardContent>
+        {stream.isRunning && stream.progress && (
+          <div className="mb-4 space-y-2">
+            <div className="flex items-center gap-2 text-sm">
+              <div className="h-2 w-2 animate-pulse rounded-full bg-blue-500" />
+              <span className="text-blue-600">{stream.progress.detail}</span>
+            </div>
+            {stream.progress.total > 0 && (
+              <div className="flex items-center gap-2">
+                <div className="h-1.5 flex-1 overflow-hidden rounded-full bg-muted">
+                  <div
+                    className="h-full bg-blue-500 transition-all duration-300"
+                    style={{
+                      width: `${Math.min(100, (stream.progress.current / stream.progress.total) * 100)}%`,
+                    }}
+                  />
+                </div>
+                <span className="text-xs text-muted-foreground tabular-nums">
+                  {stream.progress.current}/{stream.progress.total}
+                </span>
+              </div>
+            )}
+          </div>
+        )}
         {loading ? (
           <div className="text-muted-foreground">Loading emails...</div>
         ) : emails.length === 0 ? (

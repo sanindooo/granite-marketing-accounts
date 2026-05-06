@@ -25,6 +25,7 @@ const commandSchema = z.object({
   workers: z.number().int().min(1).max(20).optional(),
   model: z.enum(["claude", "openai"]).optional(),
   force: z.boolean().optional(),
+  msgIds: z.array(z.string()).optional(),
 });
 
 type PipelineCommand = keyof typeof COMMANDS;
@@ -74,6 +75,10 @@ function buildArgs(command: PipelineCommand, options: z.infer<typeof commandSche
 
   if (options.model && command === "processInvoices") {
     args.push("--model", options.model);
+  }
+
+  if (options.msgIds && options.msgIds.length > 0 && command === "processInvoices") {
+    args.push("--msg-ids", JSON.stringify(options.msgIds));
   }
 
   if (options.force && command === "backfillFx") {

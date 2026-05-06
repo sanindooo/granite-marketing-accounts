@@ -902,6 +902,10 @@ def ingest_invoice_process(
         str | None,
         typer.Option("--fy", help="Filter to emails received in this fiscal year (e.g., FY-2025-26)."),
     ] = None,
+    msg_ids: Annotated[
+        str | None,
+        typer.Option("--msg-ids", help="JSON array of msg_ids to process (selective processing)."),
+    ] = None,
     tmp_root: Annotated[
         Path | None,
         typer.Option("--tmp", help="Override temp directory (default: .tmp)."),
@@ -926,6 +930,7 @@ def ingest_invoice_process(
     Use ``--workers N`` to process N emails in parallel (default: 5).
     Use ``--model claude`` for Claude Haiku (more accurate, higher cost).
     Use ``--fy FY-2025-26`` to process only emails from a specific fiscal year.
+    Use ``--msg-ids '["id1","id2"]'`` to process only specific emails.
     """
     try:
         from execution.adapters.ms365 import Ms365Adapter, Ms365Auth
@@ -981,13 +986,27 @@ def ingest_invoice_process(
         resolved_tmp = tmp_root or Path(".tmp")
         resolved_tmp.mkdir(parents=True, exist_ok=True)
 
+        # Parse msg_ids if provided
+        parsed_msg_ids: list[str] | None = None
+        if msg_ids:
+            import json
+            try:
+                parsed_msg_ids = json.loads(msg_ids)
+                if not isinstance(parsed_msg_ids, list) or not all(isinstance(x, str) for x in parsed_msg_ids):
+                    emit_error("--msg-ids must be a JSON array of strings")
+                    raise typer.Exit(1)
+            except json.JSONDecodeError as e:
+                emit_error(f"Invalid JSON in --msg-ids: {e}")
+                raise typer.Exit(1)
+
         def progress_callback(current: int, total: int, detail: str) -> None:
             emit_progress("process", current, total, detail)
             # Update stats incrementally so interrupted runs show partial progress
             _update_run_stats(conn, run_id=run_id, stats={"processed": current, "total": total, "detail": detail})
 
         fy_desc = f" for {fy}" if fy else ""
-        emit_progress("process", 0, 0, f"Starting invoice processing with {workers} worker(s){fy_desc}")
+        selection_desc = f" ({len(parsed_msg_ids)} selected)" if parsed_msg_ids else ""
+        emit_progress("process", 0, 0, f"Starting invoice processing with {workers} worker(s){fy_desc}{selection_desc}")
         try:
             stats = process_pending_emails(
                 conn,
@@ -999,6 +1018,7 @@ def ingest_invoice_process(
                 tmp_root=resolved_tmp,
                 limit=limit,
                 fy_filter=fy,
+                msg_ids=parsed_msg_ids,
                 on_progress=progress_callback,
                 workers=workers,
                 db_path=db_path,
