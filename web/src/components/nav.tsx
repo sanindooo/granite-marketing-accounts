@@ -14,6 +14,7 @@ function NavLinks() {
   // Build links that preserve the FY param when navigating
   const links = [
     { href: `/dashboard${fy ? `?fy=${fy}` : ""}`, label: "Dashboard", match: "/dashboard" },
+    { href: "/inbox", label: "Inbox", match: "/inbox" },
     { href: `/invoices${fy ? `?fy=${fy}` : ""}`, label: "Invoices", match: "/invoices" },
   ];
 
