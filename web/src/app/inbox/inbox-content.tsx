@@ -6,6 +6,7 @@ import { useDebouncedCallback } from "use-debounce";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { Checkbox } from "@/components/ui/checkbox";
 import {
   Table,
   TableBody,
@@ -34,6 +35,7 @@ export function InboxContent() {
   const [emails, setEmails] = useState<InboxEmailRow[]>([]);
   const [counts, setCounts] = useState<InboxCounts>({ unprocessed: 0, all: 0 });
   const [loading, setLoading] = useState(true);
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
 
   useEffect(() => {
     setLocalSender(filters.sender || "");
@@ -45,11 +47,32 @@ export function InboxContent() {
 
   const { view, sender, dateFrom, dateTo } = filters;
 
+  const toggleSelection = (msgId: string) => {
+    setSelectedIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(msgId)) {
+        next.delete(msgId);
+      } else {
+        next.add(msgId);
+      }
+      return next;
+    });
+  };
+
+  const toggleSelectAll = () => {
+    if (selectedIds.size === emails.length && emails.length > 0) {
+      setSelectedIds(new Set());
+    } else {
+      setSelectedIds(new Set(emails.map((e) => e.msgId)));
+    }
+  };
+
   useEffect(() => {
     let cancelled = false;
 
     async function loadData() {
       setLoading(true);
+      setSelectedIds(new Set());
       try {
         const [emailsResult, countsResult] = await Promise.all([
           fetchInboxEmails({
@@ -84,6 +107,7 @@ export function InboxContent() {
   }, [view, sender, dateFrom, dateTo]);
 
   const hasActiveFilters = sender || dateFrom || dateTo;
+  const hasSelection = selectedIds.size > 0;
 
   const clearFilters = () => {
     setLocalSender("");
@@ -124,7 +148,24 @@ export function InboxContent() {
     <Card>
       <CardHeader className="space-y-4">
         <div className="flex items-center justify-between">
-          <CardTitle>Synced Emails</CardTitle>
+          <div className="flex items-center gap-4">
+            <CardTitle>Synced Emails</CardTitle>
+            {hasSelection && (
+              <div className="flex items-center gap-2">
+                <span className="text-sm text-muted-foreground">
+                  {selectedIds.size} selected
+                </span>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  className="h-7 text-xs"
+                  onClick={() => setSelectedIds(new Set())}
+                >
+                  Clear
+                </Button>
+              </div>
+            )}
+          </div>
           <div className="flex gap-1 rounded-lg bg-muted p-1">
             <Button
               variant={view === "unprocessed" ? "default" : "ghost"}
@@ -190,6 +231,13 @@ export function InboxContent() {
           <Table>
             <TableHeader>
               <TableRow>
+                <TableHead className="w-10">
+                  <Checkbox
+                    checked={selectedIds.size === emails.length && emails.length > 0}
+                    onCheckedChange={toggleSelectAll}
+                    aria-label="Select all"
+                  />
+                </TableHead>
                 <TableHead>From</TableHead>
                 <TableHead>Subject</TableHead>
                 <TableHead>Date</TableHead>
@@ -199,6 +247,13 @@ export function InboxContent() {
             <TableBody>
               {emails.map((email) => (
                 <TableRow key={email.msgId}>
+                  <TableCell className="w-10">
+                    <Checkbox
+                      checked={selectedIds.has(email.msgId)}
+                      onCheckedChange={() => toggleSelection(email.msgId)}
+                      aria-label={`Select ${email.subject}`}
+                    />
+                  </TableCell>
                   <TableCell className="max-w-40 truncate text-sm">
                     {email.fromAddr}
                   </TableCell>
