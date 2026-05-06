@@ -1,9 +1,11 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { useQueryState, parseAsString } from "nuqs";
+import { useQueryStates, parseAsString } from "nuqs";
+import { useDebouncedCallback } from "use-debounce";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
 import {
   Table,
   TableBody,
@@ -18,13 +20,30 @@ import type { InboxEmailRow, InboxCounts } from "@/lib/queries/inbox";
 type View = "unprocessed" | "all";
 
 export function InboxContent() {
-  const [view, setView] = useQueryState(
-    "view",
-    parseAsString.withDefault("unprocessed")
+  const [filters, setFilters] = useQueryStates(
+    {
+      view: parseAsString.withDefault("unprocessed"),
+      sender: parseAsString,
+      dateFrom: parseAsString,
+      dateTo: parseAsString,
+    },
+    { shallow: true }
   );
+
+  const [localSender, setLocalSender] = useState(filters.sender || "");
   const [emails, setEmails] = useState<InboxEmailRow[]>([]);
   const [counts, setCounts] = useState<InboxCounts>({ unprocessed: 0, all: 0 });
   const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    setLocalSender(filters.sender || "");
+  }, [filters.sender]);
+
+  const debouncedSetSender = useDebouncedCallback((value: string) => {
+    setFilters({ sender: value || null });
+  }, 300);
+
+  const { view, sender, dateFrom, dateTo } = filters;
 
   useEffect(() => {
     let cancelled = false;
@@ -33,7 +52,12 @@ export function InboxContent() {
       setLoading(true);
       try {
         const [emailsResult, countsResult] = await Promise.all([
-          fetchInboxEmails({ view: view as View }),
+          fetchInboxEmails({
+            view: view as View,
+            sender: sender || undefined,
+            dateFrom: dateFrom || undefined,
+            dateTo: dateTo || undefined,
+          }),
           fetchInboxCounts(),
         ]);
 
@@ -57,7 +81,18 @@ export function InboxContent() {
     return () => {
       cancelled = true;
     };
-  }, [view]);
+  }, [view, sender, dateFrom, dateTo]);
+
+  const hasActiveFilters = sender || dateFrom || dateTo;
+
+  const clearFilters = () => {
+    setLocalSender("");
+    setFilters({
+      sender: null,
+      dateFrom: null,
+      dateTo: null,
+    });
+  };
 
   const formatDate = (dateStr: string) => {
     return new Date(dateStr).toLocaleDateString();
@@ -87,7 +122,7 @@ export function InboxContent() {
 
   return (
     <Card>
-      <CardHeader>
+      <CardHeader className="space-y-4">
         <div className="flex items-center justify-between">
           <CardTitle>Synced Emails</CardTitle>
           <div className="flex gap-1 rounded-lg bg-muted p-1">
@@ -95,7 +130,7 @@ export function InboxContent() {
               variant={view === "unprocessed" ? "default" : "ghost"}
               size="sm"
               className="h-7 text-xs"
-              onClick={() => setView("unprocessed")}
+              onClick={() => setFilters({ view: "unprocessed" })}
             >
               Unprocessed ({counts.unprocessed})
             </Button>
@@ -103,11 +138,41 @@ export function InboxContent() {
               variant={view === "all" ? "default" : "ghost"}
               size="sm"
               className="h-7 text-xs"
-              onClick={() => setView("all")}
+              onClick={() => setFilters({ view: "all" })}
             >
               All Synced ({counts.all})
             </Button>
           </div>
+        </div>
+        <div className="flex flex-wrap items-center gap-3">
+          <Input
+            type="search"
+            value={localSender}
+            onChange={(e) => {
+              setLocalSender(e.target.value);
+              debouncedSetSender(e.target.value);
+            }}
+            placeholder="Search sender..."
+            className="max-w-xs"
+          />
+          <Input
+            type="date"
+            value={dateFrom || ""}
+            onChange={(e) => setFilters({ dateFrom: e.target.value || null })}
+            className="w-36"
+          />
+          <span className="text-sm text-muted-foreground">to</span>
+          <Input
+            type="date"
+            value={dateTo || ""}
+            onChange={(e) => setFilters({ dateTo: e.target.value || null })}
+            className="w-36"
+          />
+          {hasActiveFilters && (
+            <Button variant="ghost" size="sm" onClick={clearFilters}>
+              Clear filters
+            </Button>
+          )}
         </div>
       </CardHeader>
       <CardContent>
@@ -115,7 +180,9 @@ export function InboxContent() {
           <div className="text-muted-foreground">Loading emails...</div>
         ) : emails.length === 0 ? (
           <div className="py-8 text-center text-muted-foreground">
-            {view === "unprocessed"
+            {hasActiveFilters
+              ? "No emails match your filters."
+              : view === "unprocessed"
               ? "No unprocessed emails. All caught up!"
               : "No synced emails yet. Run sync from the Dashboard."}
           </div>
