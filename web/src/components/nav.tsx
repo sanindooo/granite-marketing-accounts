@@ -4,6 +4,7 @@ import { Suspense } from "react";
 import Link from "next/link";
 import { usePathname, useSearchParams } from "next/navigation";
 import { cn } from "@/lib/utils";
+import { ThemeToggle } from "@/components/theme-toggle";
 
 function NavLinks() {
   const pathname = usePathname();
@@ -49,6 +50,7 @@ export function Nav() {
               <NavLinks />
             </Suspense>
           </div>
+          <ThemeToggle />
         </div>
       </div>
     </nav>
