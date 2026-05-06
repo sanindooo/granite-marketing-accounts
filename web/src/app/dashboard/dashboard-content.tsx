@@ -420,53 +420,53 @@ fetchPendingActions(fy === "all" ? undefined : fy),
   return (
     <div className="space-y-6">
       <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
-        <Card>
+        <Card className="shadow-sm">
           <CardHeader className="pb-2">
-            <CardTitle className="text-sm font-medium text-muted-foreground">
+            <CardTitle className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
               Total Invoices
             </CardTitle>
           </CardHeader>
           <CardContent>
-            <div className="text-2xl font-bold font-mono tabular-nums">
+            <div className="text-3xl font-semibold font-mono tabular-nums tracking-tight">
               {metrics.invoiceCount}
             </div>
           </CardContent>
         </Card>
 
-        <Card>
+        <Card className="shadow-sm">
           <CardHeader className="pb-2">
-            <CardTitle className="text-sm font-medium text-muted-foreground">
+            <CardTitle className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
               Total Spend
             </CardTitle>
           </CardHeader>
           <CardContent>
-            <div className="text-2xl font-bold font-mono tabular-nums">
+            <div className="text-3xl font-semibold font-mono tabular-nums tracking-tight">
               {formatCurrency(metrics.totalSpend)}
             </div>
           </CardContent>
         </Card>
 
-        <Card>
+        <Card className="shadow-sm">
           <CardHeader className="pb-2">
-            <CardTitle className="text-sm font-medium text-muted-foreground">
+            <CardTitle className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
               Matched
             </CardTitle>
           </CardHeader>
           <CardContent>
-            <div className="text-2xl font-bold font-mono tabular-nums text-green-600">
+            <div className="text-3xl font-semibold font-mono tabular-nums tracking-tight text-green-600 dark:text-green-400">
               {matchedCount}
             </div>
           </CardContent>
         </Card>
 
-        <Card>
+        <Card className="shadow-sm">
           <CardHeader className="pb-2">
-            <CardTitle className="text-sm font-medium text-muted-foreground">
+            <CardTitle className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
               Unmatched
             </CardTitle>
           </CardHeader>
           <CardContent>
-            <div className="text-2xl font-bold font-mono tabular-nums text-amber-600">
+            <div className="text-3xl font-semibold font-mono tabular-nums tracking-tight text-amber-600 dark:text-amber-400">
               {unmatchedCount + pendingCount}
             </div>
           </CardContent>
