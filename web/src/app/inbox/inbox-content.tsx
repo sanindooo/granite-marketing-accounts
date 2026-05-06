@@ -8,6 +8,14 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Checkbox } from "@/components/ui/checkbox";
 import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
+import { getAvailableFYs, getCurrentFY } from "@/lib/fiscal";
+import {
   Table,
   TableBody,
   TableCell,
@@ -26,6 +34,7 @@ export function InboxContent() {
   const [filters, setFilters] = useQueryStates(
     {
       view: parseAsString.withDefault("unprocessed"),
+      fy: parseAsString.withDefault(getCurrentFY()),
       sender: parseAsString,
       dateFrom: parseAsString,
       dateTo: parseAsString,
@@ -49,7 +58,7 @@ export function InboxContent() {
     setFilters({ sender: value || null });
   }, 300);
 
-  const { view, sender, dateFrom, dateTo } = filters;
+  const { view, fy, sender, dateFrom, dateTo } = filters;
 
   const toggleSelection = (msgId: string) => {
     setSelectedIds((prev) => {
@@ -81,6 +90,7 @@ export function InboxContent() {
         const [emailsResult, countsResult] = await Promise.all([
           fetchInboxEmails({
             view: view as View,
+            fy: fy || undefined,
             sender: sender || undefined,
             dateFrom: dateFrom || undefined,
             dateTo: dateTo || undefined,
@@ -108,14 +118,15 @@ export function InboxContent() {
     return () => {
       cancelled = true;
     };
-  }, [view, sender, dateFrom, dateTo]);
+  }, [view, fy, sender, dateFrom, dateTo]);
 
-  const hasActiveFilters = sender || dateFrom || dateTo;
+  const hasActiveFilters = sender || dateFrom || dateTo || (fy && fy !== getCurrentFY());
   const hasSelection = selectedIds.size > 0;
 
   const clearFilters = () => {
     setLocalSender("");
     setFilters({
+      fy: getCurrentFY(),
       sender: null,
       dateFrom: null,
       dateTo: null,
@@ -126,6 +137,7 @@ export function InboxContent() {
     const [emailsResult, countsResult] = await Promise.all([
       fetchInboxEmails({
         view: view as View,
+        fy: fy || undefined,
         sender: sender || undefined,
         dateFrom: dateFrom || undefined,
         dateTo: dateTo || undefined,
@@ -244,26 +256,68 @@ export function InboxContent() {
               </div>
             )}
           </div>
-          <div className="flex gap-1 rounded-lg bg-muted p-1">
-            <Button
-              variant={view === "unprocessed" ? "default" : "ghost"}
-              size="sm"
-              className="h-7 text-xs"
-              onClick={() => setFilters({ view: "unprocessed" })}
-            >
-              Unprocessed ({counts.unprocessed})
-            </Button>
-            <Button
-              variant={view === "all" ? "default" : "ghost"}
-              size="sm"
-              className="h-7 text-xs"
-              onClick={() => setFilters({ view: "all" })}
-            >
-              All Synced ({counts.all})
-            </Button>
+        </div>
+
+        <div className="flex flex-wrap items-center gap-3">
+          <Select
+            value={fy}
+            onValueChange={(value) => setFilters({ fy: value })}
+          >
+            <SelectTrigger className="w-36">
+              <SelectValue placeholder="Fiscal Year">
+                {fy === "all" ? "All Years" : fy}
+              </SelectValue>
+            </SelectTrigger>
+            <SelectContent>
+              {getAvailableFYs(true).map((fyOption) => (
+                <SelectItem key={fyOption} value={fyOption}>
+                  {fyOption === "all" ? "All Years" : fyOption}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+
+          <Select
+            value={view}
+            onValueChange={(value) => setFilters({ view: value })}
+          >
+            <SelectTrigger className="w-44">
+              <SelectValue placeholder="Status">
+                {view === "unprocessed"
+                  ? `Unprocessed (${counts.unprocessed})`
+                  : `All Synced (${counts.all})`}
+              </SelectValue>
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="unprocessed">
+                Unprocessed ({counts.unprocessed})
+              </SelectItem>
+              <SelectItem value="all">All Synced ({counts.all})</SelectItem>
+            </SelectContent>
+          </Select>
+
+          <div className="flex items-center gap-2">
+            <span className="text-sm text-muted-foreground">From</span>
+            <Input
+              type="date"
+              value={dateFrom || ""}
+              onChange={(e) => setFilters({ dateFrom: e.target.value || null })}
+              className="w-36"
+            />
+          </div>
+
+          <div className="flex items-center gap-2">
+            <span className="text-sm text-muted-foreground">To</span>
+            <Input
+              type="date"
+              value={dateTo || ""}
+              onChange={(e) => setFilters({ dateTo: e.target.value || null })}
+              className="w-36"
+            />
           </div>
         </div>
-        <div className="flex flex-wrap items-center gap-3">
+
+        <div className="flex items-center gap-3">
           <Input
             type="search"
             value={localSender}
@@ -271,22 +325,10 @@ export function InboxContent() {
               setLocalSender(e.target.value);
               debouncedSetSender(e.target.value);
             }}
-            placeholder="Search sender..."
+            placeholder="Search by sender email..."
             className="max-w-xs"
           />
-          <Input
-            type="date"
-            value={dateFrom || ""}
-            onChange={(e) => setFilters({ dateFrom: e.target.value || null })}
-            className="w-36"
-          />
-          <span className="text-sm text-muted-foreground">to</span>
-          <Input
-            type="date"
-            value={dateTo || ""}
-            onChange={(e) => setFilters({ dateTo: e.target.value || null })}
-            className="w-36"
-          />
+
           {hasActiveFilters && (
             <Button variant="ghost" size="sm" onClick={clearFilters}>
               Clear filters

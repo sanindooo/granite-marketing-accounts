@@ -1,4 +1,5 @@
 import { db } from "../db";
+import { fyBoundsOrAll } from "../fiscal";
 
 export interface InboxEmailRow {
   msgId: string;
@@ -14,6 +15,7 @@ export interface InboxFilters {
   dateFrom?: string;
   dateTo?: string;
   view?: "unprocessed" | "all";
+  fy?: string;
 }
 
 export interface InboxCounts {
@@ -42,6 +44,14 @@ export function getInboxEmails(filters: InboxFilters): InboxEmailRow[] {
   if (filters.dateTo) {
     conditions.push("DATE(received_at) <= ?");
     params.push(filters.dateTo);
+  }
+
+  if (filters.fy) {
+    const fyRange = fyBoundsOrAll(filters.fy);
+    if (fyRange) {
+      conditions.push("DATE(received_at) >= ? AND DATE(received_at) <= ?");
+      params.push(fyRange.start, fyRange.end);
+    }
   }
 
   const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
