@@ -258,46 +258,52 @@ export function InboxContent() {
           </div>
         </div>
 
-        <div className="flex flex-wrap items-center gap-3">
-          <Select
-            value={fy}
-            onValueChange={(value) => setFilters({ fy: value })}
-          >
-            <SelectTrigger className="w-36">
-              <SelectValue placeholder="Fiscal Year">
-                {fy === "all" ? "All Years" : fy}
-              </SelectValue>
-            </SelectTrigger>
-            <SelectContent>
-              {getAvailableFYs(true).map((fyOption) => (
-                <SelectItem key={fyOption} value={fyOption}>
-                  {fyOption === "all" ? "All Years" : fyOption}
+        <div className="flex flex-wrap items-center gap-4">
+          <div className="flex flex-col gap-1">
+            <label className="text-xs font-medium text-muted-foreground">Fiscal Year</label>
+            <Select
+              value={fy}
+              onValueChange={(value) => setFilters({ fy: value })}
+            >
+              <SelectTrigger className="w-36">
+                <SelectValue placeholder="Fiscal Year">
+                  {fy === "all" ? "All Years" : fy}
+                </SelectValue>
+              </SelectTrigger>
+              <SelectContent>
+                {getAvailableFYs(true).map((fyOption) => (
+                  <SelectItem key={fyOption} value={fyOption}>
+                    {fyOption === "all" ? "All Years" : fyOption}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          </div>
+
+          <div className="flex flex-col gap-1">
+            <label className="text-xs font-medium text-muted-foreground">Status</label>
+            <Select
+              value={view}
+              onValueChange={(value) => setFilters({ view: value })}
+            >
+              <SelectTrigger className="w-44">
+                <SelectValue placeholder="Status">
+                  {view === "unprocessed"
+                    ? `Unprocessed (${counts.unprocessed})`
+                    : `All Synced (${counts.all})`}
+                </SelectValue>
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="unprocessed">
+                  Unprocessed ({counts.unprocessed})
                 </SelectItem>
-              ))}
-            </SelectContent>
-          </Select>
+                <SelectItem value="all">All Synced ({counts.all})</SelectItem>
+              </SelectContent>
+            </Select>
+          </div>
 
-          <Select
-            value={view}
-            onValueChange={(value) => setFilters({ view: value })}
-          >
-            <SelectTrigger className="w-44">
-              <SelectValue placeholder="Status">
-                {view === "unprocessed"
-                  ? `Unprocessed (${counts.unprocessed})`
-                  : `All Synced (${counts.all})`}
-              </SelectValue>
-            </SelectTrigger>
-            <SelectContent>
-              <SelectItem value="unprocessed">
-                Unprocessed ({counts.unprocessed})
-              </SelectItem>
-              <SelectItem value="all">All Synced ({counts.all})</SelectItem>
-            </SelectContent>
-          </Select>
-
-          <div className="flex items-center gap-2">
-            <span className="text-sm text-muted-foreground">From</span>
+          <div className="flex flex-col gap-1">
+            <label className="text-xs font-medium text-muted-foreground">From Date</label>
             <Input
               type="date"
               value={dateFrom || ""}
@@ -306,8 +312,8 @@ export function InboxContent() {
             />
           </div>
 
-          <div className="flex items-center gap-2">
-            <span className="text-sm text-muted-foreground">To</span>
+          <div className="flex flex-col gap-1">
+            <label className="text-xs font-medium text-muted-foreground">To Date</label>
             <Input
               type="date"
               value={dateTo || ""}
@@ -318,21 +324,26 @@ export function InboxContent() {
         </div>
 
         <div className="flex items-center gap-3">
-          <Input
-            type="search"
-            value={localSender}
-            onChange={(e) => {
-              setLocalSender(e.target.value);
-              debouncedSetSender(e.target.value);
-            }}
-            placeholder="Search by sender email..."
-            className="max-w-xs"
-          />
+          <div className="flex flex-col gap-1">
+            <label className="text-xs font-medium text-muted-foreground">Search</label>
+            <Input
+              type="search"
+              value={localSender}
+              onChange={(e) => {
+                setLocalSender(e.target.value);
+                debouncedSetSender(e.target.value);
+              }}
+              placeholder="Sender email..."
+              className="w-64"
+            />
+          </div>
 
           {hasActiveFilters && (
-            <Button variant="ghost" size="sm" onClick={clearFilters}>
-              Clear filters
-            </Button>
+            <div className="flex items-end pb-0.5">
+              <Button variant="ghost" size="sm" onClick={clearFilters}>
+                Clear filters
+              </Button>
+            </div>
           )}
         </div>
       </CardHeader>
