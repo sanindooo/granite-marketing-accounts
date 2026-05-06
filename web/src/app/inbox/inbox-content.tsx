@@ -15,7 +15,8 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table";
-import { fetchInboxEmails, fetchInboxCounts } from "@/lib/actions/inbox";
+import { toast } from "sonner";
+import { fetchInboxEmails, fetchInboxCounts, rejectEmails } from "@/lib/actions/inbox";
 import type { InboxEmailRow, InboxCounts } from "@/lib/queries/inbox";
 
 type View = "unprocessed" | "all";
@@ -36,6 +37,7 @@ export function InboxContent() {
   const [counts, setCounts] = useState<InboxCounts>({ unprocessed: 0, all: 0 });
   const [loading, setLoading] = useState(true);
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
+  const [rejecting, setRejecting] = useState(false);
 
   useEffect(() => {
     setLocalSender(filters.sender || "");
@@ -118,6 +120,37 @@ export function InboxContent() {
     });
   };
 
+  const refreshData = async () => {
+    const [emailsResult, countsResult] = await Promise.all([
+      fetchInboxEmails({
+        view: view as View,
+        sender: sender || undefined,
+        dateFrom: dateFrom || undefined,
+        dateTo: dateTo || undefined,
+      }),
+      fetchInboxCounts(),
+    ]);
+    if (emailsResult.ok) setEmails(emailsResult.data);
+    if (countsResult.ok) setCounts(countsResult.data);
+  };
+
+  const handleReject = async () => {
+    if (selectedIds.size === 0) return;
+    setRejecting(true);
+    try {
+      const result = await rejectEmails(Array.from(selectedIds));
+      if (result.ok) {
+        toast.success(`Rejected ${result.data.count} emails`);
+        setSelectedIds(new Set());
+        await refreshData();
+      } else {
+        toast.error(result.error.message);
+      }
+    } finally {
+      setRejecting(false);
+    }
+  };
+
   const formatDate = (dateStr: string) => {
     return new Date(dateStr).toLocaleDateString();
   };
@@ -155,6 +188,15 @@ export function InboxContent() {
                 <span className="text-sm text-muted-foreground">
                   {selectedIds.size} selected
                 </span>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  className="h-7 text-xs text-red-600 border-red-200 hover:bg-red-50 dark:text-red-400 dark:border-red-800 dark:hover:bg-red-950/50"
+                  onClick={handleReject}
+                  disabled={rejecting}
+                >
+                  {rejecting ? "Rejecting..." : "Reject"}
+                </Button>
                 <Button
                   variant="ghost"
                   size="sm"

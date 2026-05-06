@@ -1,6 +1,7 @@
 "use server";
 
 import { getInboxEmails, getInboxCounts, type InboxFilters, type InboxEmailRow, type InboxCounts } from "../queries/inbox";
+import { bulkDismissEmails } from "../queries/dashboard";
 
 type Result<T> = { ok: true; data: T } | { ok: false; error: { message: string } };
 
@@ -23,5 +24,17 @@ export async function fetchInboxCounts(): Promise<Result<InboxCounts>> {
   } catch (err) {
     console.error("Failed to fetch inbox counts:", err);
     return { ok: false, error: { message: "Failed to fetch counts" } };
+  }
+}
+
+export async function rejectEmails(
+  msgIds: string[]
+): Promise<Result<{ count: number }>> {
+  try {
+    const count = bulkDismissEmails(msgIds, "rejected");
+    return { ok: true, data: { count } };
+  } catch (err) {
+    console.error("Failed to reject emails:", err);
+    return { ok: false, error: { message: "Failed to reject emails" } };
   }
 }
