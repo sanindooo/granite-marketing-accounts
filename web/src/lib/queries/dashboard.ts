@@ -297,7 +297,7 @@ export function blockDomain(domain: string): void {
 
 export function bulkDismissEmails(
   msgIds: string[],
-  reason: "not_invoice" | "resolved"
+  reason: "not_invoice" | "resolved" | "rejected"
 ): number {
   if (msgIds.length === 0) return 0;
 

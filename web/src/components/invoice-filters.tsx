@@ -75,138 +75,162 @@ export function InvoiceFilters({ vendors, categories }: InvoiceFiltersProps) {
 
   return (
     <div className="space-y-4">
-      <div className="flex flex-wrap items-center gap-3">
-        <Select
-          value={filters.fy}
-          onValueChange={(value) => setFilters({ fy: value })}
-        >
-          <SelectTrigger className="w-36">
-            <SelectValue placeholder="Fiscal Year">
-              {filters.fy === "all" ? "All Years" : filters.fy}
-            </SelectValue>
-          </SelectTrigger>
-          <SelectContent>
-            {fys.map((fy) => (
-              <SelectItem key={fy} value={fy}>
-                {fy === "all" ? "All Years" : fy}
-              </SelectItem>
-            ))}
-          </SelectContent>
-        </Select>
+      <div className="flex flex-wrap items-center gap-4">
+        <div className="flex flex-col gap-1">
+          <label className="text-xs font-medium text-muted-foreground">Fiscal Year</label>
+          <Select
+            value={filters.fy}
+            onValueChange={(value) => setFilters({ fy: value })}
+          >
+            <SelectTrigger className="w-36">
+              <SelectValue placeholder="Fiscal Year">
+                {filters.fy === "all" ? "All Years" : filters.fy}
+              </SelectValue>
+            </SelectTrigger>
+            <SelectContent>
+              {fys.map((fy) => (
+                <SelectItem key={fy} value={fy}>
+                  {fy === "all" ? "All Years" : fy}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        </div>
 
-        <Select
-          value={filters.vendor || "all"}
-          onValueChange={(value) =>
-            setFilters({ vendor: value === "all" ? null : value })
-          }
-        >
-          <SelectTrigger className="w-44">
-            <SelectValue placeholder="All vendors" />
-          </SelectTrigger>
-          <SelectContent>
-            <SelectItem value="all">All vendors</SelectItem>
-            {vendors.map((v) => (
-              <SelectItem key={v.vendor_id} value={v.vendor_id}>
-                {v.canonical_name}
-              </SelectItem>
-            ))}
-          </SelectContent>
-        </Select>
+        <div className="flex flex-col gap-1">
+          <label className="text-xs font-medium text-muted-foreground">Vendor</label>
+          <Select
+            value={filters.vendor || "all"}
+            onValueChange={(value) =>
+              setFilters({ vendor: value === "all" ? null : value })
+            }
+          >
+            <SelectTrigger className="w-44">
+              <SelectValue placeholder="All vendors" />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="all">All vendors</SelectItem>
+              {vendors.map((v) => (
+                <SelectItem key={v.vendor_id} value={v.vendor_id}>
+                  {v.canonical_name}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        </div>
 
-        <Select
-          value={filters.category || "all"}
-          onValueChange={(value) =>
-            setFilters({ category: value === "all" ? null : value })
-          }
-        >
-          <SelectTrigger className="w-36">
-            <SelectValue placeholder="All categories" />
-          </SelectTrigger>
-          <SelectContent>
-            <SelectItem value="all">All categories</SelectItem>
-            {categories.map((cat) => (
-              <SelectItem key={cat} value={cat}>
-                <span className="capitalize">{cat}</span>
-              </SelectItem>
-            ))}
-          </SelectContent>
-        </Select>
+        <div className="flex flex-col gap-1">
+          <label className="text-xs font-medium text-muted-foreground">Category</label>
+          <Select
+            value={filters.category || "all"}
+            onValueChange={(value) =>
+              setFilters({ category: value === "all" ? null : value })
+            }
+          >
+            <SelectTrigger className="w-36">
+              <SelectValue placeholder="All categories" />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="all">All categories</SelectItem>
+              {categories.map((cat) => (
+                <SelectItem key={cat} value={cat}>
+                  <span className="capitalize">{cat}</span>
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        </div>
 
-        <Select
-          value={filters.status}
-          onValueChange={(value) => setFilters({ status: value })}
-        >
-          <SelectTrigger className="w-36">
-            <SelectValue placeholder="Status" />
-          </SelectTrigger>
-          <SelectContent>
-            <SelectItem value="all">All statuses</SelectItem>
-            <SelectItem value="matched">Matched</SelectItem>
-            <SelectItem value="unmatched">Unmatched</SelectItem>
-            <SelectItem value="pending">Pending</SelectItem>
-          </SelectContent>
-        </Select>
+        <div className="flex flex-col gap-1">
+          <label className="text-xs font-medium text-muted-foreground">Status</label>
+          <Select
+            value={filters.status}
+            onValueChange={(value) => setFilters({ status: value })}
+          >
+            <SelectTrigger className="w-36">
+              <SelectValue placeholder="Status" />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="all">All statuses</SelectItem>
+              <SelectItem value="matched">Matched</SelectItem>
+              <SelectItem value="unmatched">Unmatched</SelectItem>
+              <SelectItem value="pending">Pending</SelectItem>
+            </SelectContent>
+          </Select>
+        </div>
 
-        <Select
-          value={filters.exported || "all"}
-          onValueChange={(value) =>
-            setFilters({ exported: value === "all" ? null : value })
-          }
-        >
-          <SelectTrigger className="w-36">
-            <SelectValue placeholder="Export" />
-          </SelectTrigger>
-          <SelectContent>
-            <SelectItem value="all">All exports</SelectItem>
-            <SelectItem value="no">Not exported</SelectItem>
-            <SelectItem value="yes">Exported</SelectItem>
-          </SelectContent>
-        </Select>
+        <div className="flex flex-col gap-1">
+          <label className="text-xs font-medium text-muted-foreground">Exported</label>
+          <Select
+            value={filters.exported || "all"}
+            onValueChange={(value) =>
+              setFilters({ exported: value === "all" ? null : value })
+            }
+          >
+            <SelectTrigger className="w-36">
+              <SelectValue placeholder="Export" />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="all">All</SelectItem>
+              <SelectItem value="no">Not exported</SelectItem>
+              <SelectItem value="yes">Exported</SelectItem>
+            </SelectContent>
+          </Select>
+        </div>
 
-        <Input
-          type="date"
-          value={filters.dateFrom || ""}
-          onChange={(e) =>
-            setFilters({ dateFrom: e.target.value || null })
-          }
-          className="w-36"
-          placeholder="From"
-        />
+        <div className="flex flex-col gap-1">
+          <label className="text-xs font-medium text-muted-foreground">From Date</label>
+          <Input
+            type="date"
+            value={filters.dateFrom || ""}
+            onChange={(e) =>
+              setFilters({ dateFrom: e.target.value || null })
+            }
+            className="w-36"
+          />
+        </div>
 
-        <Input
-          type="date"
-          value={filters.dateTo || ""}
-          onChange={(e) => setFilters({ dateTo: e.target.value || null })}
-          className="w-36"
-          placeholder="To"
-        />
+        <div className="flex flex-col gap-1">
+          <label className="text-xs font-medium text-muted-foreground">To Date</label>
+          <Input
+            type="date"
+            value={filters.dateTo || ""}
+            onChange={(e) => setFilters({ dateTo: e.target.value || null })}
+            className="w-36"
+          />
+        </div>
       </div>
 
       <div className="flex items-center gap-3">
-        <Input
-          type="search"
-          value={localSearch}
-          onChange={(e) => {
-            setLocalSearch(e.target.value);
-            debouncedSetSearch(e.target.value);
-          }}
-          placeholder="Search vendor or invoice #..."
-          className="max-w-xs"
-        />
+        <div className="flex flex-col gap-1">
+          <label className="text-xs font-medium text-muted-foreground">Search</label>
+          <Input
+            type="search"
+            value={localSearch}
+            onChange={(e) => {
+              setLocalSearch(e.target.value);
+              debouncedSetSearch(e.target.value);
+            }}
+            placeholder="Vendor or invoice #..."
+            className="w-64"
+          />
+        </div>
 
-        <Button
-          variant={filters.exceptions ? "default" : "outline"}
-          size="sm"
-          onClick={() => setFilters({ exceptions: !filters.exceptions })}
-        >
-          Exceptions only
-        </Button>
-
-        {hasActiveFilters && (
-          <Button variant="ghost" size="sm" onClick={clearFilters}>
-            Clear filters
+        <div className="flex items-end gap-3 pb-0.5">
+          <Button
+            variant={filters.exceptions ? "default" : "outline"}
+            size="sm"
+            onClick={() => setFilters({ exceptions: !filters.exceptions })}
+          >
+            Exceptions only
           </Button>
-        )}
+
+          {hasActiveFilters && (
+            <Button variant="ghost" size="sm" onClick={clearFilters}>
+              Clear filters
+            </Button>
+          )}
+        </div>
       </div>
     </div>
   );

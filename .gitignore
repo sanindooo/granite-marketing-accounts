@@ -38,3 +38,6 @@ todos/
 .claude/
 .gemini/
 .agents/
+
+# Bank statements (sensitive)
+statements/

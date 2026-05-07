@@ -189,16 +189,16 @@ export function NeedsAttentionCard({
   const hasSelection = selectedIds.size > 0;
 
   return (
-    <Card className="border-amber-200 bg-amber-50/50">
+    <Card className="border-amber-200 bg-amber-50/50 dark:border-amber-900/50 dark:bg-amber-950/30">
       <CardHeader
         className="cursor-pointer select-none"
         onClick={() => setIsCollapsed(!isCollapsed)}
       >
         <div className="flex items-center justify-between">
-          <CardTitle className="flex items-center gap-2 text-amber-800">
-            <span className="inline-flex h-2 w-2 rounded-full bg-amber-500" />
+          <CardTitle className="flex items-center gap-2 text-amber-800 dark:text-amber-200">
+            <span className="inline-flex h-2 w-2 rounded-full bg-amber-500 dark:bg-amber-400" />
             Needs Attention ({pendingActions.length})
-            <span className="ml-1 text-sm font-normal text-amber-600">
+            <span className="ml-1 text-sm font-normal text-amber-600 dark:text-amber-400">
               {isCollapsed ? "▸" : "▾"}
             </span>
           </CardTitle>
@@ -261,7 +261,7 @@ export function NeedsAttentionCard({
           <div className="mb-3 flex flex-wrap items-center gap-2">
             {needsReauth && onReauthGoogle && (
               <div
-                className="flex flex-1 items-center justify-between gap-3 rounded-md border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-800"
+                className="flex flex-1 items-center justify-between gap-3 rounded-md border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-800 dark:border-red-900/50 dark:bg-red-950/30 dark:text-red-200"
                 role="alert"
               >
                 <span>
@@ -271,7 +271,7 @@ export function NeedsAttentionCard({
                 <Button
                   variant="outline"
                   size="sm"
-                  className="h-7 border-red-300 bg-white text-xs text-red-700 hover:bg-red-100"
+                  className="h-7 border-red-300 bg-background text-xs text-red-700 hover:bg-red-100 dark:border-red-800 dark:text-red-300 dark:hover:bg-red-900/50"
                   disabled={reauthing}
                   onClick={async (e) => {
                     e.stopPropagation();
@@ -329,7 +329,7 @@ export function NeedsAttentionCard({
           <TableBody>
             {pendingActions.map((action) => (
               <Fragment key={action.msgId}>
-                <TableRow className="cursor-pointer hover:bg-amber-100/50">
+                <TableRow className="cursor-pointer hover:bg-amber-100/50 dark:hover:bg-amber-900/30">
                   <TableCell className="w-8">
                     <Checkbox
                       checked={selectedIds.has(action.msgId)}
@@ -364,10 +364,10 @@ export function NeedsAttentionCard({
                       title={action.errorCode || undefined}
                       className={`inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium ${
                         action.outcome === "needs_manual_download"
-                          ? "bg-amber-100 text-amber-800"
+                          ? "bg-amber-100 text-amber-800 dark:bg-amber-900/50 dark:text-amber-200"
                           : action.outcome === "no_attachment"
-                          ? "bg-blue-100 text-blue-800"
-                          : "bg-red-100 text-red-800"
+                          ? "bg-blue-100 text-blue-800 dark:bg-blue-900/50 dark:text-blue-200"
+                          : "bg-red-100 text-red-800 dark:bg-red-900/50 dark:text-red-200"
                       }`}
                     >
                       {action.outcome === "needs_manual_download"
@@ -384,7 +384,7 @@ export function NeedsAttentionCard({
                           href={action.manualDownloadUrl}
                           target="_blank"
                           rel="noopener noreferrer"
-                          className="rounded border border-blue-200 bg-blue-50 px-2 py-1 text-xs text-blue-700 hover:bg-blue-100"
+                          className="rounded border border-blue-200 bg-blue-50 px-2 py-1 text-xs text-blue-700 hover:bg-blue-100 dark:border-blue-800 dark:bg-blue-900/50 dark:text-blue-200 dark:hover:bg-blue-900"
                           title={`Open invoice URL: ${action.manualDownloadUrl}`}
                         >
                           Open at {extractHost(action.manualDownloadUrl)}
@@ -413,7 +413,7 @@ export function NeedsAttentionCard({
                         {uploadingId === action.msgId ? "Uploading..." : "Upload PDF"}
                       </Button>
                       {confirmingDismiss === action.msgId ? (
-                        <div className="flex items-center gap-0.5 rounded border bg-white px-1.5 py-0.5 shadow-sm">
+                        <div className="flex items-center gap-0.5 rounded border bg-background px-1.5 py-0.5 shadow-sm">
                           <span className="text-xs text-muted-foreground">Block?</span>
                           <Button
                             variant="ghost"
@@ -463,7 +463,7 @@ export function NeedsAttentionCard({
                 </TableRow>
                 {expandedId === action.msgId && (
                   <TableRow>
-                    <TableCell colSpan={7} className="bg-white p-4">
+                    <TableCell colSpan={7} className="bg-background p-4">
                       {action.errorMessage && (
                         <div className="mb-3 rounded border border-red-200 bg-red-50 p-3 text-sm">
                           <div className="mb-1 font-medium text-red-800">
@@ -482,7 +482,7 @@ export function NeedsAttentionCard({
                       {loadingBody ? (
                         <div className="text-sm text-muted-foreground">Loading email content...</div>
                       ) : emailBody ? (
-                        <div className="max-h-96 overflow-auto rounded border bg-gray-50 p-4">
+                        <div className="max-h-96 overflow-auto rounded border bg-muted/50 p-4">
                           {sanitizedBodyHtml ? (
                             <div
                               className="prose prose-sm max-w-none"

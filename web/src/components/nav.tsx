@@ -4,6 +4,7 @@ import { Suspense } from "react";
 import Link from "next/link";
 import { usePathname, useSearchParams } from "next/navigation";
 import { cn } from "@/lib/utils";
+import { ThemeToggle } from "@/components/theme-toggle";
 
 function NavLinks() {
   const pathname = usePathname();
@@ -13,6 +14,7 @@ function NavLinks() {
   // Build links that preserve the FY param when navigating
   const links = [
     { href: `/dashboard${fy ? `?fy=${fy}` : ""}`, label: "Dashboard", match: "/dashboard" },
+    { href: "/inbox", label: "Inbox", match: "/inbox" },
     { href: `/invoices${fy ? `?fy=${fy}` : ""}`, label: "Invoices", match: "/invoices" },
   ];
 
@@ -49,6 +51,7 @@ export function Nav() {
               <NavLinks />
             </Suspense>
           </div>
+          <ThemeToggle />
         </div>
       </div>
     </nav>
