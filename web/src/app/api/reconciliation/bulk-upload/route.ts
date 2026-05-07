@@ -1,16 +1,15 @@
 import { spawn } from "child_process";
-import { createInterface } from "readline";
-import { writeFile, mkdir, unlink } from "fs/promises";
+import { writeFile, mkdir } from "fs/promises";
 import { join } from "path";
 import { randomUUID } from "crypto";
-import { getGraniteBinary, getProjectRoot } from "@/lib/spawn-granite";
+import Database from "better-sqlite3";
+import { getProjectRoot } from "@/lib/spawn-granite";
 
 export const runtime = "nodejs";
 
 const MAX_FILE_SIZE = 10 * 1024 * 1024; // 10MB per file
 const MAX_TOTAL_SIZE = 200 * 1024 * 1024; // 200MB total
 const MAX_FILES = 100;
-const SUBPROCESS_TIMEOUT_MS = 900_000; // 15 minutes for bulk
 
 export async function POST(request: Request) {
   const formData = await request.formData();
@@ -78,120 +77,83 @@ export async function POST(request: Request) {
   }
 
   const projectRoot = getProjectRoot();
-  const granitePath = getGraniteBinary();
 
+  // Write files to temp directory
   const tmpDir = join(projectRoot, ".tmp", "bulk-uploads");
   await mkdir(tmpDir, { recursive: true });
 
   const tmpPaths: string[] = [];
+  const fileNames: string[] = [];
 
   for (const file of files) {
     const tmpPath = join(tmpDir, `${randomUUID()}.pdf`);
     const bytes = await file.arrayBuffer();
     await writeFile(tmpPath, Buffer.from(bytes));
     tmpPaths.push(tmpPath);
+    fileNames.push(file.name);
   }
 
-  const args = ["reconcile", "bulk-upload", ...tmpPaths];
+  // Create job record
+  const jobId = `job_${randomUUID().slice(0, 8)}`;
+  const now = new Date().toISOString();
+
+  const db = new Database(join(projectRoot, "granite.db"));
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS jobs (
+        job_id TEXT PRIMARY KEY,
+        job_type TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'pending',
+        progress_current INTEGER DEFAULT 0,
+        progress_total INTEGER DEFAULT 0,
+        progress_message TEXT,
+        result_json TEXT,
+        error_message TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      )
+    `);
+
+    db.prepare(`
+      INSERT INTO jobs (job_id, job_type, status, progress_total, progress_message, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+    `).run(jobId, "bulk_upload", "pending", files.length, "Queued...", now, now);
+  } finally {
+    db.close();
+  }
+
+  // Spawn background worker (detached)
+  const pythonPath = join(projectRoot, ".venv", "bin", "python");
+  const workerArgs = [
+    "-m",
+    "execution.jobs.bulk_upload_worker",
+    jobId,
+    ...tmpPaths,
+  ];
 
   if (fiscalYear) {
-    args.push("--fy", fiscalYear);
+    workerArgs.push("--fy", fiscalYear);
   }
 
-  const encoder = new TextEncoder();
-
-  const stream = new ReadableStream({
-    start(controller) {
-      const proc = spawn(granitePath, args, {
-        cwd: projectRoot,
-        shell: false,
-        env: { ...process.env },
-      });
-
-      let stdout = "";
-      let timedOut = false;
-
-      const timeout = setTimeout(() => {
-        timedOut = true;
-        proc.kill("SIGTERM");
-      }, SUBPROCESS_TIMEOUT_MS);
-
-      const rl = createInterface({ input: proc.stderr });
-      rl.on("line", (line) => {
-        try {
-          const event = JSON.parse(line);
-          if (event.event === "progress") {
-            const sseData = `data: ${JSON.stringify(event)}\n\n`;
-            controller.enqueue(encoder.encode(sseData));
-          }
-        } catch {
-          // Non-JSON stderr line, ignore
-        }
-      });
-
-      proc.stdout.on("data", (data) => {
-        stdout += data.toString();
-      });
-
-      proc.on("error", (err) => {
-        clearTimeout(timeout);
-        const errorEvent = `data: ${JSON.stringify({
-          event: "error",
-          message: err.message,
-        })}\n\n`;
-        controller.enqueue(encoder.encode(errorEvent));
-        controller.close();
-
-        for (const p of tmpPaths) {
-          unlink(p).catch(() => {});
-        }
-      });
-
-      proc.on("close", (code) => {
-        clearTimeout(timeout);
-        let finalEvent;
-        if (timedOut) {
-          finalEvent = { event: "error", message: "Processing timed out" };
-        } else if (code === 0) {
-          try {
-            const parsed = JSON.parse(stdout);
-            finalEvent = { event: "complete", result: parsed };
-          } catch {
-            finalEvent = { event: "complete", result: { status: "success" } };
-          }
-        } else {
-          try {
-            const parsed = JSON.parse(stdout);
-            finalEvent = { event: "error", ...parsed };
-          } catch {
-            finalEvent = { event: "error", message: stdout || "Command failed" };
-          }
-        }
-
-        controller.enqueue(encoder.encode(`data: ${JSON.stringify(finalEvent)}\n\n`));
-        controller.close();
-
-        for (const p of tmpPaths) {
-          unlink(p).catch(() => {});
-        }
-      });
-
-      request.signal.addEventListener("abort", () => {
-        clearTimeout(timeout);
-        proc.kill("SIGTERM");
-        rl.close();
-        for (const p of tmpPaths) {
-          unlink(p).catch(() => {});
-        }
-      });
-    },
+  const worker = spawn(pythonPath, workerArgs, {
+    cwd: projectRoot,
+    detached: true,
+    stdio: "ignore",
+    env: { ...process.env },
   });
 
-  return new Response(stream, {
-    headers: {
-      "Content-Type": "text/event-stream",
-      "Cache-Control": "no-cache",
-      Connection: "keep-alive",
-    },
-  });
+  worker.unref();
+
+  return new Response(
+    JSON.stringify({
+      status: "accepted",
+      jobId,
+      fileCount: files.length,
+      fileNames,
+    }),
+    {
+      status: 202,
+      headers: { "Content-Type": "application/json" },
+    }
+  );
 }

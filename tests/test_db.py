@@ -82,7 +82,7 @@ class TestMigrations:
     def test_current_version_records_latest(self) -> None:
         conn = _fresh_conn()
         db_mod.apply_migrations(conn)
-        assert db_mod.current_version(conn) == "014_add_transaction_manual_download"
+        assert db_mod.current_version(conn) == "015_create_jobs_table"
 
     def test_new_columns_queryable(self) -> None:
         """Pin column shape for migrations 009/010/012/013.
