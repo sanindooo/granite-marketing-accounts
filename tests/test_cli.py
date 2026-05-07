@@ -35,7 +35,7 @@ def test_db_status_after_migrate(tmp_path) -> None:
     assert result.exit_code == 0
     doc = json.loads(result.stdout.strip().splitlines()[-1])
     assert doc["status"] == "success"
-    assert doc["schema_version"] == "013_add_vendor_search_index"
+    assert doc["schema_version"] == "015_create_jobs_table"
     assert doc["pragmas"]["foreign_keys"] == 1
 
 

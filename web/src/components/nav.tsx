@@ -15,6 +15,7 @@ function NavLinks() {
   const links = [
     { href: `/dashboard${fy ? `?fy=${fy}` : ""}`, label: "Dashboard", match: "/dashboard" },
     { href: "/inbox", label: "Inbox", match: "/inbox" },
+    { href: `/reconciliation${fy ? `?fy=${fy}` : ""}`, label: "Reconciliation", match: "/reconciliation" },
     { href: `/invoices${fy ? `?fy=${fy}` : ""}`, label: "Invoices", match: "/invoices" },
   ];
 

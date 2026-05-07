@@ -58,6 +58,8 @@ EXPECTED_HASHES: dict[str, str] = {
     "011_add_email_manual_download_url": "36cf2cfa4d3fd4404b8ad945d726420e9fffd00c10a87a7544ff32688fb6d902",
     "012_rename_email_manual_download_url": "148250982e59719bb9e1ffdb85cbaa19fc96162bb478aaaad311d21df1f4f017",
     "013_add_vendor_search_index": "62b9ff82f1ae6b78ad9d16e20568653d4c62d05fc8ebaeb5be5a74bd529a3ea0",
+    "014_add_transaction_manual_download": "0e423e70fc4aea6db451922d3e0aa6e3b2a95695a59e6c4fdb58f032edf8fb41",
+    "015_create_jobs_table": "54da8532edfd3b29ff6bb25c1971b7f01b620859f9dc6bcd7866a405be5b44ba",
 }
 
 

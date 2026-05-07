@@ -1878,6 +1878,521 @@ def reconcile_run(
 
 
 # ---------------------------------------------------------------------------
+# Bank-centric reconciliation commands
+# ---------------------------------------------------------------------------
+
+
+@reconcile_app.command("upload")
+def reconcile_upload(
+    file_path: Annotated[Path, typer.Argument(help="Path to statement file (CSV or PDF).")],
+    account: Annotated[
+        str,
+        typer.Option("--account", help="Account type: amex, wise, tide, monzo."),
+    ],
+    fiscal_year: Annotated[
+        str | None,
+        typer.Option("--fy", help="Fiscal year filter for matching (e.g. FY-2025-26)."),
+    ] = None,
+    db_path: Annotated[Path | None, typer.Option("--db")] = None,
+) -> None:
+    """Upload bank statement, store transactions, and run matching.
+
+    Parses the statement file (CSV or PDF), stores transactions with
+    deduplication, and runs the transaction-first matcher to find
+    invoice and email matches.
+
+    Example:
+        granite reconcile upload statement.csv --account amex
+        granite reconcile upload statement.pdf --account wise --fy FY-2025-26
+    """
+    try:
+        from execution.reconcile.match import TransactionCandidate
+        from execution.reconcile.transaction_matcher import match_all_transactions
+        from execution.statement.parser import Account, parse_statement
+        from execution.statement.store import store_transactions
+
+        # Validate account
+        valid_accounts = {"amex", "wise", "tide", "monzo"}
+        if account not in valid_accounts:
+            raise ConfigError(
+                f"Unknown account '{account}'. Valid: {', '.join(sorted(valid_accounts))}",
+                source="cli",
+            )
+
+        # Validate file exists
+        if not file_path.exists():
+            raise ConfigError(f"File not found: {file_path}", source="cli")
+
+        conn = db_mod.connect(db_path)
+        db_mod.apply_migrations(conn)
+        run_id = _begin_run(conn, kind="statement", operation="reconcile_upload")
+
+        emit_progress("upload", 0, 3, f"Parsing {file_path.name}")
+
+        # Parse statement (account already validated above)
+        account_typed: Account = account  # type: ignore[assignment]
+        parse_result = parse_statement(file_path, account_typed)
+
+        emit_progress("upload", 1, 3, f"Storing {len(parse_result.transactions)} transactions")
+
+        # Store transactions
+        store_result = store_transactions(
+            conn, parse_result.transactions, account, source="cli_upload"
+        )
+
+        emit_progress("upload", 2, 3, "Running transaction matcher")
+
+        # Build transaction candidates for matching
+        txn_candidates = []
+        from execution.statement.store import canonicalize_description, compute_txn_id
+
+        for idx, txn in enumerate(parse_result.transactions):
+            canonical_desc = canonicalize_description(txn.description)
+            txn_id = compute_txn_id(
+                account=account,
+                booking_date=txn.date,
+                canonical_description=canonical_desc,
+                amount=abs(txn.amount),
+                row_ordinal=idx,
+            )
+            txn_candidates.append(
+                TransactionCandidate(
+                    txn_id=txn_id,
+                    description_canonical=canonical_desc,
+                    booking_date=txn.date,
+                    currency=txn.currency,
+                    amount=abs(txn.amount),
+                    amount_gbp=abs(txn.amount),  # Simplified - real impl uses FX
+                )
+            )
+
+        # Run matching on stored transactions
+        match_results = match_all_transactions(
+            conn,
+            txn_candidates,
+            fiscal_year=fiscal_year,
+        )
+
+        matched_count = sum(1 for r in match_results if r.invoice_id)
+        email_match_count = sum(1 for r in match_results if r.email_msg_id)
+
+        emit_progress("upload", 3, 3, "Complete")
+
+        _complete_run(
+            conn,
+            run_id=run_id,
+            status="ok",
+            stats={
+                "total": store_result.total_count,
+                "new": store_result.new_count,
+                "duplicates": store_result.duplicate_count,
+                "matched": matched_count,
+                "email_matches": email_match_count,
+            },
+        )
+
+        emit_success({
+            "run_id": run_id,
+            "account": account,
+            "file": str(file_path),
+            "transactions": {
+                "total": store_result.total_count,
+                "new": store_result.new_count,
+                "duplicates": store_result.duplicate_count,
+            },
+            "matching": {
+                "invoice_matches": matched_count,
+                "email_matches": email_match_count,
+            },
+            "fx_errors": store_result.fx_errors,
+        })
+    except PipelineError as err:
+        emit_error(err)
+    except Exception as err:
+        emit_error(err)
+
+
+@reconcile_app.command("list-transactions")
+def reconcile_list_transactions(
+    fiscal_year: Annotated[
+        str | None,
+        typer.Option("--fy", help="Fiscal year filter (e.g. FY-2025-26)."),
+    ] = None,
+    state: Annotated[
+        str | None,
+        typer.Option("--state", help="Filter by state: unmatched, matched, flagged."),
+    ] = None,
+    account: Annotated[
+        str | None,
+        typer.Option("--account", help="Filter by account: amex, wise, tide, monzo."),
+    ] = None,
+    limit: Annotated[
+        int,
+        typer.Option("--limit", help="Maximum transactions to return."),
+    ] = 100,
+    db_path: Annotated[Path | None, typer.Option("--db")] = None,
+) -> None:
+    """List transactions with their reconciliation status.
+
+    Example:
+        granite reconcile list-transactions --fy FY-2025-26
+        granite reconcile list-transactions --state flagged --account amex
+    """
+    try:
+        conn = db_mod.connect(db_path)
+        db_mod.apply_migrations(conn)
+
+        from execution.shared.fiscal import fy_bounds
+
+        params: list[str | int] = []
+        where_clauses = ["t.deleted_at IS NULL", "t.status = 'settled'"]
+
+        if fiscal_year:
+            start, end = fy_bounds(fiscal_year)
+            where_clauses.append("DATE(t.booking_date) >= ? AND DATE(t.booking_date) <= ?")
+            params.extend([start.isoformat(), end.isoformat()])
+
+        if account:
+            where_clauses.append("t.account = ?")
+            params.append(account)
+
+        if state == "flagged":
+            where_clauses.append("t.needs_manual_download = 1")
+        elif state == "unmatched":
+            where_clauses.append("""
+                NOT EXISTS (
+                    SELECT 1 FROM reconciliation_rows r
+                    WHERE r.txn_id = t.txn_id AND r.state NOT IN ('unmatched', 'suggested')
+                )
+            """)
+        elif state == "matched":
+            where_clauses.append("""
+                EXISTS (
+                    SELECT 1 FROM reconciliation_rows r
+                    WHERE r.txn_id = t.txn_id AND r.state IN ('auto_matched', 'user_verified')
+                )
+            """)
+
+        where_sql = " AND ".join(where_clauses)
+        query = f"""
+            SELECT
+                t.txn_id,
+                t.account,
+                t.booking_date,
+                t.description_raw,
+                t.description_canonical,
+                t.currency,
+                t.amount,
+                t.amount_gbp,
+                t.needs_manual_download,
+                r.state as recon_state,
+                r.invoice_id,
+                r.match_score
+            FROM transactions t
+            LEFT JOIN reconciliation_rows r ON r.txn_id = t.txn_id
+            WHERE {where_sql}
+            ORDER BY t.booking_date DESC
+            LIMIT ?
+        """  # noqa: S608
+        params.append(limit)
+
+        rows = conn.execute(query, params).fetchall()
+
+        transactions = []
+        for row in rows:
+            transactions.append({
+                "txn_id": row["txn_id"],
+                "account": row["account"],
+                "booking_date": row["booking_date"],
+                "description": row["description_raw"],
+                "currency": row["currency"],
+                "amount": row["amount"],
+                "amount_gbp": row["amount_gbp"],
+                "needs_manual_download": bool(row["needs_manual_download"]),
+                "recon_state": row["recon_state"],
+                "invoice_id": row["invoice_id"],
+                "match_score": row["match_score"],
+            })
+
+        emit_success({
+            "count": len(transactions),
+            "transactions": transactions,
+            "filters": {
+                "fiscal_year": fiscal_year,
+                "state": state,
+                "account": account,
+            },
+        })
+    except PipelineError as err:
+        emit_error(err)
+    except Exception as err:
+        emit_error(err)
+
+
+@reconcile_app.command("resolve")
+def reconcile_resolve(
+    txn_id: Annotated[str, typer.Argument(help="Transaction ID to resolve.")],
+    state: Annotated[
+        str,
+        typer.Option("--state", help="New state: personal, verified, ignore."),
+    ],
+    invoice_id: Annotated[
+        str | None,
+        typer.Option("--invoice-id", help="Invoice ID to link (for verified state)."),
+    ] = None,
+    note: Annotated[
+        str | None,
+        typer.Option("--note", help="User note explaining the resolution."),
+    ] = None,
+    db_path: Annotated[Path | None, typer.Option("--db")] = None,
+) -> None:
+    """Manually resolve a transaction's reconciliation state.
+
+    Example:
+        granite reconcile resolve TXN123 --state personal
+        granite reconcile resolve TXN123 --state personal --note "travel expense"
+        granite reconcile resolve TXN123 --state verified --invoice-id INV456
+    """
+    try:
+        from datetime import UTC, datetime
+
+        from execution.reconcile.state import (
+            RowState,
+            Trigger,
+            append_history,
+            compute_row_id,
+            transition,
+        )
+        from execution.shared.fiscal import fy_of
+
+        # Validate state
+        state_map = {
+            "personal": RowState.USER_PERSONAL,
+            "verified": RowState.USER_VERIFIED,
+            "ignore": RowState.USER_IGNORE,
+            "override": RowState.USER_OVERRIDDEN,
+        }
+        if state not in state_map:
+            raise ConfigError(
+                f"Unknown state '{state}'. Valid: {', '.join(state_map.keys())}",
+                source="cli",
+            )
+
+        target_state = state_map[state]
+
+        # verified requires invoice_id
+        if state == "verified" and not invoice_id:
+            raise ConfigError("--state verified requires --invoice-id", source="cli")
+
+        conn = db_mod.connect(db_path)
+        db_mod.apply_migrations(conn)
+
+        # Get transaction
+        txn = conn.execute(
+            "SELECT booking_date, amount FROM transactions WHERE txn_id = ? AND deleted_at IS NULL",
+            (txn_id,),
+        ).fetchone()
+
+        if not txn:
+            raise ConfigError(f"Transaction not found: {txn_id}", source="cli")
+
+        booking_date = date.fromisoformat(txn["booking_date"])
+        fiscal_year = fy_of(booking_date)
+
+        now = datetime.now(tz=UTC)
+
+        # Compute row_id
+        row_id = compute_row_id(
+            fiscal_year=fiscal_year,
+            invoice_id=invoice_id or "",
+            txn_id=txn_id,
+            link_kind="full",
+        )
+
+        # Get existing row if any
+        existing = conn.execute(
+            "SELECT state, override_history FROM reconciliation_rows WHERE row_id = ?",
+            (row_id,),
+        ).fetchone()
+
+        if existing:
+            current_state = RowState(existing["state"])
+            history = existing["override_history"] or ""
+        else:
+            current_state = RowState.NEW
+            history = ""
+
+        # Record transition
+        record = transition(
+            current=current_state,
+            proposed=target_state,
+            trigger=Trigger.USER,
+            at=now,
+            note=note or f"CLI resolve to {state}",
+        )
+        history = append_history(history, record)
+
+        with conn:
+            conn.execute(
+                """
+                INSERT INTO reconciliation_rows (
+                    row_id, invoice_id, txn_id, fiscal_year, state,
+                    match_score, match_reason, user_note, override_history, updated_at, last_run_id
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(row_id) DO UPDATE SET
+                    state = excluded.state,
+                    match_reason = excluded.match_reason,
+                    user_note = excluded.user_note,
+                    override_history = excluded.override_history,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    row_id,
+                    invoice_id,
+                    txn_id,
+                    fiscal_year,
+                    target_state.value,
+                    "1.00" if invoice_id else "0.00",
+                    "manual resolution via CLI",
+                    note or "",
+                    history,
+                    now.isoformat(),
+                    "cli-manual",
+                ),
+            )
+
+            # Clear needs_manual_download flag
+            conn.execute(
+                "UPDATE transactions SET needs_manual_download = 0 WHERE txn_id = ?",
+                (txn_id,),
+            )
+
+        emit_success({
+            "txn_id": txn_id,
+            "state": target_state.value,
+            "invoice_id": invoice_id,
+            "row_id": row_id,
+        })
+    except PipelineError as err:
+        emit_error(err)
+    except Exception as err:
+        emit_error(err)
+
+
+@reconcile_app.command("bulk-upload")
+def reconcile_bulk_upload(
+    files: Annotated[
+        list[Path],
+        typer.Argument(help="PDF files to upload."),
+    ],
+    fiscal_year: Annotated[
+        str | None,
+        typer.Option("--fy", help="Fiscal year filter for matching."),
+    ] = None,
+    model: Annotated[
+        str,
+        typer.Option("--model", help="LLM provider: claude or openai."),
+    ] = "openai",
+    db_path: Annotated[Path | None, typer.Option("--db")] = None,
+) -> None:
+    """Bulk upload invoice PDFs to match against flagged transactions.
+
+    Processes each PDF through the extraction pipeline, files to Drive,
+    and attempts to match against transactions flagged for manual download.
+
+    Example:
+        granite reconcile bulk-upload invoice1.pdf invoice2.pdf
+        granite reconcile bulk-upload *.pdf --fy FY-2025-26
+    """
+    try:
+        from execution.shared.budget import SharedBudget
+        from execution.shared.prompts import EXTRACTOR_WEIGHTS, load_prompt
+        from execution.shared.sheet import LazyGoogleClients
+        from execution.statement.bulk_upload import process_bulk_upload
+
+        if not files:
+            raise ConfigError("No files provided", source="cli")
+
+        # Validate files exist
+        for f in files:
+            if not f.exists():
+                raise ConfigError(f"File not found: {f}", source="cli")
+
+        conn = db_mod.connect(db_path)
+        db_mod.apply_migrations(conn)
+        run_id = _begin_run(conn, kind="bulk", operation="reconcile_bulk_upload")
+
+        # Setup LLM client
+        budget = SharedBudget(ceiling_gbp=Decimal("5.00"))
+        if model == "openai":
+            from execution.shared.openai_client import OpenAIClient
+            llm_client = OpenAIClient(budget=budget)
+            model_id = "gpt-4o-mini"
+        else:
+            from execution.shared.claude_client import HAIKU, ClaudeClient
+            llm_client = ClaudeClient(shared_budget=budget, ttl="5m")
+            model_id = HAIKU
+
+        extractor_prompt = load_prompt("extractor", model_id=model_id, weights=EXTRACTOR_WEIGHTS)
+        google = LazyGoogleClients(allow_interactive=False)
+
+        tmp_root = Path(".tmp")
+        tmp_root.mkdir(parents=True, exist_ok=True)
+
+        def progress_callback(current: int, total: int, message: str) -> None:
+            emit_progress("bulk-upload", current, total, message)
+
+        stats = process_bulk_upload(
+            conn,
+            files,
+            llm_client=llm_client,
+            google=google,
+            extractor_prompt=extractor_prompt,
+            tmp_root=tmp_root,
+            fiscal_year=fiscal_year,
+            on_progress=progress_callback,
+        )
+
+        _complete_run(
+            conn,
+            run_id=run_id,
+            status="ok",
+            stats={
+                "total": stats.total_files,
+                "filed": stats.filed,
+                "matched": stats.matched,
+                "errors": stats.errors,
+            },
+        )
+
+        emit_success({
+            "run_id": run_id,
+            "total_files": stats.total_files,
+            "processed": stats.processed,
+            "filed": stats.filed,
+            "matched": stats.matched,
+            "unmatched": stats.unmatched,
+            "duplicates": stats.duplicates,
+            "errors": stats.errors,
+            "results": [
+                {
+                    "file": r.file_path,
+                    "success": r.success,
+                    "invoice_id": r.invoice_id,
+                    "matched_txn_id": r.matched_txn_id,
+                    "error": r.error,
+                }
+                for r in stats.results
+            ],
+        })
+    except PipelineError as err:
+        emit_error(err)
+    except Exception as err:
+        emit_error(err)
+
+
+# ---------------------------------------------------------------------------
 # Orchestrator helpers
 # ---------------------------------------------------------------------------
 
