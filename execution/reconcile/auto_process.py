@@ -82,9 +82,13 @@ def auto_process_matched_email(
         return AutoProcessResult(success=False, error="no email match in result")
 
     if match_result.email_match_type != EmailMatchType.INLINE_INVOICE:
+        if match_result.email_match_type == EmailMatchType.NEEDS_EVALUATION:
+            error_msg = "email attachment type unknown - needs manual review"
+        else:
+            error_msg = f"email match type '{match_result.email_match_type}' requires manual download"
         return AutoProcessResult(
             success=False,
-            error=f"email match type '{match_result.email_match_type}' requires manual download",
+            error=error_msg,
         )
 
     msg_id = match_result.email_msg_id

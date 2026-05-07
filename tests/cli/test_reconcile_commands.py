@@ -72,6 +72,7 @@ class TestReconcileUpload:
                 state TEXT,
                 match_score TEXT,
                 match_reason TEXT,
+                user_note TEXT,
                 override_history TEXT,
                 updated_at TEXT,
                 last_run_id TEXT
@@ -197,6 +198,7 @@ class TestReconcileListTransactions:
                 state TEXT,
                 match_score TEXT,
                 match_reason TEXT,
+                user_note TEXT,
                 override_history TEXT,
                 updated_at TEXT,
                 last_run_id TEXT
@@ -286,6 +288,7 @@ class TestReconcileResolve:
                 state TEXT,
                 match_score TEXT,
                 match_reason TEXT,
+                user_note TEXT,
                 override_history TEXT,
                 updated_at TEXT,
                 last_run_id TEXT

@@ -42,6 +42,7 @@ class EmailMatchType:
 
     INLINE_INVOICE = "inline_invoice"
     THIRD_PARTY_LINK = "third_party_link"
+    NEEDS_EVALUATION = "needs_evaluation"
     NO_MATCH = "no_match"
 
 
@@ -173,6 +174,15 @@ def match_transaction(
                     email_msg_id=best_email.msg_id,
                     email_match_type=match_type,
                     reason="email match with inline invoice (needs processing)",
+                )
+            else:
+                # NEEDS_EVALUATION: email matched but attachment type unknown
+                return TransactionMatchResult(
+                    txn_id=txn.txn_id,
+                    state=MatchState.UNMATCHED,
+                    email_msg_id=best_email.msg_id,
+                    email_match_type=match_type,
+                    reason="email match (attachment type needs evaluation)",
                 )
 
     # No match found
@@ -398,20 +408,16 @@ def _extract_domain(email_addr: str) -> str | None:
 
 
 def _classify_email_attachment(email: EmailCandidate) -> str:
-    """Classify email as inline_invoice or third_party_link.
+    """Classify email based on available attachment information.
 
-    This is a placeholder - actual classification happens during
-    email processing when attachments are fetched.
-
-    For now, we assume all unprocessed emails need evaluation.
-    The auto-process step (U4) will determine the actual type.
+    Returns NEEDS_EVALUATION when attachment type is unknown,
+    allowing downstream code to handle the ambiguity explicitly.
     """
     if email.has_pdf_attachment:
         return EmailMatchType.INLINE_INVOICE
     if email.has_download_link:
         return EmailMatchType.THIRD_PARTY_LINK
-    # Default to inline - auto-processor will update if needed
-    return EmailMatchType.INLINE_INVOICE
+    return EmailMatchType.NEEDS_EVALUATION
 
 
 __all__ = [

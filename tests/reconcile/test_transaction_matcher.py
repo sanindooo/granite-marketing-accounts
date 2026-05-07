@@ -166,6 +166,17 @@ class TestClassifyEmailAttachment:
         )
         assert _classify_email_attachment(email) == EmailMatchType.THIRD_PARTY_LINK
 
+    def test_unknown_attachment_needs_evaluation(self) -> None:
+        """Unknown attachment type should return NEEDS_EVALUATION, not default to INLINE_INVOICE."""
+        email = EmailCandidate(
+            msg_id="e1",
+            from_addr="billing@example.com",
+            received_at=date(2025, 11, 15),
+            has_pdf_attachment=False,
+            has_download_link=False,
+        )
+        assert _classify_email_attachment(email) == EmailMatchType.NEEDS_EVALUATION
+
 
 class TestMatchTransaction:
     """Test full transaction matching."""

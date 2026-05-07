@@ -1893,10 +1893,6 @@ def reconcile_upload(
         str | None,
         typer.Option("--fy", help="Fiscal year filter for matching (e.g. FY-2025-26)."),
     ] = None,
-    mock: Annotated[
-        bool,
-        typer.Option("--mock", help="Use mock LLM responses (for testing)."),
-    ] = False,
     db_path: Annotated[Path | None, typer.Option("--db")] = None,
 ) -> None:
     """Upload bank statement, store transactions, and run matching.
@@ -1935,18 +1931,7 @@ def reconcile_upload(
 
         # Parse statement (account already validated above)
         account_typed: Account = account  # type: ignore[assignment]
-        if mock:
-            parse_result = parse_statement(file_path, account_typed, mock=True)
-        else:
-            from execution.shared.budget import SharedBudget
-            from execution.shared.claude_client import ClaudeClient
-
-            budget = SharedBudget(ceiling_gbp=Decimal("1.00"))
-            claude = ClaudeClient(shared_budget=budget)
-            parse_result = parse_statement(file_path, account_typed, claude_client=claude)
-
-        if parse_result.error:
-            raise ConfigError(f"Parse failed: {parse_result.error}", source="cli")
+        parse_result = parse_statement(file_path, account_typed)
 
         emit_progress("upload", 1, 3, f"Storing {len(parse_result.transactions)} transactions")
 
@@ -1959,13 +1944,21 @@ def reconcile_upload(
 
         # Build transaction candidates for matching
         txn_candidates = []
-        for txn in parse_result.transactions:
-            from execution.statement.store import canonicalize_description
+        from execution.statement.store import canonicalize_description, compute_txn_id
 
+        for idx, txn in enumerate(parse_result.transactions):
+            canonical_desc = canonicalize_description(txn.description)
+            txn_id = compute_txn_id(
+                account=account,
+                booking_date=txn.date,
+                canonical_description=canonical_desc,
+                amount=abs(txn.amount),
+                row_ordinal=idx,
+            )
             txn_candidates.append(
                 TransactionCandidate(
-                    txn_id="",  # Will be computed during match
-                    description_canonical=canonicalize_description(txn.description),
+                    txn_id=txn_id,
+                    description_canonical=canonical_desc,
                     booking_date=txn.date,
                     currency=txn.currency,
                     amount=abs(txn.amount),
@@ -2147,12 +2140,17 @@ def reconcile_resolve(
         str | None,
         typer.Option("--invoice-id", help="Invoice ID to link (for verified state)."),
     ] = None,
+    note: Annotated[
+        str | None,
+        typer.Option("--note", help="User note explaining the resolution."),
+    ] = None,
     db_path: Annotated[Path | None, typer.Option("--db")] = None,
 ) -> None:
     """Manually resolve a transaction's reconciliation state.
 
     Example:
         granite reconcile resolve TXN123 --state personal
+        granite reconcile resolve TXN123 --state personal --note "travel expense"
         granite reconcile resolve TXN123 --state verified --invoice-id INV456
     """
     try:
@@ -2230,7 +2228,7 @@ def reconcile_resolve(
             proposed=target_state,
             trigger=Trigger.USER,
             at=now,
-            note=f"CLI resolve to {state}",
+            note=note or f"CLI resolve to {state}",
         )
         history = append_history(history, record)
 
@@ -2239,12 +2237,13 @@ def reconcile_resolve(
                 """
                 INSERT INTO reconciliation_rows (
                     row_id, invoice_id, txn_id, fiscal_year, state,
-                    match_score, match_reason, override_history, updated_at
+                    match_score, match_reason, user_note, override_history, updated_at, last_run_id
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(row_id) DO UPDATE SET
                     state = excluded.state,
                     match_reason = excluded.match_reason,
+                    user_note = excluded.user_note,
                     override_history = excluded.override_history,
                     updated_at = excluded.updated_at
                 """,
@@ -2254,10 +2253,12 @@ def reconcile_resolve(
                     txn_id,
                     fiscal_year,
                     target_state.value,
-                    "1.00" if invoice_id else None,
+                    "1.00" if invoice_id else "0.00",
                     "manual resolution via CLI",
+                    note or "",
                     history,
                     now.isoformat(),
+                    "cli-manual",
                 ),
             )
 

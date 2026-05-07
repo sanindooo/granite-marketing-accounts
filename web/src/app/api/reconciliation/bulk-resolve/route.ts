@@ -73,21 +73,42 @@ export async function POST(request: Request) {
       args.push("--note", resolveNote);
     }
 
-    const exitCode = await new Promise<number>((resolve) => {
+    const result = await new Promise<{ code: number; stdout: string }>((resolve) => {
       const proc = spawn(granitePath, args, {
         cwd: projectRoot,
         shell: false,
         env: { ...process.env },
       });
 
-      proc.on("close", (code) => resolve(code ?? 1));
-      proc.on("error", () => resolve(1));
+      let stdout = "";
+      proc.stdout.on("data", (data) => {
+        stdout += data.toString();
+      });
+      proc.stderr.on("data", (data) => {
+        stdout += data.toString();
+      });
+
+      proc.on("close", (code) => resolve({ code: code ?? 1, stdout }));
+      proc.on("error", (err) => resolve({ code: 1, stdout: err.message }));
     });
 
-    if (exitCode === 0) {
+    if (result.code === 0) {
       resolved++;
     } else {
-      errors.push(txnId);
+      // Try to extract error message from CLI output
+      let errorMsg = txnId;
+      try {
+        const parsed = JSON.parse(result.stdout);
+        if (parsed.message) {
+          errorMsg = `${txnId}: ${parsed.message}`;
+        }
+      } catch {
+        // JSON parse failed, use raw output if available
+        if (result.stdout.trim()) {
+          errorMsg = `${txnId}: ${result.stdout.trim().slice(0, 100)}`;
+        }
+      }
+      errors.push(errorMsg);
     }
   }
 
