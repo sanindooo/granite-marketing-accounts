@@ -16,6 +16,7 @@ function NavLinks() {
     { href: `/dashboard${fy ? `?fy=${fy}` : ""}`, label: "Dashboard", match: "/dashboard" },
     { href: "/inbox", label: "Inbox", match: "/inbox" },
     { href: `/invoices${fy ? `?fy=${fy}` : ""}`, label: "Invoices", match: "/invoices" },
+    { href: `/reconciliation${fy ? `?fy=${fy}` : ""}`, label: "Reconciliation", match: "/reconciliation" },
   ];
 
   return (
