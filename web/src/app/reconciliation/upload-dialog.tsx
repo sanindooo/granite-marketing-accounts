@@ -11,13 +11,6 @@ import {
   DialogTitle,
   DialogTrigger,
 } from "@/components/ui/dialog";
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "@/components/ui/select";
 import { toast } from "sonner";
 import { apiFetch } from "@/lib/api-fetch";
 
@@ -163,18 +156,19 @@ export function UploadDialog({ accounts, onSuccess }: UploadDialogProps) {
         <div className="space-y-4 py-4">
           <div className="space-y-2">
             <label className="text-sm font-medium">Account</label>
-            <Select value={account} onValueChange={(value) => setAccount(value ?? "")} disabled={uploading}>
-              <SelectTrigger>
-                <SelectValue placeholder="Select account" />
-              </SelectTrigger>
-              <SelectContent>
-                {accounts.map((acc) => (
-                  <SelectItem key={acc} value={acc}>
-                    {acc.charAt(0).toUpperCase() + acc.slice(1)}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
+            <select
+              value={account}
+              onChange={(e) => setAccount(e.target.value)}
+              disabled={uploading}
+              className="flex h-9 w-full rounded-lg border border-input bg-transparent px-3 py-2 text-sm shadow-sm transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              <option value="">Select account</option>
+              {accounts.map((acc) => (
+                <option key={acc} value={acc}>
+                  {acc.charAt(0).toUpperCase() + acc.slice(1)}
+                </option>
+              ))}
+            </select>
           </div>
 
           <div className="space-y-2">
