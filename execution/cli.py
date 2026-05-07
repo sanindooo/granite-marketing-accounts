@@ -1933,17 +1933,17 @@ def reconcile_upload(
 
         emit_progress("upload", 0, 3, f"Parsing {file_path.name}")
 
-        # Parse statement
-        account_enum = Account(account)
+        # Parse statement (account already validated above)
+        account_typed: Account = account  # type: ignore[assignment]
         if mock:
-            parse_result = parse_statement(file_path, account_enum, mock=True)
+            parse_result = parse_statement(file_path, account_typed, mock=True)
         else:
             from execution.shared.budget import SharedBudget
             from execution.shared.claude_client import ClaudeClient
 
             budget = SharedBudget(ceiling_gbp=Decimal("1.00"))
             claude = ClaudeClient(shared_budget=budget)
-            parse_result = parse_statement(file_path, account_enum, claude_client=claude)
+            parse_result = parse_statement(file_path, account_typed, claude_client=claude)
 
         if parse_result.error:
             raise ConfigError(f"Parse failed: {parse_result.error}", source="cli")
