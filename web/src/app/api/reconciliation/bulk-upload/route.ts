@@ -8,9 +8,9 @@ import { getGraniteBinary, getProjectRoot } from "@/lib/spawn-granite";
 export const runtime = "nodejs";
 
 const MAX_FILE_SIZE = 10 * 1024 * 1024; // 10MB per file
-const MAX_TOTAL_SIZE = 50 * 1024 * 1024; // 50MB total
-const MAX_FILES = 20;
-const SUBPROCESS_TIMEOUT_MS = 300_000; // 5 minutes for bulk
+const MAX_TOTAL_SIZE = 200 * 1024 * 1024; // 200MB total
+const MAX_FILES = 100;
+const SUBPROCESS_TIMEOUT_MS = 900_000; // 15 minutes for bulk
 
 export async function POST(request: Request) {
   const formData = await request.formData();
