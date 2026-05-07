@@ -1,36 +1,27 @@
 """Bank statement parser — PDF/CSV → normalized transactions.
 
 Supports:
-- Amex (PDF): Text extraction + Claude haiku parsing
-- Wise (PDF): Text extraction + Claude haiku parsing (multi-currency)
-- Tide (PDF): Text extraction + Claude haiku parsing
-- Monzo (CSV): Direct parsing, no LLM
+- Amex (PDF): Text extraction with regex parsing
+- Wise (PDF): Text extraction with regex parsing (multi-currency)
+- Tide (PDF): Direct table extraction via pdfplumber
+- Monzo (CSV): Direct CSV parsing
 
-PDF extraction uses pdfplumber for text, then Claude haiku to parse
-the narrative format into structured JSON transactions. This approach
-handles bank-specific formatting variations without brittle table parsing.
-
-Cost: ~$0.02-0.10 per PDF statement depending on page count.
+All PDF parsing uses pdfplumber for deterministic extraction without LLM calls.
 """
 
 from __future__ import annotations
 
 import csv
-import hashlib
-import json
 import re
 from dataclasses import dataclass, field
 from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Final, Literal
+from typing import Any, Final, Literal
 
 import pdfplumber
 
 from execution.shared.errors import PipelineError
-
-if TYPE_CHECKING:
-    from execution.shared.claude_client import ClaudeClient
 
 Account = Literal["amex", "wise", "tide", "monzo"]
 SUPPORTED_ACCOUNTS: Final[tuple[Account, ...]] = ("amex", "wise", "tide", "monzo")
@@ -39,7 +30,6 @@ MAX_PDF_SIZE_BYTES: Final[int] = 20 * 1024 * 1024  # 20 MB
 MAX_PDF_PAGES: Final[int] = 50
 MAX_CSV_ROWS: Final[int] = 5000
 
-# Regex for cleaning text
 _WHITESPACE: Final[re.Pattern[str]] = re.compile(r"\s+")
 _CONTROL_CHARS: Final[re.Pattern[str]] = re.compile(r"[\x00-\x1f\x7f]")
 
@@ -114,17 +104,12 @@ class ParseResult:
 def parse_statement(
     file_path: Path,
     account: Account,
-    *,
-    claude_client: ClaudeClient | None = None,
-    mock: bool = False,
 ) -> ParseResult:
     """Parse a bank statement file into normalized transactions.
 
     Args:
         file_path: Path to the statement file (PDF or CSV)
         account: Account type (amex, wise, tide, monzo)
-        claude_client: Claude client for PDF extraction (required for PDF unless mock=True)
-        mock: If True, return mock data without calling LLM
 
     Returns:
         ParseResult with extracted transactions
@@ -141,7 +126,7 @@ def parse_statement(
     if suffix == ".csv":
         return _parse_csv(file_path, account)
     elif suffix == ".pdf":
-        return _parse_pdf(file_path, account, claude_client=claude_client, mock=mock)
+        return _parse_pdf(file_path, account)
     else:
         raise ExtractionError(
             f"Unsupported file type: {suffix}. Expected .pdf or .csv",
@@ -175,7 +160,6 @@ def _parse_monzo_csv(file_path: Path) -> ParseResult:
         reader = csv.DictReader(f)
         fieldnames = reader.fieldnames or []
 
-        # Validate we have the expected columns
         required = {"Date", "Amount", "Currency", "Name"}
         if not required.issubset(set(fieldnames)):
             missing = required - set(fieldnames)
@@ -213,11 +197,9 @@ def _parse_monzo_row(row: dict[str, str]) -> RawTransaction | None:
     if not date_str:
         return None
 
-    # Monzo dates are DD/MM/YYYY
     try:
         txn_date = datetime.strptime(date_str, "%d/%m/%Y").date()  # noqa: DTZ007
     except ValueError:
-        # Try ISO format as fallback
         txn_date = datetime.strptime(date_str, "%Y-%m-%d").date()  # noqa: DTZ007
 
     amount_str = _clean_text(row.get("Amount", ""))
@@ -227,12 +209,10 @@ def _parse_monzo_row(row: dict[str, str]) -> RawTransaction | None:
 
     currency = _clean_text(row.get("Currency", "GBP")) or "GBP"
 
-    # Description from Name or Description field
     description = _clean_text(row.get("Name", "")) or _clean_text(row.get("Description", ""))
     if not description:
         return None
 
-    # Balance if present
     balance_str = _clean_text(row.get("Balance", ""))
     balance = Decimal(balance_str.replace(",", "")) if balance_str else None
 
@@ -245,48 +225,14 @@ def _parse_monzo_row(row: dict[str, str]) -> RawTransaction | None:
     )
 
 
-def _parse_pdf(
-    file_path: Path,
-    account: Account,
-    *,
-    claude_client: ClaudeClient | None = None,
-    mock: bool = False,
-) -> ParseResult:
-    """Parse a PDF statement using text extraction + LLM."""
-    # Check file size
+def _parse_pdf(file_path: Path, account: Account) -> ParseResult:
+    """Parse a PDF statement using pdfplumber."""
     file_size = file_path.stat().st_size
     if file_size > MAX_PDF_SIZE_BYTES:
         raise ExtractionError(
             f"PDF too large: {file_size} bytes (max {MAX_PDF_SIZE_BYTES})",
             details={"file": str(file_path), "size": file_size},
         )
-
-    # Extract text from PDF
-    text, page_count = _extract_pdf_text(file_path)
-
-    if not text.strip():
-        raise ExtractionError(
-            "No text extracted from PDF",
-            details={"file": str(file_path), "page_count": page_count},
-        )
-
-    if mock:
-        return _mock_pdf_result(file_path, account, page_count)
-
-    if claude_client is None:
-        raise ExtractionError(
-            "Claude client required for PDF extraction (or use mock=True)",
-            details={"file": str(file_path)},
-        )
-
-    # Parse with LLM
-    return _parse_with_llm(file_path, account, text, page_count, claude_client)
-
-
-def _extract_pdf_text(file_path: Path) -> tuple[str, int]:
-    """Extract all text from a PDF using pdfplumber."""
-    text_parts: list[str] = []
-    page_count = 0
 
     try:
         with pdfplumber.open(file_path) as pdf:
@@ -297,9 +243,17 @@ def _extract_pdf_text(file_path: Path) -> tuple[str, int]:
                     details={"file": str(file_path), "page_count": page_count},
                 )
 
-            for page in pdf.pages:
-                page_text = page.extract_text() or ""
-                text_parts.append(page_text)
+            if account == "tide":
+                return _parse_tide_pdf(pdf, file_path)
+            elif account == "amex":
+                return _parse_amex_pdf(pdf, file_path)
+            elif account == "wise":
+                return _parse_wise_pdf(pdf, file_path)
+            else:
+                raise ExtractionError(
+                    f"PDF parsing not implemented for {account}",
+                    details={"account": account},
+                )
 
     except pdfplumber.pdfminer.pdfparser.PDFSyntaxError as e:
         raise ExtractionError(
@@ -307,246 +261,499 @@ def _extract_pdf_text(file_path: Path) -> tuple[str, int]:
             details={"file": str(file_path)},
         ) from e
 
-    return "\n\n--- Page Break ---\n\n".join(text_parts), page_count
 
+# =============================================================================
+# TIDE PDF PARSER - Uses direct table extraction
+# =============================================================================
 
-def _parse_with_llm(
-    file_path: Path,
-    account: Account,
-    text: str,
-    page_count: int,
-    claude_client: ClaudeClient,
-) -> ParseResult:
-    """Parse statement text using Claude haiku."""
-    from execution.shared.claude_client import HAIKU
-    from execution.shared.prompts import LoadedPrompt
+def _parse_tide_pdf(pdf: pdfplumber.pdf.PDF, file_path: Path) -> ParseResult:
+    """Parse Tide bank statement PDF using table extraction.
 
-    # Build the prompt
-    prompt_text = _get_extraction_prompt(account)
+    Tide statements have a clean table with columns:
+    Date | Transaction type | Details | Paid in (£) | Paid out (£) | Balance (£)
+    """
+    transactions: list[RawTransaction] = []
+    warnings: list[str] = []
 
-    # Create a minimal LoadedPrompt for the extraction
-    loaded_prompt = LoadedPrompt(
-        name=f"statement_extract_{account}",
-        model_id=HAIKU,
-        text=prompt_text,
-        schema={},  # No strict schema validation for statement extraction
-        version=_compute_prompt_version(prompt_text),
-        estimated_tokens=len(prompt_text) // 4,
-    )
+    for page_num, page in enumerate(pdf.pages):
+        tables = page.extract_tables()
 
-    # Call Claude
-    response_text, _call = claude_client.call_with_cached_prompt(
-        loaded_prompt=loaded_prompt,
-        user_content=f"Extract transactions from this {account.upper()} statement:\n\n{text}",
-        max_tokens=4096,
-        stage="extract",
-        model=HAIKU,
-    )
+        for table in tables:
+            if not table or len(table) < 2:
+                continue
 
-    # Parse response
-    transactions, confidence, warnings = _parse_llm_response(response_text, account)
+            header_row = _find_header_row(table, ["Date", "Paid in", "Paid out", "Balance"])
+            if header_row is None:
+                continue
+
+            col_indices = _map_tide_columns(table[header_row])
+
+            for row_idx, row in enumerate(table[header_row + 1:], start=header_row + 2):
+                try:
+                    txn = _parse_tide_row(row, col_indices)
+                    if txn:
+                        transactions.append(txn)
+                except (ValueError, InvalidOperation) as e:
+                    warnings.append(f"Page {page_num + 1}, row {row_idx}: {e}")
+
+    if not transactions:
+        warnings.append("No transactions found in PDF")
 
     return ParseResult(
-        account=account,
+        account="tide",
         transactions=transactions,
-        confidence=confidence,
+        confidence=1.0,
         source_file=file_path.name,
-        page_count=page_count,
-        extraction_method="pdf_llm",
+        page_count=len(pdf.pages),
+        extraction_method="pdf_table",
         warnings=warnings,
     )
 
 
-def _get_extraction_prompt(account: Account) -> str:
-    """Get the extraction prompt for a specific account type."""
-    prompts_dir = Path(__file__).parent / "prompts"
-    prompt_file = prompts_dir / f"extract_{account}.md"
-
-    if prompt_file.exists():
-        return prompt_file.read_text(encoding="utf-8")
-
-    # Fallback to generic prompt
-    return _get_generic_extraction_prompt(account)
+def _find_header_row(table: list[list[str | None]], keywords: list[str]) -> int | None:
+    """Find the row index containing header keywords."""
+    for idx, row in enumerate(table):
+        row_text = " ".join(str(cell or "") for cell in row).lower()
+        if all(kw.lower() in row_text for kw in keywords):
+            return idx
+    return None
 
 
-def _get_generic_extraction_prompt(account: Account) -> str:
-    """Generic extraction prompt for bank statements."""
-    return f"""# Bank Statement Transaction Extractor
-
-You extract transactions from a {account.upper()} bank statement.
-
-Your output must be a single JSON object with this structure:
-```json
-{{
-  "transactions": [
-    {{
-      "date": "YYYY-MM-DD",
-      "description": "Merchant or transaction description",
-      "amount": "-123.45",
-      "currency": "GBP",
-      "balance": "1234.56"
-    }}
-  ],
-  "confidence": 0.95,
-  "warnings": []
-}}
-```
-
-## Rules
-
-1. **Extract all transactions** from the statement, in chronological order (oldest first).
-
-2. **Date format**: Always use ISO format YYYY-MM-DD. Convert from DD/MM/YYYY or other formats.
-
-3. **Amount sign convention**:
-   - Negative amounts are money OUT (purchases, payments, fees)
-   - Positive amounts are money IN (refunds, credits, deposits)
-   - If the statement shows debits/credits separately, use negative for debits.
-
-4. **Currency**: Use ISO 4217 codes (GBP, USD, EUR, etc.). Default to GBP if unclear.
-
-5. **Description**: Extract the merchant name or transaction description. Clean up but preserve key info.
-
-6. **Balance**: Include if shown (running balance after transaction). Set to null if not present.
-
-7. **Confidence**: Set between 0.0 and 1.0 based on extraction quality:
-   - 0.95+ : Clean extraction, all fields clearly parsed
-   - 0.80-0.95 : Minor ambiguity but likely correct
-   - Below 0.80 : Significant uncertainty
-
-8. **Warnings**: List any issues encountered (unclear amounts, missing dates, etc.)
-
-9. **Do not invent data**. If a field is unclear, set to null and add a warning.
-
-Return ONLY the JSON object, no markdown formatting or extra text.
-"""
+def _map_tide_columns(header_row: list[str | None]) -> dict[str, int]:
+    """Map Tide column names to indices."""
+    mapping: dict[str, int] = {}
+    for idx, cell in enumerate(header_row):
+        cell_text = str(cell or "").lower().strip()
+        if "date" in cell_text:
+            mapping["date"] = idx
+        elif "transaction type" in cell_text or "type" in cell_text:
+            mapping["type"] = idx
+        elif "details" in cell_text or "description" in cell_text:
+            mapping["details"] = idx
+        elif "paid in" in cell_text:
+            mapping["paid_in"] = idx
+        elif "paid out" in cell_text:
+            mapping["paid_out"] = idx
+        elif "balance" in cell_text:
+            mapping["balance"] = idx
+    return mapping
 
 
-def _compute_prompt_version(prompt_text: str) -> str:
-    """Compute a short hash version of the prompt."""
-    return hashlib.sha256(prompt_text.encode()).hexdigest()[:8]
-
-
-def _parse_llm_response(
-    response_text: str,
-    account: Account,
-) -> tuple[list[RawTransaction], float, list[str]]:
-    """Parse the LLM response JSON into transactions."""
-    # Strip markdown code blocks if present
-    text = response_text.strip()
-    if text.startswith("```"):
-        lines = text.split("\n")
-        # Remove first and last lines (code fence)
-        lines = [line for line in lines if not line.strip().startswith("```")]
-        text = "\n".join(lines)
-
-    try:
-        data = json.loads(text)
-    except json.JSONDecodeError as e:
-        raise ExtractionError(
-            f"LLM returned invalid JSON: {e}",
-            details={"response": response_text[:500]},
-        ) from e
-
-    if not isinstance(data, dict):
-        raise ExtractionError(
-            "LLM response is not a JSON object",
-            details={"type": type(data).__name__},
-        )
-
-    raw_transactions = data.get("transactions", [])
-    if not isinstance(raw_transactions, list):
-        raise ExtractionError(
-            "transactions field is not a list",
-            details={"type": type(raw_transactions).__name__},
-        )
-
-    transactions: list[RawTransaction] = []
-    warnings: list[str] = list(data.get("warnings", []))
-
-    for idx, raw in enumerate(raw_transactions):
-        try:
-            txn = _parse_transaction_dict(raw)
-            transactions.append(txn)
-        except (ValueError, KeyError, InvalidOperation) as e:
-            warnings.append(f"Transaction {idx}: {e}")
-
-    confidence = float(data.get("confidence", 0.9))
-
-    return transactions, confidence, warnings
-
-
-def _parse_transaction_dict(raw: dict[str, Any]) -> RawTransaction:
-    """Parse a transaction dict from LLM output."""
-    date_str = raw.get("date")
+def _parse_tide_row(row: list[str | None], col_indices: dict[str, int]) -> RawTransaction | None:
+    """Parse a single Tide table row."""
+    date_idx = col_indices.get("date", 0)
+    date_str = _clean_text(str(row[date_idx] or ""))
     if not date_str:
-        raise ValueError("missing date")
+        return None
 
-    # Parse date (ISO format expected)
     try:
-        txn_date = date.fromisoformat(date_str)
+        txn_date = _parse_date(date_str)
     except ValueError:
-        # Try DD/MM/YYYY fallback
-        txn_date = datetime.strptime(date_str, "%d/%m/%Y").date()  # noqa: DTZ007
+        return None
 
-    description = raw.get("description", "")
+    details_idx = col_indices.get("details", 2)
+    type_idx = col_indices.get("type", 1)
+    description = _clean_text(str(row[details_idx] or ""))
     if not description:
-        raise ValueError("missing description")
+        txn_type = _clean_text(str(row[type_idx] or ""))
+        description = txn_type or "Unknown"
 
-    amount_str = raw.get("amount")
-    if amount_str is None:
-        raise ValueError("missing amount")
-    amount = Decimal(str(amount_str).replace(",", ""))
+    paid_in_idx = col_indices.get("paid_in", 4)
+    paid_out_idx = col_indices.get("paid_out", 5)
+    balance_idx = col_indices.get("balance", 6)
 
-    currency = raw.get("currency", "GBP")
+    paid_in_str = _clean_text(str(row[paid_in_idx] or ""))
+    paid_out_str = _clean_text(str(row[paid_out_idx] or ""))
+    balance_str = _clean_text(str(row[balance_idx] or ""))
 
-    balance_str = raw.get("balance")
-    balance = Decimal(str(balance_str).replace(",", "")) if balance_str else None
+    if paid_in_str:
+        amount = Decimal(paid_in_str.replace(",", ""))
+    elif paid_out_str:
+        amount = -Decimal(paid_out_str.replace(",", ""))
+    else:
+        return None
+
+    balance = Decimal(balance_str.replace(",", "")) if balance_str else None
 
     return RawTransaction(
         date=txn_date,
         description=description,
         amount=amount,
-        currency=currency,
+        currency="GBP",
         balance=balance,
     )
 
 
-def _mock_pdf_result(file_path: Path, account: Account, page_count: int) -> ParseResult:
-    """Return mock data for testing without LLM calls."""
-    mock_transactions = [
-        RawTransaction(
-            date=date(2025, 11, 15),
-            description="MOCK MERCHANT ONE",
-            amount=Decimal("-50.00"),
-            currency="GBP",
-            balance=Decimal("1000.00"),
-        ),
-        RawTransaction(
-            date=date(2025, 11, 16),
-            description="MOCK MERCHANT TWO",
-            amount=Decimal("-25.50"),
-            currency="GBP",
-            balance=Decimal("974.50"),
-        ),
-        RawTransaction(
-            date=date(2025, 11, 17),
-            description="MOCK REFUND",
-            amount=Decimal("10.00"),
-            currency="GBP",
-            balance=Decimal("984.50"),
-        ),
-    ]
+# =============================================================================
+# AMEX PDF PARSER - Uses text extraction with regex
+# =============================================================================
+
+# Pattern: Nov5 Nov5 DESCRIPTION AMOUNT or Nov5 Nov5 DESCRIPTION AMOUNT\nCR
+_AMEX_TXN_PATTERN: Final[re.Pattern[str]] = re.compile(
+    r"^([A-Z][a-z]{2}\d{1,2})\s+([A-Z][a-z]{2}\d{1,2})\s+(.+?)\s+([\d,]+\.\d{2})(?:\s*\nCR)?$",
+    re.MULTILINE,
+)
+
+# Alternative pattern for lines with foreign currency
+_AMEX_FOREIGN_PATTERN: Final[re.Pattern[str]] = re.compile(
+    r"^([A-Z][a-z]{2}\d{1,2})\s+([A-Z][a-z]{2}\d{1,2})\s+(.+?)\s+([\d,]+\.\d{2})\s*$",
+    re.MULTILINE,
+)
+
+
+def _parse_amex_pdf(pdf: pdfplumber.pdf.PDF, file_path: Path) -> ParseResult:
+    """Parse Amex statement PDF using text extraction.
+
+    Amex statements have transactions in format:
+    TransDate ProcessDate Description Amount
+    Nov5 Nov5 MERCHANT NAME CITY 123.45
+    """
+    transactions: list[RawTransaction] = []
+    warnings: list[str] = []
+    statement_year: int | None = None
+
+    for page_num, page in enumerate(pdf.pages):
+        text = page.extract_text() or ""
+
+        if statement_year is None:
+            statement_year = _extract_amex_statement_year(text)
+
+        page_txns, page_warnings = _parse_amex_page(text, statement_year or 2025, page_num + 1)
+        transactions.extend(page_txns)
+        warnings.extend(page_warnings)
+
+    if not transactions:
+        warnings.append("No transactions found in PDF")
 
     return ParseResult(
-        account=account,
-        transactions=mock_transactions,
+        account="amex",
+        transactions=transactions,
         confidence=1.0,
         source_file=file_path.name,
-        page_count=page_count,
-        extraction_method="mock",
-        warnings=["Mock mode - no actual extraction performed"],
+        page_count=len(pdf.pages),
+        extraction_method="pdf_text",
+        warnings=warnings,
     )
+
+
+def _extract_amex_statement_year(text: str) -> int | None:
+    """Extract statement year from Amex header."""
+    # Look for "Statement Period From 4November to3December2025"
+    match = re.search(r"Statement Period.*?(\d{4})", text)
+    if match:
+        return int(match.group(1))
+
+    # Look for date patterns like "03/12/25"
+    match = re.search(r"\d{2}/\d{2}/(\d{2})", text)
+    if match:
+        year_short = int(match.group(1))
+        return 2000 + year_short
+
+    return None
+
+
+def _parse_amex_page(text: str, year: int, page_num: int) -> tuple[list[RawTransaction], list[str]]:
+    """Parse transactions from a single Amex page."""
+    transactions: list[RawTransaction] = []
+    warnings: list[str] = []
+
+    lines = text.split("\n")
+    i = 0
+
+    while i < len(lines):
+        line = lines[i].strip()
+
+        # Look for transaction pattern: MonDD MonDD Description Amount
+        match = re.match(
+            r"^([A-Z][a-z]{2})(\d{1,2})\s+([A-Z][a-z]{2})(\d{1,2})\s+(.+?)\s+([\d,]+\.\d{2})$",
+            line,
+        )
+
+        if match:
+            txn_month = match.group(1)
+            txn_day = int(match.group(2))
+            description = match.group(5).strip()
+            amount_str = match.group(6)
+
+            # Check next line for CR (credit indicator)
+            is_credit = False
+            if i + 1 < len(lines) and lines[i + 1].strip() == "CR":
+                is_credit = True
+                i += 1
+
+            # Skip foreign currency info lines
+            while i + 1 < len(lines):
+                next_line = lines[i + 1].strip()
+                if (
+                    re.match(r"^(UNITED STATES DOLLAR|Exchange Rate|ROUTING:|TO:|TICKET NUMBER:|PASSENGER NAME:)", next_line)
+                    or re.match(r"^[\d,]+\.\d{2}$", next_line)
+                    or re.match(r"^\+Nonsterling Transaction Fee", next_line)
+                ):
+                    i += 1
+                else:
+                    break
+
+            try:
+                txn_date = _parse_amex_date(txn_month, txn_day, year)
+                amount = Decimal(amount_str.replace(",", ""))
+                if not is_credit:
+                    amount = -amount
+
+                transactions.append(
+                    RawTransaction(
+                        date=txn_date,
+                        description=description,
+                        amount=amount,
+                        currency="GBP",
+                        balance=None,
+                    )
+                )
+            except (ValueError, InvalidOperation) as e:
+                warnings.append(f"Page {page_num}, line {i + 1}: {e}")
+
+        i += 1
+
+    return transactions, warnings
+
+
+def _parse_amex_date(month_str: str, day: int, year: int) -> date:
+    """Parse Amex date format (e.g., 'Nov', 5 -> date)."""
+    months = {
+        "Jan": 1, "Feb": 2, "Mar": 3, "Apr": 4, "May": 5, "Jun": 6,
+        "Jul": 7, "Aug": 8, "Sep": 9, "Oct": 10, "Nov": 11, "Dec": 12,
+    }
+    month = months.get(month_str)
+    if month is None:
+        raise ValueError(f"Unknown month: {month_str}")
+    return date(year, month, day)
+
+
+# =============================================================================
+# WISE PDF PARSER - Uses text extraction with line-by-line parsing
+# =============================================================================
+
+# Wise transaction line ends with amounts: [incoming] [outgoing] [balance]
+# Pattern captures description and trailing numbers
+_WISE_AMOUNT_PATTERN: Final[re.Pattern[str]] = re.compile(
+    r"^(.+?)\s+([-]?[\d,]+\.\d{2})\s+([\d,]+\.\d{2})$"
+)
+
+# Alternative: three numbers at end (incoming, outgoing, balance)
+_WISE_THREE_AMOUNTS: Final[re.Pattern[str]] = re.compile(
+    r"^(.+?)\s+([\d,]+\.\d{2})\s+([-]?[\d,]+\.\d{2})\s+([\d,]+\.\d{2})$"
+)
+
+# Date line pattern: "28 February 2026 ..."
+_WISE_DATE_PATTERN: Final[re.Pattern[str]] = re.compile(
+    r"^(\d{1,2})\s+(January|February|March|April|May|June|July|August|September|October|November|December)\s+(\d{4})"
+)
+
+
+def _parse_wise_pdf(pdf: pdfplumber.pdf.PDF, file_path: Path) -> ParseResult:
+    """Parse Wise statement PDF using text extraction.
+
+    Wise statements have multi-line transactions:
+    Line 1: Description [incoming] [outgoing] balance
+    Line 2: DD Month YYYY Card/Transaction details
+    """
+    transactions: list[RawTransaction] = []
+    warnings: list[str] = []
+
+    # Extract currency from filename or first page
+    currency = _extract_wise_currency(file_path, pdf)
+
+    for page_num, page in enumerate(pdf.pages):
+        text = page.extract_text() or ""
+        page_txns, page_warnings = _parse_wise_page(text, currency, page_num + 1)
+        transactions.extend(page_txns)
+        warnings.extend(page_warnings)
+
+    if not transactions:
+        warnings.append("No transactions found in PDF")
+
+    return ParseResult(
+        account="wise",
+        transactions=transactions,
+        confidence=1.0,
+        source_file=file_path.name,
+        page_count=len(pdf.pages),
+        extraction_method="pdf_text",
+        warnings=warnings,
+    )
+
+
+def _extract_wise_currency(file_path: Path, pdf: pdfplumber.pdf.PDF) -> str:
+    """Extract currency from Wise statement filename or content."""
+    # Try filename first: statement_37433713_GBP_2025-03-01_2026-02-28.pdf
+    filename = file_path.stem
+    match = re.search(r"_([A-Z]{3})_\d{4}-\d{2}-\d{2}", filename)
+    if match:
+        return match.group(1)
+
+    # Try first page header
+    if pdf.pages:
+        text = pdf.pages[0].extract_text() or ""
+        match = re.search(r"^([A-Z]{3}) statement", text, re.MULTILINE)
+        if match:
+            return match.group(1)
+
+    return "GBP"
+
+
+def _parse_wise_page(text: str, currency: str, page_num: int) -> tuple[list[RawTransaction], list[str]]:
+    """Parse transactions from a single Wise page."""
+    transactions: list[RawTransaction] = []
+    warnings: list[str] = []
+
+    lines = text.split("\n")
+    i = 0
+
+    while i < len(lines):
+        line = lines[i].strip()
+
+        # Skip header and footer lines
+        if _is_wise_header_footer(line):
+            i += 1
+            continue
+
+        # Try to match transaction line (description + amounts)
+        # Wise format: "Description text -amount balance" or "Description text amount balance"
+
+        # Check for two numbers at end of line
+        match = _WISE_AMOUNT_PATTERN.match(line)
+        if match:
+            description = match.group(1).strip()
+            amount_str = match.group(2)
+            balance_str = match.group(3)
+
+            # Look for date on next line
+            txn_date = None
+            if i + 1 < len(lines):
+                date_match = _WISE_DATE_PATTERN.match(lines[i + 1].strip())
+                if date_match:
+                    try:
+                        txn_date = _parse_wise_date(
+                            int(date_match.group(1)),
+                            date_match.group(2),
+                            int(date_match.group(3)),
+                        )
+                        i += 1  # Skip the date line
+                    except ValueError:
+                        pass
+
+            if txn_date:
+                try:
+                    amount = Decimal(amount_str.replace(",", ""))
+                    balance = Decimal(balance_str.replace(",", ""))
+
+                    # Clean up description
+                    description = _clean_wise_description(description)
+
+                    if description:
+                        transactions.append(
+                            RawTransaction(
+                                date=txn_date,
+                                description=description,
+                                amount=amount,
+                                currency=currency,
+                                balance=balance,
+                            )
+                        )
+                except (ValueError, InvalidOperation) as e:
+                    warnings.append(f"Page {page_num}, line {i + 1}: {e}")
+
+        i += 1
+
+    return transactions, warnings
+
+
+def _is_wise_header_footer(line: str) -> bool:
+    """Check if line is a Wise header/footer to skip."""
+    skip_patterns = [
+        "Wise Payments Ltd",
+        "GBP statement",
+        "USD statement",
+        "EUR statement",
+        "Generated on:",
+        "Account Holder",
+        "Account number",
+        "IBAN",
+        "Swift/BIC",
+        "Description Incoming Outgoing Amount",
+        "ref:76a8b2b1",
+        "/ 18",  # Page numbers
+    ]
+    return any(pattern in line for pattern in skip_patterns)
+
+
+def _parse_wise_date(day: int, month_str: str, year: int) -> date:
+    """Parse Wise date format."""
+    months = {
+        "January": 1, "February": 2, "March": 3, "April": 4,
+        "May": 5, "June": 6, "July": 7, "August": 8,
+        "September": 9, "October": 10, "November": 11, "December": 12,
+    }
+    month = months.get(month_str)
+    if month is None:
+        raise ValueError(f"Unknown month: {month_str}")
+    return date(year, month, day)
+
+
+def _clean_wise_description(description: str) -> str:
+    """Clean up Wise transaction description."""
+    # Remove amounts that might be embedded in description
+    # e.g., "Card transaction of 76.00 THB issued by Www.grab.com BANGKOK"
+    # We want to keep the merchant name
+
+    # Remove leading transaction type info if it contains the original amount
+    if description.startswith("Card transaction of"):
+        # Extract just the merchant part
+        match = re.search(r"issued by\s+(.+)$", description)
+        if match:
+            description = match.group(1)
+
+    # Remove "Sent money to " prefix but keep recipient
+    if description.startswith("Sent money to "):
+        description = description[14:]
+
+    # Remove "Received money from " prefix
+    if description.startswith("Received money from "):
+        description = description[20:]
+
+    # Clean up "Paid to " prefix
+    if description.startswith("Paid to "):
+        description = description[8:]
+
+    # Handle "Moved X.XX GBP from Tax"
+    if description.startswith("Moved "):
+        match = re.search(r"from\s+(.+)$", description)
+        if match:
+            description = f"Transfer from {match.group(1)}"
+
+    # Handle "Converted X.XX USD to Y.YY GBP"
+    if description.startswith("Converted "):
+        description = "Currency conversion"
+
+    return _clean_text(description)
+
+
+def _parse_date(date_str: str) -> date:
+    """Parse various date formats."""
+    formats = [
+        "%d %b %Y",      # 28 Feb 2025
+        "%d %B %Y",      # 28 February 2025
+        "%d/%m/%Y",      # 28/02/2025
+        "%Y-%m-%d",      # 2025-02-28
+        "%d-%m-%Y",      # 28-02-2025
+    ]
+
+    for fmt in formats:
+        try:
+            return datetime.strptime(date_str.strip(), fmt).date()  # noqa: DTZ007
+        except ValueError:
+            continue
+
+    raise ValueError(f"Cannot parse date: {date_str}")
 
 
 def _clean_text(text: str) -> str:

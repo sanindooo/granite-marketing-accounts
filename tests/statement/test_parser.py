@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import json
-import tempfile
 from datetime import date
 from decimal import Decimal
 from pathlib import Path
@@ -17,7 +15,6 @@ from execution.statement.parser import (
     RawTransaction,
     UnsupportedAccountError,
     _clean_text,
-    _parse_llm_response,
     parse_statement,
 )
 
@@ -28,12 +25,13 @@ class TestSupportedAccounts:
     def test_supported_accounts_list(self) -> None:
         assert SUPPORTED_ACCOUNTS == ("amex", "wise", "tide", "monzo")
 
-    def test_unsupported_account_raises(self) -> None:
-        with tempfile.NamedTemporaryFile(suffix=".pdf") as f:
-            with pytest.raises(UnsupportedAccountError) as exc_info:
-                parse_statement(Path(f.name), "unknown")  # type: ignore
-            assert "unknown" in str(exc_info.value)
-            assert "amex" in str(exc_info.value)
+    def test_unsupported_account_raises(self, tmp_path: Path) -> None:
+        pdf_file = tmp_path / "statement.pdf"
+        _create_minimal_pdf(pdf_file)
+        with pytest.raises(UnsupportedAccountError) as exc_info:
+            parse_statement(pdf_file, "unknown")  # type: ignore
+        assert "unknown" in str(exc_info.value)
+        assert "amex" in str(exc_info.value)
 
 
 class TestMonzoCsvParsing:
@@ -97,35 +95,14 @@ txn_001,15/11/2025,10:30:00,Card payment,Shop,,General,-25.00,GBP,-25.00,GBP,,,,
 
 
 class TestPdfParsing:
-    """Test PDF parsing with mock LLM."""
-
-    def test_mock_mode_returns_mock_data(self, tmp_path: Path) -> None:
-        # Create a minimal valid PDF
-        pdf_file = tmp_path / "statement.pdf"
-        _create_minimal_pdf(pdf_file)
-
-        result = parse_statement(pdf_file, "amex", mock=True)
-
-        assert result.account == "amex"
-        assert len(result.transactions) == 3
-        assert result.extraction_method == "mock"
-        assert "Mock mode" in result.warnings[0]
-
-    def test_pdf_without_client_raises(self, tmp_path: Path) -> None:
-        pdf_file = tmp_path / "statement.pdf"
-        _create_minimal_pdf(pdf_file)
-
-        with pytest.raises(ExtractionError) as exc_info:
-            parse_statement(pdf_file, "amex", mock=False, claude_client=None)
-        assert "Claude client required" in str(exc_info.value)
+    """Test PDF parsing."""
 
     def test_pdf_too_large_raises(self, tmp_path: Path) -> None:
         pdf_file = tmp_path / "large.pdf"
-        # Create a file larger than MAX_PDF_SIZE_BYTES (20MB)
         pdf_file.write_bytes(b"x" * (21 * 1024 * 1024))
 
         with pytest.raises(ExtractionError) as exc_info:
-            parse_statement(pdf_file, "amex", mock=True)
+            parse_statement(pdf_file, "amex")
         assert "too large" in str(exc_info.value).lower()
 
     def test_unsupported_file_type_raises(self, tmp_path: Path) -> None:
@@ -136,101 +113,65 @@ class TestPdfParsing:
             parse_statement(txt_file, "amex")
         assert "Unsupported file type" in str(exc_info.value)
 
+    def test_minimal_pdf_parses_without_error(self, tmp_path: Path) -> None:
+        pdf_file = tmp_path / "statement.pdf"
+        _create_minimal_pdf(pdf_file)
 
-class TestLlmResponseParsing:
-    """Test parsing of LLM JSON responses."""
+        # Should not raise - minimal PDF has no transactions but should parse
+        result = parse_statement(pdf_file, "amex")
+        assert result.account == "amex"
+        assert result.extraction_method == "pdf_text"
 
-    def test_parse_valid_response(self) -> None:
-        response = json.dumps(
-            {
-                "transactions": [
-                    {
-                        "date": "2025-11-15",
-                        "description": "MERCHANT",
-                        "amount": "-50.00",
-                        "currency": "GBP",
-                        "balance": "1000.00",
-                    },
-                    {
-                        "date": "2025-11-16",
-                        "description": "REFUND",
-                        "amount": "10.00",
-                        "currency": "GBP",
-                        "balance": "1010.00",
-                    },
-                ],
-                "confidence": 0.95,
-                "warnings": [],
-            }
-        )
 
-        transactions, confidence, warnings = _parse_llm_response(response, "amex")
+class TestRealStatements:
+    """Test parsing real statement files if they exist."""
 
-        assert len(transactions) == 2
-        assert transactions[0].date == date(2025, 11, 15)
-        assert transactions[0].amount == Decimal("-50.00")
-        assert transactions[1].amount == Decimal("10.00")
-        assert confidence == 0.95
-        assert warnings == []
+    @pytest.fixture
+    def statements_dir(self) -> Path:
+        return Path(__file__).parent.parent.parent / "statements"
 
-    def test_parse_response_with_markdown_code_block(self) -> None:
-        response = """```json
-{
-    "transactions": [
-        {"date": "2025-11-15", "description": "TEST", "amount": "-25.00", "currency": "GBP", "balance": null}
-    ],
-    "confidence": 0.90,
-    "warnings": ["Minor extraction issue"]
-}
-```"""
-        transactions, confidence, warnings = _parse_llm_response(response, "amex")
+    def test_tide_pdf(self, statements_dir: Path) -> None:
+        tide_pdf = statements_dir / "tidefeb2025.pdf"
+        if not tide_pdf.exists():
+            pytest.skip("Tide statement not available")
 
-        assert len(transactions) == 1
-        assert transactions[0].description == "TEST"
-        assert confidence == 0.90
-        assert "Minor extraction issue" in warnings
+        result = parse_statement(tide_pdf, "tide")
 
-    def test_parse_response_invalid_json_raises(self) -> None:
-        response = "This is not valid JSON"
+        assert result.account == "tide"
+        assert result.extraction_method == "pdf_table"
+        assert len(result.transactions) > 0
 
-        with pytest.raises(ExtractionError) as exc_info:
-            _parse_llm_response(response, "amex")
-        assert "invalid JSON" in str(exc_info.value)
+        # Check transactions have required fields
+        for txn in result.transactions:
+            assert txn.date is not None
+            assert txn.description
+            assert txn.currency == "GBP"
 
-    def test_parse_response_not_object_raises(self) -> None:
-        response = json.dumps([1, 2, 3])
+    def test_amex_pdf(self, statements_dir: Path) -> None:
+        amex_files = list(statements_dir.glob("AMEX*.pdf"))
+        if not amex_files:
+            pytest.skip("Amex statement not available")
 
-        with pytest.raises(ExtractionError) as exc_info:
-            _parse_llm_response(response, "amex")
-        assert "not a JSON object" in str(exc_info.value)
+        result = parse_statement(amex_files[0], "amex")
 
-    def test_parse_response_invalid_transaction_adds_warning(self) -> None:
-        response = json.dumps(
-            {
-                "transactions": [
-                    {
-                        "date": "2025-11-15",
-                        "description": "VALID",
-                        "amount": "-50.00",
-                        "currency": "GBP",
-                    },
-                    {
-                        "date": "2025-11-16",
-                        "description": "",
-                        "amount": "-25.00",
-                        "currency": "GBP",
-                    },  # Missing description
-                ],
-                "confidence": 0.85,
-                "warnings": [],
-            }
-        )
+        assert result.account == "amex"
+        assert result.extraction_method == "pdf_text"
+        assert len(result.transactions) > 0
 
-        transactions, _confidence, warnings = _parse_llm_response(response, "amex")
+    def test_wise_pdf(self, statements_dir: Path) -> None:
+        wise_dir = statements_dir / "wise"
+        if not wise_dir.exists():
+            pytest.skip("Wise statements not available")
 
-        assert len(transactions) == 1  # Only valid one
-        assert len(warnings) == 1
-        assert "Transaction 1" in warnings[0]
+        wise_files = list(wise_dir.glob("*.pdf"))
+        if not wise_files:
+            pytest.skip("No Wise PDF files found")
+
+        result = parse_statement(wise_files[0], "wise")
+
+        assert result.account == "wise"
+        assert result.extraction_method == "pdf_text"
+        assert len(result.transactions) > 0
 
 
 class TestRawTransaction:
@@ -298,7 +239,7 @@ class TestParseResult:
             confidence=0.92,
             source_file="statement.pdf",
             page_count=3,
-            extraction_method="pdf_llm",
+            extraction_method="pdf_text",
             warnings=["Some warning"],
         )
 
@@ -310,7 +251,7 @@ class TestParseResult:
         assert d["source_file"] == "statement.pdf"
         assert d["page_count"] == 3
         assert d["transaction_count"] == 1
-        assert d["extraction_method"] == "pdf_llm"
+        assert d["extraction_method"] == "pdf_text"
         assert d["warnings"] == ["Some warning"]
 
 
@@ -318,16 +259,12 @@ class TestCleanText:
     """Test text cleaning utility."""
 
     def test_removes_control_chars(self) -> None:
-        # Control chars are removed without adding spaces
         assert _clean_text("Hello\x00World") == "HelloWorld"
         assert _clean_text("Test\x1f\x7fValue") == "TestValue"
 
     def test_collapses_whitespace(self) -> None:
         assert _clean_text("Hello   World") == "Hello World"
-        # Tabs and newlines are control chars (0x09, 0x0A) so they're removed
-        # not collapsed to spaces
         assert _clean_text("Test\t\nValue") == "TestValue"
-        # But multiple spaces collapse to one
         assert _clean_text("Hello    World") == "Hello World"
 
     def test_trims_whitespace(self) -> None:
@@ -340,8 +277,6 @@ class TestCleanText:
 
 def _create_minimal_pdf(path: Path) -> None:
     """Create a minimal valid PDF file for testing."""
-    # Use pdfplumber's ability to read this minimal structure
-    # This is a valid minimal PDF that pdfplumber can open
     pdf_content = b"""%PDF-1.4
 1 0 obj
 << /Type /Catalog /Pages 2 0 R >>
