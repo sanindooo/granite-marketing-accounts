@@ -136,19 +136,21 @@ export function UploadDialog({ accounts, onSuccess }: UploadDialogProps) {
     }
   }, [file, account, onSuccess]);
 
-  const handleClose = () => {
-    if (uploading) return;
-    setOpen(false);
-    setFile(null);
-    setAccount("");
-    setError(null);
-    setProgress(null);
+  const handleOpenChange = (isOpen: boolean) => {
+    if (uploading && !isOpen) return; // Don't close while uploading
+    setOpen(isOpen);
+    if (!isOpen) {
+      setFile(null);
+      setAccount("");
+      setError(null);
+      setProgress(null);
+    }
   };
 
   return (
-    <Dialog open={open} onOpenChange={handleClose}>
+    <Dialog open={open} onOpenChange={handleOpenChange}>
       <DialogTrigger asChild>
-        <Button onClick={() => setOpen(true)}>Upload Statement</Button>
+        <Button>Upload Statement</Button>
       </DialogTrigger>
       <DialogContent>
         <DialogHeader>
@@ -231,7 +233,7 @@ export function UploadDialog({ accounts, onSuccess }: UploadDialogProps) {
         </div>
 
         <DialogFooter>
-          <Button variant="outline" onClick={handleClose} disabled={uploading}>
+          <Button variant="outline" onClick={() => handleOpenChange(false)} disabled={uploading}>
             Cancel
           </Button>
           <Button onClick={handleUpload} disabled={!file || !account || uploading}>
