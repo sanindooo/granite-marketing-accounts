@@ -38,6 +38,7 @@ export function InboxContent() {
       sender: parseAsString,
       dateFrom: parseAsString,
       dateTo: parseAsString,
+      outcome: parseAsString,
     },
     { shallow: true }
   );
@@ -58,7 +59,7 @@ export function InboxContent() {
     setFilters({ sender: value || null });
   }, 300);
 
-  const { view, fy, sender, dateFrom, dateTo } = filters;
+  const { view, fy, sender, dateFrom, dateTo, outcome } = filters;
 
   const toggleSelection = (msgId: string) => {
     setSelectedIds((prev) => {
@@ -94,6 +95,7 @@ export function InboxContent() {
             sender: sender || undefined,
             dateFrom: dateFrom || undefined,
             dateTo: dateTo || undefined,
+            outcome: outcome || undefined,
           }),
           fetchInboxCounts(),
         ]);
@@ -118,9 +120,9 @@ export function InboxContent() {
     return () => {
       cancelled = true;
     };
-  }, [view, fy, sender, dateFrom, dateTo]);
+  }, [view, fy, sender, dateFrom, dateTo, outcome]);
 
-  const hasActiveFilters = sender || dateFrom || dateTo || (fy && fy !== getCurrentFY());
+  const hasActiveFilters = sender || dateFrom || dateTo || outcome || (fy && fy !== getCurrentFY());
   const hasSelection = selectedIds.size > 0;
 
   const clearFilters = () => {
@@ -130,6 +132,7 @@ export function InboxContent() {
       sender: null,
       dateFrom: null,
       dateTo: null,
+      outcome: null,
     });
   };
 
@@ -141,6 +144,7 @@ export function InboxContent() {
         sender: sender || undefined,
         dateFrom: dateFrom || undefined,
         dateTo: dateTo || undefined,
+        outcome: outcome || undefined,
       }),
       fetchInboxCounts(),
     ]);
@@ -258,72 +262,93 @@ export function InboxContent() {
           </div>
         </div>
 
-        <div className="flex flex-wrap items-center gap-4">
-          <div className="flex flex-col gap-1">
-            <label className="text-xs font-medium text-muted-foreground">Fiscal Year</label>
-            <Select
-              value={fy}
-              onValueChange={(value) => setFilters({ fy: value })}
+        <div className="flex items-end justify-between">
+          <div className="flex flex-wrap items-end gap-4">
+            <div className="flex flex-col gap-1">
+              <label className="text-xs font-medium text-muted-foreground">Fiscal Year</label>
+              <Select
+                value={fy}
+                onValueChange={(value) => setFilters({ fy: value })}
+              >
+                <SelectTrigger className="w-36 h-9">
+                  <SelectValue placeholder="Fiscal Year">
+                    {fy === "all" ? "All Years" : fy}
+                  </SelectValue>
+                </SelectTrigger>
+                <SelectContent>
+                  {getAvailableFYs(true).map((fyOption) => (
+                    <SelectItem key={fyOption} value={fyOption}>
+                      {fyOption === "all" ? "All Years" : fyOption}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </div>
+
+            <div className="flex flex-col gap-1">
+              <label className="text-xs font-medium text-muted-foreground">From Date</label>
+              <Input
+                type="date"
+                value={dateFrom || ""}
+                onChange={(e) => setFilters({ dateFrom: e.target.value || null })}
+                className="w-36 h-9"
+              />
+            </div>
+
+            <div className="flex flex-col gap-1">
+              <label className="text-xs font-medium text-muted-foreground">To Date</label>
+              <Input
+                type="date"
+                value={dateTo || ""}
+                onChange={(e) => setFilters({ dateTo: e.target.value || null })}
+                className="w-36 h-9"
+              />
+            </div>
+
+            <div className="flex flex-col gap-1">
+              <label className="text-xs font-medium text-muted-foreground">Outcome</label>
+              <Select
+                value={outcome || "all"}
+                onValueChange={(value) => setFilters({ outcome: value === "all" ? null : value })}
+              >
+                <SelectTrigger className="w-36 h-9">
+                  <SelectValue placeholder="All Outcomes" />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="all">All Outcomes</SelectItem>
+                  <SelectItem value="invoice">Invoice</SelectItem>
+                  <SelectItem value="receipt">Receipt</SelectItem>
+                  <SelectItem value="statement">Statement</SelectItem>
+                  <SelectItem value="neither">Not Invoice</SelectItem>
+                  <SelectItem value="no_attachment">No Attachment</SelectItem>
+                  <SelectItem value="pending">Pending</SelectItem>
+                  <SelectItem value="error">Error</SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
+          </div>
+
+          <div className="flex gap-1 rounded-lg bg-muted p-1">
+            <Button
+              variant={view === "unprocessed" ? "default" : "ghost"}
+              size="sm"
+              className="h-7 text-xs"
+              onClick={() => setFilters({ view: "unprocessed" })}
             >
-              <SelectTrigger className="w-36">
-                <SelectValue placeholder="Fiscal Year">
-                  {fy === "all" ? "All Years" : fy}
-                </SelectValue>
-              </SelectTrigger>
-              <SelectContent>
-                {getAvailableFYs(true).map((fyOption) => (
-                  <SelectItem key={fyOption} value={fyOption}>
-                    {fyOption === "all" ? "All Years" : fyOption}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-          </div>
-
-          <div className="flex flex-col gap-1">
-            <label className="text-xs font-medium text-muted-foreground">Status</label>
-            <Select
-              value={view}
-              onValueChange={(value) => setFilters({ view: value })}
+              Unprocessed ({counts.unprocessed})
+            </Button>
+            <Button
+              variant={view === "all" ? "default" : "ghost"}
+              size="sm"
+              className="h-7 text-xs"
+              onClick={() => setFilters({ view: "all" })}
             >
-              <SelectTrigger className="w-44">
-                <SelectValue placeholder="Status">
-                  {view === "unprocessed"
-                    ? `Unprocessed (${counts.unprocessed})`
-                    : `All Synced (${counts.all})`}
-                </SelectValue>
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem value="unprocessed">
-                  Unprocessed ({counts.unprocessed})
-                </SelectItem>
-                <SelectItem value="all">All Synced ({counts.all})</SelectItem>
-              </SelectContent>
-            </Select>
-          </div>
-
-          <div className="flex flex-col gap-1">
-            <label className="text-xs font-medium text-muted-foreground">From Date</label>
-            <Input
-              type="date"
-              value={dateFrom || ""}
-              onChange={(e) => setFilters({ dateFrom: e.target.value || null })}
-              className="w-36"
-            />
-          </div>
-
-          <div className="flex flex-col gap-1">
-            <label className="text-xs font-medium text-muted-foreground">To Date</label>
-            <Input
-              type="date"
-              value={dateTo || ""}
-              onChange={(e) => setFilters({ dateTo: e.target.value || null })}
-              className="w-36"
-            />
+              All Synced ({counts.all})
+            </Button>
           </div>
         </div>
 
-        <div className="flex items-center gap-3">
+        <div className="flex items-end gap-4">
           <div className="flex flex-col gap-1">
             <label className="text-xs font-medium text-muted-foreground">Search</label>
             <Input
@@ -334,16 +359,14 @@ export function InboxContent() {
                 debouncedSetSender(e.target.value);
               }}
               placeholder="Sender email..."
-              className="w-64"
+              className="w-64 h-9"
             />
           </div>
 
           {hasActiveFilters && (
-            <div className="flex items-end pb-0.5">
-              <Button variant="ghost" size="sm" onClick={clearFilters}>
-                Clear filters
-              </Button>
-            </div>
+            <Button variant="ghost" size="sm" className="h-9" onClick={clearFilters}>
+              Clear filters
+            </Button>
           )}
         </div>
       </CardHeader>
@@ -400,7 +423,10 @@ export function InboxContent() {
             </TableHeader>
             <TableBody>
               {emails.map((email) => (
-                <TableRow key={email.msgId}>
+                <TableRow
+                  key={email.msgId}
+                  className={view === "all" && !email.processedAt ? "bg-amber-50/50 dark:bg-amber-950/20" : ""}
+                >
                   <TableCell className="w-10">
                     <Checkbox
                       checked={selectedIds.has(email.msgId)}
@@ -420,7 +446,9 @@ export function InboxContent() {
                   {view === "all" && (
                     <TableCell>
                       {email.processedAt ? formatOutcome(email.outcome) : (
-                        <span className="text-xs text-muted-foreground">Not processed</span>
+                        <span className="inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium bg-amber-100 text-amber-800 dark:bg-amber-900/50 dark:text-amber-200">
+                          Needs Processing
+                        </span>
                       )}
                     </TableCell>
                   )}

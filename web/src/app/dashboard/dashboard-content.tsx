@@ -14,7 +14,7 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table";
-import { getCurrentFY } from "@/lib/fiscal";
+import { getCurrentFY, getAvailableFYs } from "@/lib/fiscal";
 import { formatCurrency, formatDateTime } from "@/lib/formatters";
 import type { DashboardMetrics, LastRun, SyncCoverage, PendingAction, RunningJob, FxError } from "@/lib/queries/dashboard";
 import { fetchDashboardMetrics, fetchLastRuns, fetchSyncCoverage, fetchPendingActions, cancelRun, fetchRunningJobs, fetchFxErrors } from "@/lib/actions/dashboard";
@@ -799,9 +799,16 @@ fetchPendingActions(fy === "all" ? undefined : fy),
                         className="w-full h-9 px-3 rounded-md border border-input bg-background text-sm"
                       >
                         <option value="">All pending emails</option>
-                        <option value="FY-2025-26">FY-2025-26 (Mar 2025 - Feb 2026)</option>
-                        <option value="FY-2024-25">FY-2024-25 (Mar 2024 - Feb 2025)</option>
-                        <option value="FY-2023-24">FY-2023-24 (Mar 2023 - Feb 2024)</option>
+                        {getAvailableFYs().map((fy) => {
+                          const match = fy.match(/^FY-(\d{4})-(\d{2})$/);
+                          const startYear = match ? parseInt(match[1], 10) : 0;
+                          const label = `${fy} (Mar ${startYear} - Feb ${startYear + 1})`;
+                          return (
+                            <option key={fy} value={fy}>
+                              {label}
+                            </option>
+                          );
+                        })}
                       </select>
                       <p className="text-xs text-muted-foreground">
                         Only process emails received in this fiscal year. Great for finding missing invoices.

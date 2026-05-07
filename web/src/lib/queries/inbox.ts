@@ -16,6 +16,7 @@ export interface InboxFilters {
   dateTo?: string;
   view?: "unprocessed" | "all";
   fy?: string;
+  outcome?: string;
 }
 
 export interface InboxCounts {
@@ -51,6 +52,24 @@ export function getInboxEmails(filters: InboxFilters): InboxEmailRow[] {
     if (fyRange) {
       conditions.push("DATE(received_at) >= ? AND DATE(received_at) <= ?");
       params.push(fyRange.start, fyRange.end);
+    }
+  }
+
+  if (filters.outcome) {
+    if (filters.outcome === "no_attachment") {
+      conditions.push("outcome = 'no_attachment'");
+    } else if (filters.outcome === "neither") {
+      conditions.push("outcome = 'neither'");
+    } else if (filters.outcome === "invoice") {
+      conditions.push("outcome = 'invoice'");
+    } else if (filters.outcome === "receipt") {
+      conditions.push("outcome = 'receipt'");
+    } else if (filters.outcome === "statement") {
+      conditions.push("outcome = 'statement'");
+    } else if (filters.outcome === "pending") {
+      conditions.push("outcome = 'pending'");
+    } else if (filters.outcome === "error") {
+      conditions.push("outcome = 'error'");
     }
   }
 
