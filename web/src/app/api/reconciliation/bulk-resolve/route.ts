@@ -4,6 +4,9 @@ import { getGraniteBinary, getProjectRoot } from "@/lib/spawn-granite";
 
 export const runtime = "nodejs";
 
+const MAX_TRANSACTIONS = 100;
+const SUBPROCESS_TIMEOUT_MS = 10_000; // 10 seconds per transaction
+
 const VALID_REASONS = [
   "personal",
   "transfer_to_self",
@@ -35,6 +38,16 @@ export async function POST(request: Request) {
   }
 
   const { txnIds, reason, note } = result.data;
+
+  if (txnIds.length > MAX_TRANSACTIONS) {
+    return new Response(
+      JSON.stringify({ error: `Too many transactions. Maximum is ${MAX_TRANSACTIONS}` }),
+      {
+        status: 400,
+        headers: { "Content-Type": "application/json" },
+      }
+    );
+  }
 
   if (reason === "other" && !note?.trim()) {
     return new Response(
@@ -81,6 +94,16 @@ export async function POST(request: Request) {
       });
 
       let stdout = "";
+      let resolved = false;
+
+      const timeout = setTimeout(() => {
+        if (!resolved) {
+          resolved = true;
+          proc.kill("SIGTERM");
+          resolve({ code: 1, stdout: "Timed out" });
+        }
+      }, SUBPROCESS_TIMEOUT_MS);
+
       proc.stdout.on("data", (data) => {
         stdout += data.toString();
       });
@@ -88,8 +111,20 @@ export async function POST(request: Request) {
         stdout += data.toString();
       });
 
-      proc.on("close", (code) => resolve({ code: code ?? 1, stdout }));
-      proc.on("error", (err) => resolve({ code: 1, stdout: err.message }));
+      proc.on("close", (code) => {
+        if (!resolved) {
+          resolved = true;
+          clearTimeout(timeout);
+          resolve({ code: code ?? 1, stdout });
+        }
+      });
+      proc.on("error", (err) => {
+        if (!resolved) {
+          resolved = true;
+          clearTimeout(timeout);
+          resolve({ code: 1, stdout: err.message });
+        }
+      });
     });
 
     if (result.code === 0) {

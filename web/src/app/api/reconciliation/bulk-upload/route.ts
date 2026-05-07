@@ -7,6 +7,11 @@ import { getGraniteBinary, getProjectRoot } from "@/lib/spawn-granite";
 
 export const runtime = "nodejs";
 
+const MAX_FILE_SIZE = 10 * 1024 * 1024; // 10MB per file
+const MAX_TOTAL_SIZE = 50 * 1024 * 1024; // 50MB total
+const MAX_FILES = 20;
+const SUBPROCESS_TIMEOUT_MS = 300_000; // 5 minutes for bulk
+
 export async function POST(request: Request) {
   const formData = await request.formData();
   const files = formData.getAll("files") as File[];
@@ -19,6 +24,16 @@ export async function POST(request: Request) {
     });
   }
 
+  if (files.length > MAX_FILES) {
+    return new Response(
+      JSON.stringify({ error: `Too many files. Maximum is ${MAX_FILES}` }),
+      {
+        status: 400,
+        headers: { "Content-Type": "application/json" },
+      }
+    );
+  }
+
   const invalidFiles = files.filter(
     (f) => !f.name.toLowerCase().endsWith(".pdf")
   );
@@ -27,6 +42,33 @@ export async function POST(request: Request) {
       JSON.stringify({
         error: "Only PDF files are allowed",
         invalid: invalidFiles.map((f) => f.name),
+      }),
+      {
+        status: 400,
+        headers: { "Content-Type": "application/json" },
+      }
+    );
+  }
+
+  const oversizedFiles = files.filter((f) => f.size > MAX_FILE_SIZE);
+  if (oversizedFiles.length > 0) {
+    return new Response(
+      JSON.stringify({
+        error: `Some files exceed ${MAX_FILE_SIZE / 1024 / 1024}MB limit`,
+        oversized: oversizedFiles.map((f) => f.name),
+      }),
+      {
+        status: 400,
+        headers: { "Content-Type": "application/json" },
+      }
+    );
+  }
+
+  const totalSize = files.reduce((sum, f) => sum + f.size, 0);
+  if (totalSize > MAX_TOTAL_SIZE) {
+    return new Response(
+      JSON.stringify({
+        error: `Total upload size exceeds ${MAX_TOTAL_SIZE / 1024 / 1024}MB limit`,
       }),
       {
         status: 400,
@@ -67,6 +109,12 @@ export async function POST(request: Request) {
       });
 
       let stdout = "";
+      let timedOut = false;
+
+      const timeout = setTimeout(() => {
+        timedOut = true;
+        proc.kill("SIGTERM");
+      }, SUBPROCESS_TIMEOUT_MS);
 
       const rl = createInterface({ input: proc.stderr });
       rl.on("line", (line) => {
@@ -86,6 +134,7 @@ export async function POST(request: Request) {
       });
 
       proc.on("error", (err) => {
+        clearTimeout(timeout);
         const errorEvent = `data: ${JSON.stringify({
           event: "error",
           message: err.message,
@@ -99,8 +148,11 @@ export async function POST(request: Request) {
       });
 
       proc.on("close", (code) => {
+        clearTimeout(timeout);
         let finalEvent;
-        if (code === 0) {
+        if (timedOut) {
+          finalEvent = { event: "error", message: "Processing timed out" };
+        } else if (code === 0) {
           try {
             const parsed = JSON.parse(stdout);
             finalEvent = { event: "complete", result: parsed };
@@ -125,6 +177,7 @@ export async function POST(request: Request) {
       });
 
       request.signal.addEventListener("abort", () => {
+        clearTimeout(timeout);
         proc.kill("SIGTERM");
         rl.close();
         for (const p of tmpPaths) {
