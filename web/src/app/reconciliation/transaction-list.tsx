@@ -1,6 +1,7 @@
 "use client";
 
 import { Button } from "@/components/ui/button";
+import { Checkbox } from "@/components/ui/checkbox";
 import {
   Table,
   TableBody,
@@ -15,6 +16,9 @@ interface TransactionListProps {
   transactions: TransactionListRow[];
   loading: boolean;
   onResolve: (txnId: string, state: string) => void;
+  selectedTxns?: Set<string>;
+  onToggleSelect?: (txnId: string) => void;
+  onToggleSelectAll?: () => void;
 }
 
 function formatDate(dateStr: string) {
@@ -58,7 +62,17 @@ function StateLabel({ state, needsManualDownload }: { state: string | null; need
   );
 }
 
-export function TransactionList({ transactions, loading, onResolve }: TransactionListProps) {
+export function TransactionList({
+  transactions,
+  loading,
+  onResolve,
+  selectedTxns,
+  onToggleSelect,
+  onToggleSelectAll,
+}: TransactionListProps) {
+  const hasSelection = selectedTxns !== undefined && onToggleSelect !== undefined;
+  const allSelected = hasSelection && transactions.length > 0 && selectedTxns.size === transactions.length;
+
   if (loading) {
     return <div className="text-muted-foreground py-8 text-center">Loading transactions...</div>;
   }
@@ -75,6 +89,15 @@ export function TransactionList({ transactions, loading, onResolve }: Transactio
     <Table>
       <TableHeader>
         <TableRow>
+          {hasSelection && (
+            <TableHead className="w-10">
+              <Checkbox
+                checked={allSelected}
+                onCheckedChange={onToggleSelectAll}
+                aria-label="Select all"
+              />
+            </TableHead>
+          )}
           <TableHead>Date</TableHead>
           <TableHead>Account</TableHead>
           <TableHead>Description</TableHead>
@@ -85,7 +108,16 @@ export function TransactionList({ transactions, loading, onResolve }: Transactio
       </TableHeader>
       <TableBody>
         {transactions.map((txn) => (
-          <TableRow key={txn.txnId}>
+          <TableRow key={txn.txnId} data-state={selectedTxns?.has(txn.txnId) ? "selected" : undefined}>
+            {hasSelection && (
+              <TableCell>
+                <Checkbox
+                  checked={selectedTxns.has(txn.txnId)}
+                  onCheckedChange={() => onToggleSelect(txn.txnId)}
+                  aria-label={`Select ${txn.descriptionCanonical}`}
+                />
+              </TableCell>
+            )}
             <TableCell className="text-sm text-muted-foreground">
               {formatDate(txn.bookingDate)}
             </TableCell>

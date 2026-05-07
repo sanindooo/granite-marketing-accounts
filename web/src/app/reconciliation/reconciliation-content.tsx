@@ -4,6 +4,7 @@ import { useEffect, useState, useCallback } from "react";
 import { useQueryStates, parseAsString } from "nuqs";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
 import {
   Select,
   SelectContent,
@@ -21,11 +22,13 @@ import {
 } from "@/lib/actions/reconciliation";
 import type { TransactionListRow, ReconciliationCounts } from "@/lib/queries/reconciliation";
 import { UploadDialog } from "./upload-dialog";
+import { BulkUploadDialog } from "./bulk-upload-dialog";
 import { TransactionList } from "./transaction-list";
+import { BulkResolveDialog } from "./bulk-resolve-dialog";
 
 type View = "all" | "unmatched" | "matched" | "resolved";
 
-const VALID_ACCOUNTS = ["amex", "wise", "monzo"];
+const VALID_ACCOUNTS = ["amex", "wise", "tide", "monzo"];
 
 export function ReconciliationContent() {
   const [filters, setFilters] = useQueryStates(
@@ -47,6 +50,9 @@ export function ReconciliationContent() {
   const [accounts, setAccounts] = useState<string[]>(VALID_ACCOUNTS);
   const [loading, setLoading] = useState(true);
   const [resolving, setResolving] = useState<string | null>(null);
+  const [search, setSearch] = useState("");
+  const [selectedTxns, setSelectedTxns] = useState<Set<string>>(new Set());
+  const [bulkResolveOpen, setBulkResolveOpen] = useState(false);
 
   const { view, fy, account } = filters;
 
@@ -67,6 +73,7 @@ export function ReconciliationContent() {
           fy: fy || undefined,
           state: stateFilter,
           account: account || undefined,
+          search: search || undefined,
         }),
         fetchReconciliationCounts(fy || undefined),
         fetchAccounts(),
@@ -86,7 +93,7 @@ export function ReconciliationContent() {
     } finally {
       setLoading(false);
     }
-  }, [view, fy, account]);
+  }, [view, fy, account, search]);
 
   useEffect(() => {
     loadData();
@@ -124,15 +131,65 @@ export function ReconciliationContent() {
     [loadData]
   );
 
+  const handleBulkResolve = useCallback(
+    async (reason: string, note?: string) => {
+      const txnIds = Array.from(selectedTxns);
+      if (txnIds.length === 0) return;
+
+      try {
+        const response = await apiFetch("/api/reconciliation/bulk-resolve", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ txnIds, reason, note }),
+        });
+
+        const result = await response.json();
+
+        if (result.status === "success") {
+          toast.success(`Resolved ${result.resolved} transactions`);
+          setSelectedTxns(new Set());
+          await loadData();
+        } else {
+          toast.error(result.message || "Failed to resolve transactions");
+        }
+      } catch (err) {
+        toast.error("Failed to resolve transactions");
+        console.error(err);
+      }
+    },
+    [selectedTxns, loadData]
+  );
+
+  const toggleSelectAll = useCallback(() => {
+    if (selectedTxns.size === transactions.length) {
+      setSelectedTxns(new Set());
+    } else {
+      setSelectedTxns(new Set(transactions.map((t) => t.txnId)));
+    }
+  }, [transactions, selectedTxns.size]);
+
+  const toggleSelectTxn = useCallback((txnId: string) => {
+    setSelectedTxns((prev) => {
+      const next = new Set(prev);
+      if (next.has(txnId)) {
+        next.delete(txnId);
+      } else {
+        next.add(txnId);
+      }
+      return next;
+    });
+  }, []);
+
   const clearFilters = () => {
     setFilters({
       fy: getCurrentFY(),
       account: null,
       view: "all",
     });
+    setSearch("");
   };
 
-  const hasActiveFilters = account || (fy && fy !== getCurrentFY()) || view !== "all";
+  const hasActiveFilters = account || (fy && fy !== getCurrentFY()) || view !== "all" || search;
 
   return (
     <div className="space-y-6">
@@ -185,7 +242,10 @@ export function ReconciliationContent() {
         <CardHeader className="space-y-4">
           <div className="flex items-center justify-between">
             <CardTitle>Transactions</CardTitle>
-            <UploadDialog accounts={accounts} onSuccess={loadData} />
+            <div className="flex gap-2">
+              <BulkUploadDialog onSuccess={loadData} />
+              <UploadDialog accounts={accounts} onSuccess={loadData} />
+            </div>
           </div>
 
           <div className="flex items-end justify-between">
@@ -232,6 +292,16 @@ export function ReconciliationContent() {
                 </Select>
               </div>
 
+              <div className="flex flex-col gap-1">
+                <label className="text-xs font-medium text-muted-foreground">Search</label>
+                <Input
+                  placeholder="Search description..."
+                  value={search}
+                  onChange={(e) => setSearch(e.target.value)}
+                  className="w-48 h-9"
+                />
+              </div>
+
               {hasActiveFilters && (
                 <Button variant="ghost" size="sm" className="h-9" onClick={clearFilters}>
                   Clear filters
@@ -268,13 +338,44 @@ export function ReconciliationContent() {
           </div>
         </CardHeader>
         <CardContent>
+          {selectedTxns.size > 0 && (
+            <div className="mb-4 flex items-center gap-4 rounded-lg bg-muted p-3">
+              <span className="text-sm font-medium">
+                {selectedTxns.size} selected
+              </span>
+              <Button
+                size="sm"
+                variant="outline"
+                onClick={() => setBulkResolveOpen(true)}
+              >
+                Resolve Selected
+              </Button>
+              <Button
+                size="sm"
+                variant="ghost"
+                onClick={() => setSelectedTxns(new Set())}
+              >
+                Clear Selection
+              </Button>
+            </div>
+          )}
           <TransactionList
             transactions={transactions}
             loading={loading || resolving !== null}
             onResolve={handleResolve}
+            selectedTxns={selectedTxns}
+            onToggleSelect={toggleSelectTxn}
+            onToggleSelectAll={toggleSelectAll}
           />
         </CardContent>
       </Card>
+
+      <BulkResolveDialog
+        open={bulkResolveOpen}
+        onOpenChange={setBulkResolveOpen}
+        count={selectedTxns.size}
+        onResolve={handleBulkResolve}
+      />
     </div>
   );
 }

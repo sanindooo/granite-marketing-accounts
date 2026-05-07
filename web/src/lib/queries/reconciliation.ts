@@ -19,6 +19,7 @@ export interface ReconciliationFilters {
   state?: string;
   account?: string;
   needsManualDownload?: boolean;
+  search?: string;
 }
 
 export interface ReconciliationCounts {
@@ -69,6 +70,11 @@ export function getTransactions(
 
   if (filters.needsManualDownload) {
     conditions.push("t.needs_manual_download = 1");
+  }
+
+  if (filters.search) {
+    conditions.push("t.description_canonical LIKE ?");
+    params.push(`%${filters.search.toUpperCase()}%`);
   }
 
   const whereClause =

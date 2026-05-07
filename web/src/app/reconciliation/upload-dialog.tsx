@@ -30,9 +30,15 @@ interface FileUploadState {
 
 interface UploadResult {
   status: string;
-  transactions_added?: number;
-  duplicates_skipped?: number;
-  matched?: number;
+  transactions?: {
+    total: number;
+    new: number;
+    duplicates: number;
+  };
+  matching?: {
+    invoice_matches: number;
+    email_matches: number;
+  };
 }
 
 export function UploadDialog({ accounts, onSuccess }: UploadDialogProps) {
@@ -110,9 +116,9 @@ export function UploadDialog({ accounts, onSuccess }: UploadDialogProps) {
               result = {
                 ...fileState,
                 status: "success",
-                added: uploadResult.transactions_added || 0,
-                matched: uploadResult.matched || 0,
-                skipped: uploadResult.duplicates_skipped || 0,
+                added: uploadResult.transactions?.new || 0,
+                matched: uploadResult.matching?.invoice_matches || 0,
+                skipped: uploadResult.transactions?.duplicates || 0,
               };
             } else if (event.event === "error") {
               result = { ...fileState, status: "error", error: event.message || "Upload failed" };
@@ -157,11 +163,16 @@ export function UploadDialog({ accounts, onSuccess }: UploadDialogProps) {
     const failed = results.filter((r) => r.status === "error");
     const totalAdded = successful.reduce((sum, r) => sum + (r.added || 0), 0);
     const totalMatched = successful.reduce((sum, r) => sum + (r.matched || 0), 0);
+    const totalSkipped = successful.reduce((sum, r) => sum + (r.skipped || 0), 0);
 
     if (successful.length > 0) {
-      toast.success(
-        `Added ${totalAdded} transactions from ${successful.length} files (${totalMatched} matched)`
-      );
+      if (totalAdded === 0 && totalSkipped > 0) {
+        toast.info(`All ${totalSkipped} transactions already imported (duplicates skipped)`);
+      } else {
+        toast.success(
+          `Added ${totalAdded} transactions from ${successful.length} file${successful.length > 1 ? "s" : ""} (${totalMatched} matched)`
+        );
+      }
     }
     if (failed.length > 0) {
       toast.error(`${failed.length} files failed to upload`);
